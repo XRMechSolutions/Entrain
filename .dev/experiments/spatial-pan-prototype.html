@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Spatial Pan — by-ear prototype (D-021)</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 15px/1.5 system-ui, sans-serif; margin: 0; background:#15171c; color:#e7e9ee; }
+  main { max-width: 720px; margin: 0 auto; padding: 24px 20px 64px; }
+  h1 { font-size: 20px; margin: 0 0 2px; }
+  .sub { color:#9aa3b2; margin: 0 0 20px; font-size: 13px; }
+  fieldset { border: 1px solid #2c313c; border-radius: 10px; margin: 0 0 16px; padding: 14px 16px; }
+  legend { color:#aeb6c6; padding: 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+  .row { display:grid; grid-template-columns: 130px 1fr 64px; align-items:center; gap:12px; margin:8px 0; }
+  .row label { color:#cdd3df; }
+  input[type=range] { width:100%; }
+  output { text-align:right; font-variant-numeric: tabular-nums; color:#8fd0ff; }
+  .modes { display:flex; gap:14px; flex-wrap:wrap; }
+  .modes label { color:#cdd3df; }
+  select, button { font: inherit; }
+  button { background:#2a6df4; color:#fff; border:0; border-radius:8px; padding:10px 22px; cursor:pointer; }
+  button.stop { background:#3a4150; }
+  .bar { position:relative; height:46px; background:#0f1116; border:1px solid #2c313c; border-radius:8px; margin-top:8px; overflow:hidden; }
+  .bar .mid { position:absolute; left:50%; top:0; bottom:0; width:1px; background:#2c313c; }
+  .bar .dot { position:absolute; top:50%; width:18px; height:18px; margin:-9px 0 0 -9px; border-radius:50%; background:#8fd0ff; box-shadow:0 0 14px #8fd0ffaa; transition: none; }
+  .bar .lbl { position:absolute; top:4px; font-size:11px; color:#6b7384; }
+  .ll { left:8px; } .rl { right:8px; }
+  .note { background:#1a2230; border:1px solid #28415f; border-radius:8px; padding:10px 12px; font-size:13px; color:#bcd2ee; margin: 6px 0 0; }
+  .q { margin: 18px 0 0; }
+  .q h3 { font-size:13px; text-transform:uppercase; letter-spacing:.05em; color:#aeb6c6; margin: 0 0 4px; }
+  .q ol { margin:0; padding-left:20px; color:#cdd3df; }
+  code { background:#0f1116; padding:1px 5px; border-radius:4px; color:#ffd596; }
+  .warn { color:#ffb454; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Spatial Pan — by-ear prototype</h1>
+  <p class="sub">Throwaway instrument for D-021. Not app source — lives in <code>.dev/experiments/</code>, never bundled. <span class="warn">Use headphones.</span></p>
+
+  <fieldset>
+    <legend>Tone</legend>
+    <div class="row"><label for="carrier">Carrier (Hz)</label><input id="carrier" type="range" min="50" max="1000" step="1" value="200"><output id="carrierV">200</output></div>
+    <div class="row"><label for="beat">Beat (Hz)</label><input id="beat" type="range" min="0" max="20" step="0.5" value="6"><output id="beatV">6.0</output></div>
+    <div class="row"><label for="vol">Volume</label><input id="vol" type="range" min="0" max="0.5" step="0.01" value="0.22"><output id="volV">0.22</output></div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Movement (the sweep)</legend>
+    <div class="row"><label for="width">Swing width</label><input id="width" type="range" min="0" max="1" step="0.01" value="0.7"><output id="widthV">0.70</output></div>
+    <div class="row"><label for="period">Cycle (seconds)</label><input id="period" type="range" min="1" max="40" step="0.5" value="12"><output id="periodV">12.0</output></div>
+    <div class="row"><label for="center">Center</label><input id="center" type="range" min="-1" max="1" step="0.01" value="0"><output id="centerV">0.00</output></div>
+    <div class="row"><label for="shape">Shape</label>
+      <select id="shape">
+        <option value="sine">sine — smooth swing</option>
+        <option value="triangle">triangle — linear sweep</option>
+        <option value="sawtooth">sawtooth — continuous rotation</option>
+        <option value="square">square — hard alternate</option>
+      </select><output></output></div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Cue mode — the question to settle</legend>
+    <div class="modes">
+      <label><input type="radio" name="mode" value="phase" checked> Phase (ITD)</label>
+      <label><input type="radio" name="mode" value="level"> Level (ILD)</label>
+      <label><input type="radio" name="mode" value="both"> Both</label>
+    </div>
+    <div class="row" style="margin-top:10px"><label for="blend">Blend (Both)</label><input id="blend" type="range" min="0" max="1" step="0.01" value="0.2" disabled><output id="blendV">0.20</output></div>
+    <p class="note">Blend 0 = pure ITD (subtle, in-head). 1 = pure ILD (wide, but rebalances the beat). Only active in <b>Both</b>.</p>
+  </fieldset>
+
+  <div style="display:flex; gap:12px; align-items:center;">
+    <button id="play">▶ Play</button>
+    <span class="sub" id="status" style="margin:0;">stopped</span>
+  </div>
+
+  <div class="bar"><div class="mid"></div><div class="lbl ll">L</div><div class="lbl rl">R</div><div class="dot" id="dot" style="left:50%"></div></div>
+
+  <div class="q">
+    <h3>Experiments to run (then tell me your calls)</h3>
+    <ol>
+      <li><b>#1 cue default:</b> set Beat=0, width 0.7, cycle 12s. Toggle <b>Phase ↔ Level</b>. Which feels right as the default? Then try <b>Both</b> and sweep Blend — does the middle earn its place, or is a strict 2-way toggle cleaner?</li>
+      <li><b>#2 ambiguity:</b> set Carrier=1000, width=1.0, Phase mode. Listen for the image splitting / jumping sides — that's the &gt;750 Hz ITD ambiguity the real feature would auto-clamp.</li>
+      <li><b>Feel check:</b> sawtooth shape gives a one-way "rotation"; square + low cycle is a hard L/R ping-pong.</li>
+    </ol>
+  </div>
+</main>
+
+<script>
+// ---- Mirrors the proposed engine math (D-021), simplified for listening ----
+const ITD_MAX = 0.00066; // 660 µs at full ±1.0 swing
+const ILD_DEPTH = 1.0;   // full-swing L/R gain delta (±0.5)
+const D0 = ITD_MAX;      // base delay on both ears so delayTime never goes < 0 (headroom)
+
+const P = { carrier:200, beat:6, vol:0.22, width:0.7, period:12, center:0, shape:'sine', mode:'phase', blend:0.2 };
+let ctx=null, N=null, playing=false, raf=0;
+
+function cue(){ // ITD/ILD contribution from mode+blend
+  if (P.mode==='phase') return {itd:1, ild:0};
+  if (P.mode==='level') return {itd:0, ild:1};
+  return {itd:1-P.blend, ild:P.blend}; // Both = cross-fade
+}
+function ramp(param, val, tc=0.03){
+  const t=ctx.currentTime;
+  param.cancelScheduledValues(t); param.setValueAtTime(param.value, t);
+  param.linearRampToValueAtTime(val, t+tc);
+}
+
+function start(){
+  ctx = new (window.AudioContext||window.webkitAudioContext)();
+  const n = {};
+  n.oscL = ctx.createOscillator(); n.oscR = ctx.createOscillator();
+  n.oscL.frequency.value = P.carrier - P.beat/2;
+  n.oscR.frequency.value = P.carrier + P.beat/2;
+
+  n.delayL = ctx.createDelay(1); n.delayR = ctx.createDelay(1);
+  n.delayL.delayTime.value = D0; n.delayR.delayTime.value = D0;
+  n.panL = ctx.createGain(); n.panR = ctx.createGain();
+
+  n.merger = ctx.createChannelMerger(2);
+  n.master = ctx.createGain(); n.master.gain.value = 0;
+
+  n.oscL.connect(n.delayL); n.delayL.connect(n.panL); n.panL.connect(n.merger,0,0);
+  n.oscR.connect(n.delayR); n.delayR.connect(n.panR); n.panR.connect(n.merger,0,1);
+  n.merger.connect(n.master); n.master.connect(ctx.destination);
+
+  // Spatial control bus: lfo*width + center  ->  bus  (a slowly-varying −1..1 signal)
+  n.lfo = ctx.createOscillator(); n.lfo.type = P.shape; n.lfo.frequency.value = 1/P.period;
+  n.width = ctx.createGain(); n.width.gain.value = P.width;
+  n.center = ctx.createConstantSource(); n.center.offset.value = P.center;
+  n.bus = ctx.createGain();
+  n.lfo.connect(n.width); n.width.connect(n.bus); n.center.connect(n.bus);
+
+  const c = cue();
+  n.itdL = ctx.createGain(); n.itdL.gain.value = +0.5*ITD_MAX*c.itd;
+  n.itdR = ctx.createGain(); n.itdR.gain.value = -0.5*ITD_MAX*c.itd;
+  n.ildL = ctx.createGain(); n.ildL.gain.value = -0.5*ILD_DEPTH*c.ild;
+  n.ildR = ctx.createGain(); n.ildR.gain.value = +0.5*ILD_DEPTH*c.ild;
+  n.bus.connect(n.itdL); n.itdL.connect(n.delayL.delayTime);
+  n.bus.connect(n.itdR); n.itdR.connect(n.delayR.delayTime);
+  n.bus.connect(n.ildL); n.ildL.connect(n.panL.gain);
+  n.bus.connect(n.ildR); n.ildR.connect(n.panR.gain);
+
+  n.analyser = ctx.createAnalyser(); n.analyser.fftSize = 256;
+  n.buf = new Float32Array(n.analyser.fftSize);
+  n.bus.connect(n.analyser);
+
+  const t0 = ctx.currentTime + 0.02;
+  n.oscL.start(t0); n.oscR.start(t0); n.lfo.start(t0); n.center.start(t0);
+  n.master.gain.setValueAtTime(0, t0);
+  n.master.gain.linearRampToValueAtTime(P.vol, t0+0.4);
+
+  N = n; playing = true;
+  document.getElementById('status').textContent = 'playing';
+  document.getElementById('play').textContent = '■ Stop';
+  document.getElementById('play').classList.add('stop');
+  draw();
+}
+
+function stop(){
+  if(!playing) return;
+  const t = ctx.currentTime, n = N;
+  ramp(n.master.gain, 0, 0.25);
+  setTimeout(()=>{ try{ n.oscL.stop(); n.oscR.stop(); n.lfo.stop(); n.center.stop(); ctx.close(); }catch(e){} }, 350);
+  playing=false; cancelAnimationFrame(raf);
+  document.getElementById('status').textContent = 'stopped';
+  document.getElementById('play').textContent = '▶ Play';
+  document.getElementById('play').classList.remove('stop');
+}
+
+function applyCue(){
+  if(!playing) return;
+  const c = cue();
+  ramp(N.itdL.gain, +0.5*ITD_MAX*c.itd);
+  ramp(N.itdR.gain, -0.5*ITD_MAX*c.itd);
+  ramp(N.ildL.gain, -0.5*ILD_DEPTH*c.ild);
+  ramp(N.ildR.gain, +0.5*ILD_DEPTH*c.ild);
+}
+
+function draw(){
+  N.analyser.getFloatTimeDomainData(N.buf);
+  let s=0; for(let i=0;i<N.buf.length;i++) s+=N.buf[i];
+  let pos = s/N.buf.length;                  // ≈ current spatial position −1..1
+  pos = Math.max(-1.15, Math.min(1.15, pos));
+  document.getElementById('dot').style.left = (50 + pos*46) + '%';
+  raf = requestAnimationFrame(draw);
+}
+
+// ---- wiring ----
+const $ = id => document.getElementById(id);
+function bind(id, key, fmt, live){
+  const el = $(id), out = $(id+'V');
+  el.addEventListener('input', ()=>{
+    P[key] = parseFloat(el.value);
+    if(out) out.textContent = fmt(P[key]);
+    if(playing) live();
+  });
+}
+bind('carrier','carrier', v=>v.toFixed(0), ()=>{ ramp(N.oscL.frequency, P.carrier-P.beat/2, 0.05); ramp(N.oscR.frequency, P.carrier+P.beat/2, 0.05); });
+bind('beat','beat', v=>v.toFixed(1), ()=>{ ramp(N.oscL.frequency, P.carrier-P.beat/2, 0.05); ramp(N.oscR.frequency, P.carrier+P.beat/2, 0.05); });
+bind('vol','vol', v=>v.toFixed(2), ()=>ramp(N.master.gain, P.vol, 0.05));
+bind('width','width', v=>v.toFixed(2), ()=>ramp(N.width.gain, P.width));
+bind('period','period', v=>v.toFixed(1), ()=>ramp(N.lfo.frequency, 1/P.period, 0.05));
+bind('center','center', v=>v.toFixed(2), ()=>ramp(N.center.offset, P.center));
+bind('blend','blend', v=>v.toFixed(2), ()=>applyCue());
+
+$('shape').addEventListener('change', ()=>{ P.shape = $('shape').value; if(playing) N.lfo.type = P.shape; });
+document.querySelectorAll('input[name=mode]').forEach(r=> r.addEventListener('change', ()=>{
+  P.mode = document.querySelector('input[name=mode]:checked').value;
+  $('blend').disabled = (P.mode !== 'both');
+  applyCue();
+}));
+$('play').addEventListener('click', ()=> playing ? stop() : start());
+</script>
+</body>
+</html>

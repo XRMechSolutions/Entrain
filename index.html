@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- viewport-fit=cover is the prerequisite that makes env(safe-area-inset-*) non-zero
+         on notched devices (design.md §4/§5). -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+
+    <!-- Critical inline CSS (design.md §5, interfaces.md §6). Paints the dark background
+         and publishes the --safe-* / --app-bg tokens BEFORE the JS/CSS bundle loads, so
+         there is no white flash under the iOS black-translucent status bar (edge-cases C3).
+         pwa-shell DEFINES these tokens; ui CONSUMES them and must not redefine them (E1). -->
+    <style>
+      :root {
+        --safe-top: env(safe-area-inset-top, 0px);
+        --safe-right: env(safe-area-inset-right, 0px);
+        --safe-bottom: env(safe-area-inset-bottom, 0px);
+        --safe-left: env(safe-area-inset-left, 0px);
+        --app-bg: #0B0F14;
+        color-scheme: dark;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: var(--app-bg);
+      }
+      body {
+        min-height: 100dvh;
+        overscroll-behavior: none;
+      }
+    </style>
+
+    <!-- Early install-event capture (design.md §7, edge-cases B5). beforeinstallprompt can
+         fire during HTML parse — before the ES-module bundle (and ui's install store) runs.
+         This classic inline script buffers the earliest event so ui can adopt it via
+         consumeBufferedInstallPrompt(); no event is ever missed, early or late. -->
+    <script>
+      window.__deferredInstallPrompt = null;
+      window.__appInstalled = false;
+      window.addEventListener('beforeinstallprompt', function (e) {
+        e.preventDefault();
+        window.__deferredInstallPrompt = e;
+      });
+      window.addEventListener('appinstalled', function () {
+        window.__appInstalled = true;
+        window.__deferredInstallPrompt = null;
+      });
+    </script>
+
+    <!-- Theme / scheme. theme-color MUST equal manifest theme_color and the critical-CSS
+         --app-bg (#0B0F14) or a color seam appears (design.md §4, edge-cases). -->
+    <meta name="theme-color" content="#0B0F14" />
+    <meta name="color-scheme" content="dark" />
+
+    <!-- Standalone capability (both spellings for old/new engines). -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Binaural" />
+    <meta name="application-name" content="Binaural" />
+
+    <!-- Icons. iOS home-screen icon (180, opaque background) + browser-tab favicons.
+         The web-app manifest link is deliberately NOT hand-written — vite-plugin-pwa
+         injects it (design.md §2, edge-cases B8). -->
+    <link rel="apple-touch-icon" href="/apple-touch-icon-180x180.png" />
+    <link rel="icon" href="/favicon.ico" sizes="any" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+
+    <title>BinauralAudio</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+dev-dist/
+
+# Test / coverage
+coverage/
+
+# Editor / OS
+.DS_Store
+*.local
+*.log
+.vscode/*
+!.vscode/extensions.json
+
+# AI / agent dev tooling — not part of the public project
+.claude/
+/CLAUDE.md
+/AGENTS.md
+/codex.json
+/skills/
+
+# .dev: publish only the knowledge base, module specs, architecture & project overview.
+# Everything else under .dev (planning, task-state, scripts, templates, plan/tasks docs)
+# is internal working material and stays out of the public repo.
+.dev/*
+!.dev/architecture.md
+!.dev/project.md
+!.dev/knowledge/
+!.dev/modules/
+!.dev/experiments/
+
+# Focus-level session presets — kept local for now, not part of the initial public
+# release (they're folklore-grounded approximations, no affiliation with any program).
+/presets/focus-*.json

@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 3,
+  "name": "Power Nap — 60 min (Sleep Fast, Gentle Wake)",
+  "durationSec": 3600,
+  "masterGain": 0.7,
+  "nodes": [
+    {
+      "t": 0,
+      "carrier": { "value": 150 },
+      "beat": { "value": 10, "transition": "linear" },
+      "volume": { "value": 0, "transition": "linear" }
+    },
+    { "t": 15, "volume": { "value": 1, "transition": "linear" } },
+    { "t": 150, "beat": { "value": 5, "transition": "linear" } },
+    { "t": 360, "beat": { "value": 2.5, "transition": "linear" } },
+    { "t": 3000, "beat": { "value": 2.5, "transition": "linear" } },
+    { "t": 3120, "beat": { "value": 5, "transition": "linear" } },
+    {
+      "t": 3300,
+      "beat": { "value": 9, "transition": "linear" },
+      "volume": {
+        "value": 1,
+        "transition": "linear",
+        "mod": { "shape": "pulse", "periodSec": 0.25, "depth": 0.5, "transition": "glide", "pulseWidth": 0.5, "edgeMs": 5 }
+      }
+    },
+    { "t": 3480, "beat": { "value": 13, "transition": "linear" } },
+    { "t": 3600, "beat": { "value": 15 }, "volume": { "value": 1 } }
+  ]
+}

@@ -1,0 +1,1036 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { createTransport } from './transport';
+import { TransportError } from './transport-types';
+import type { BackgroundAudioMode, SessionScheduler, TransportNotice } from './transport-types';
+import type { ShepardHandle, ShepardOptions } from './shepard';
+import { createDefaultPreset } from './session-model';
+import type { Preset } from './session-model';
+import { MockAudioContext, MockAudioNode, MockAudioParam, MockGainNode } from '../test/webaudio-mock';
+
+// =====================================================================================
+// Co-located transport test doubles (NOT the shared webaudio-mock — automation may be
+// editing that concurrently). A FakeAudioContext adds the lifecycle surface transport
+// needs (suspend/resume/close/state + statechange events, createMediaStreamDestination)
+// on top of the shared node factory, plus fakes for <audio>, mediaSession and wakeLock.
+// =====================================================================================
+
+/** A MediaStreamAudioDestinationNode stand-in: a node with a `.stream`. */
+class FakeMediaStreamDest extends MockAudioNode {
+  readonly stream = { id: 'fake-stream' } as unknown as MediaStream;
+  constructor(ctx: MockAudioContext) {
+    super(ctx, 'destination');
+  }
+}
+
+class FakeAudioContext {
+  currentTime = 0;
+  state: 'suspended' | 'running' | 'interrupted' | 'closed' = 'suspended';
+  suspendCalls = 0;
+  resumeCalls = 0;
+  closeCalls = 0;
+  resumeFails = false; // when true, resume() leaves the context 'interrupted' (stuck — F5)
+  readonly msDests: FakeMediaStreamDest[] = [];
+  readonly destination: MockAudioNode;
+  readonly created: MockAudioContext['created'];
+  createMediaStreamDestination?: () => FakeMediaStreamDest;
+
+  private readonly inner = new MockAudioContext();
+  private readonly stateListeners = new Set<() => void>();
+
+  constructor(opts: { mediaStream?: boolean } = {}) {
+    this.destination = this.inner.destination;
+    this.created = this.inner.created;
+    if (opts.mediaStream !== false) {
+      this.createMediaStreamDestination = (): FakeMediaStreamDest => {
+        const d = new FakeMediaStreamDest(this.inner);
+        this.msDests.push(d);
+        return d;
+      };
+    }
+  }
+
+  createOscillator() {
+    return this.inner.createOscillator();
+  }
+  createConstantSource() {
+    return this.inner.createConstantSource();
+  }
+  createGain() {
+    return this.inner.createGain();
+  }
+  createChannelMerger(n?: number) {
+    return this.inner.createChannelMerger(n);
+  }
+  createWaveShaper() {
+    return this.inner.createWaveShaper();
+  }
+
+  addEventListener(type: string, cb: () => void): void {
+    if (type === 'statechange') this.stateListeners.add(cb);
+  }
+  removeEventListener(type: string, cb: () => void): void {
+    if (type === 'statechange') this.stateListeners.delete(cb);
+  }
+  emitStateChange(): void {
+    for (const cb of [...this.stateListeners]) cb();
+  }
+
+  suspend = async (): Promise<void> => {
+    this.suspendCalls++;
+    this.state = 'suspended';
+    this.emitStateChange();
+  };
+  resume = async (): Promise<void> => {
+    this.resumeCalls++;
+    this.state = this.resumeFails ? 'interrupted' : 'running';
+    this.emitStateChange();
+  };
+  close = async (): Promise<void> => {
+    this.closeCalls++;
+    this.state = 'closed';
+    this.emitStateChange();
+  };
+}
+
+interface FakeAudio {
+  loop: boolean;
+  src: string;
+  srcObject: unknown;
+  paused: boolean;
+  play: ReturnType<typeof vi.fn>;
+  pause: ReturnType<typeof vi.fn>;
+  setAttribute: ReturnType<typeof vi.fn>;
+  removeAttribute: ReturnType<typeof vi.fn>;
+}
+
+function makeFakeAudio(behavior: () => 'resolve' | 'reject'): FakeAudio {
+  const fake: FakeAudio = {
+    loop: false,
+    src: '',
+    srcObject: null,
+    paused: true,
+    play: vi.fn(() => (behavior() === 'reject' ? Promise.reject(new Error('blocked')) : Promise.resolve())),
+    pause: vi.fn(() => {
+      fake.paused = true;
+    }),
+    setAttribute: vi.fn(),
+    removeAttribute: vi.fn(() => {
+      fake.src = '';
+    }),
+  };
+  return fake;
+}
+
+interface FakeMediaSession {
+  metadata: unknown;
+  playbackState: string;
+  readonly handlers: Record<string, ((d: { seekTime?: number }) => void) | null>;
+  readonly positionStates: { duration: number; position: number; playbackRate: number }[];
+  throwOnSeekto: boolean;
+  setActionHandler(action: string, handler: ((d: { seekTime?: number }) => void) | null): void;
+  setPositionState(s: { duration: number; position: number; playbackRate: number }): void;
+}
+
+function makeFakeMediaSession(): FakeMediaSession {
+  const handlers: Record<string, ((d: { seekTime?: number }) => void) | null> = {};
+  const positionStates: { duration: number; position: number; playbackRate: number }[] = [];
+  return {
+    metadata: undefined,
+    playbackState: 'none',
+    handlers,
+    positionStates,
+    throwOnSeekto: false,
+    setActionHandler(action, handler) {
+      if (action === 'seekto' && this.throwOnSeekto) throw new Error('unknown action seekto');
+      handlers[action] = handler;
+    },
+    setPositionState(s) {
+      positionStates.push(s);
+    },
+  };
+}
+
+function makeFakeWakeLock(opts: { reject?: boolean } = {}): {
+  request: ReturnType<typeof vi.fn>;
+  sentinels: { released: boolean; release: ReturnType<typeof vi.fn> }[];
+} {
+  const sentinels: { released: boolean; release: ReturnType<typeof vi.fn> }[] = [];
+  const request = vi.fn(async () => {
+    if (opts.reject) throw new Error('low battery');
+    const sentinel = {
+      released: false,
+      release: vi.fn(async () => {
+        sentinel.released = true;
+      }),
+      addEventListener: vi.fn(),
+    };
+    sentinels.push(sentinel);
+    return sentinel;
+  });
+  return { request, sentinels };
+}
+
+function makeScheduler(): { apply: ReturnType<typeof vi.fn>; retarget: ReturnType<typeof vi.fn>; cancel: ReturnType<typeof vi.fn> } {
+  return { apply: vi.fn(), retarget: vi.fn(), cancel: vi.fn() };
+}
+
+/** Test shepard double: a MockGainNode stands in for the worklet node so it can connect
+ *  into the graph; speed/gain are plain MockAudioParams so live ramps are assertable. The
+ *  mock instances are retained in `handles` for assertions. */
+function makeShepardSpies(fakeCtx: FakeAudioContext) {
+  const handles: Array<{ node: MockGainNode; speedParam: MockAudioParam; gainParam: MockAudioParam }> = [];
+  const register = vi.fn(() => Promise.resolve());
+  const create = vi.fn((_c: BaseAudioContext, opts?: ShepardOptions): ShepardHandle => {
+    const node = fakeCtx.createGain();
+    const speedParam = new MockAudioParam(opts?.speed ?? 0.25);
+    const gainParam = new MockAudioParam(opts?.gain ?? 0.5);
+    handles.push({ node, speedParam, gainParam });
+    return {
+      node: node as unknown as AudioWorkletNode,
+      output: node as unknown as AudioNode,
+      speedParam: speedParam as unknown as AudioParam,
+      gainParam: gainParam as unknown as AudioParam,
+      disconnect(): void {
+        node.disconnect();
+      },
+    };
+  });
+  return { register, create, handles };
+}
+
+function makePreset(over: Partial<Preset> = {}): Preset {
+  return { ...createDefaultPreset(), ...over };
+}
+
+// --- test-wide fixtures ----------------------------------------------------
+
+const realCreateElement = document.createElement.bind(document);
+let fakeAudio: FakeAudio;
+let audioPlayBehavior: 'resolve' | 'reject';
+let rafCallbacks: FrameRequestCallback[];
+
+function flushRaf(): void {
+  const cbs = rafCallbacks;
+  rafCallbacks = [];
+  for (const cb of cbs) cb(0);
+}
+async function microflush(times = 8): Promise<void> {
+  for (let i = 0; i < times; i++) await Promise.resolve();
+}
+
+function installMediaSession(): FakeMediaSession {
+  const ms = makeFakeMediaSession();
+  Object.defineProperty(navigator, 'mediaSession', { value: ms, configurable: true, writable: true });
+  vi.stubGlobal(
+    'MediaMetadata',
+    class {
+      constructor(public init: unknown) {}
+    },
+  );
+  return ms;
+}
+function installWakeLock(opts: { reject?: boolean } = {}): ReturnType<typeof makeFakeWakeLock> {
+  const wl = makeFakeWakeLock(opts);
+  Object.defineProperty(navigator, 'wakeLock', { value: { request: wl.request }, configurable: true, writable: true });
+  return wl;
+}
+
+interface SetupOpts {
+  scheduler?: ReturnType<typeof makeScheduler>;
+  registerWorklet?: (ctx: BaseAudioContext) => Promise<void>;
+  backgroundAudioMode?: BackgroundAudioMode;
+  silentFileUrl?: string;
+  noFactory?: boolean;
+  fakeOpts?: { mediaStream?: boolean };
+  duration?: number;
+  masterGain?: number;
+  autoload?: boolean;
+}
+
+function setup(opts: SetupOpts = {}) {
+  const fakeCtx = new FakeAudioContext(opts.fakeOpts);
+  const scheduler = opts.scheduler ?? makeScheduler();
+  const factory = vi.fn(() => fakeCtx as unknown as AudioContext);
+  const preset = makePreset({
+    durationSec: opts.duration ?? 100,
+    masterGain: opts.masterGain ?? 0.8,
+  });
+  const notices: { error: TransportNotice[]; warning: TransportNotice[] } = { error: [], warning: [] };
+  // Lift (shepard) spies — wired into every transport; only exercised by tests that call
+  // setLift, so non-lift tests are unaffected (create/register stay un-called).
+  const shepard = makeShepardSpies(fakeCtx);
+  const transport = createTransport({
+    scheduler: scheduler as unknown as SessionScheduler,
+    audioContextFactory: opts.noFactory ? undefined : (factory as unknown as () => AudioContext),
+    registerWorklet: opts.registerWorklet ?? ((): Promise<void> => Promise.resolve()),
+    backgroundAudioMode: opts.backgroundAudioMode ?? 'none',
+    silentFileUrl: opts.silentFileUrl,
+    registerShepard: shepard.register,
+    createShepard: shepard.create,
+  });
+  transport.on('error', (n) => notices.error.push(n));
+  transport.on('warning', (n) => notices.warning.push(n));
+  if (opts.autoload !== false) transport.load(preset);
+  return { transport, fakeCtx, scheduler, factory, preset, notices, shepard };
+}
+
+function lastMasterGain(fakeCtx: FakeAudioContext): MockAudioParam {
+  const gains = fakeCtx.created.gains;
+  return gains[gains.length - 1].gain;
+}
+function lastRampTarget(param: MockAudioParam, method: 'linearRampToValueAtTime' | 'setValueAtTime'): number | undefined {
+  const evts = param.events.filter((e) => e.method === method);
+  return evts.length ? evts[evts.length - 1].value : undefined;
+}
+
+beforeEach(() => {
+  vi.useFakeTimers();
+  audioPlayBehavior = 'resolve';
+  fakeAudio = makeFakeAudio(() => audioPlayBehavior);
+  const spy = vi.spyOn(document, 'createElement') as unknown as {
+    mockImplementation(fn: (tag: string) => unknown): void;
+  };
+  spy.mockImplementation((tag: string) => (tag === 'audio' ? fakeAudio : realCreateElement(tag)));
+  Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+  rafCallbacks = [];
+  vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+    rafCallbacks.push(cb);
+    return rafCallbacks.length;
+  });
+  vi.stubGlobal('cancelAnimationFrame', () => {});
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+  delete (navigator as unknown as Record<string, unknown>).mediaSession;
+  delete (navigator as unknown as Record<string, unknown>).wakeLock;
+});
+
+// =====================================================================================
+// Task 3 — state machine, event emitter, load, position/duration, setMasterTrim, seek
+// =====================================================================================
+
+describe('state machine & control-surface boundaries (Task 3 — A1–A9, H1)', () => {
+  it('A4: play() while already playing is a no-op', async () => {
+    const { transport, scheduler } = setup();
+    await transport.play();
+    expect(transport.state).toBe('playing');
+    expect(scheduler.apply).toHaveBeenCalledTimes(1);
+    await transport.play();
+    expect(scheduler.apply).toHaveBeenCalledTimes(1); // no second schedule
+    expect(transport.state).toBe('playing');
+  });
+
+  it('A5: pause() while not playing is a no-op', async () => {
+    const { transport } = setup();
+    await transport.pause(); // idle
+    expect(transport.state).toBe('idle');
+  });
+
+  it('A6: stop() while idle or stopped is a no-op', async () => {
+    const { transport, scheduler } = setup();
+    await transport.stop(); // idle
+    expect(transport.state).toBe('idle');
+    expect(scheduler.cancel).not.toHaveBeenCalled();
+  });
+
+  it('A8: load() while active stops the session first, then resets to idle', async () => {
+    const { transport, scheduler } = setup();
+    await transport.play();
+    expect(transport.state).toBe('playing');
+    transport.load(makePreset({ durationSec: 50 }));
+    expect(scheduler.cancel).toHaveBeenCalledTimes(1); // old session torn down
+    expect(transport.state).toBe('idle');
+    expect(transport.position()).toBe(0); // startOffset reset
+    expect(transport.duration()).toBe(50);
+  });
+
+  it('A7: any method after destroy() throws DISPOSED', async () => {
+    const { transport } = setup();
+    await transport.destroy();
+    expect(() => transport.position()).toThrow(TransportError);
+    expect(() => transport.duration()).toThrow(TransportError);
+    expect(() => transport.setMasterTrim(0.5)).toThrow(TransportError);
+    expect(() => transport.reapply()).toThrow(TransportError);
+    expect(() => transport.isKeepScreenOn()).toThrow(TransportError);
+    expect(() => transport.load(makePreset())).toThrow(TransportError);
+    expect(() => transport.on('tick', () => {})).toThrow(TransportError);
+    await expect(transport.play()).rejects.toBeInstanceOf(TransportError);
+    await expect(transport.pause()).rejects.toBeInstanceOf(TransportError);
+    await expect(transport.seek(1)).rejects.toBeInstanceOf(TransportError);
+    await expect(transport.prime()).rejects.toBeInstanceOf(TransportError);
+    await expect(transport.setKeepScreenOn(true)).rejects.toBeInstanceOf(TransportError);
+    try {
+      transport.position();
+    } catch (e) {
+      expect((e as TransportError).code).toBe('DISPOSED');
+    }
+  });
+
+  it('A2/A3: seek clamps finite t and throws INVALID_SEEK on non-finite', async () => {
+    const { transport } = setup({ duration: 100 });
+    await transport.seek(-10); // idle: clamp to 0
+    expect(transport.position()).toBe(0);
+    await transport.seek(99999); // clamp to durationSec
+    expect(transport.position()).toBe(100);
+    await expect(transport.seek(Number.NaN)).rejects.toMatchObject({ code: 'INVALID_SEEK' });
+    await expect(transport.seek(Number.POSITIVE_INFINITY)).rejects.toMatchObject({ code: 'INVALID_SEEK' });
+  });
+
+  it('A1: play()/seek() with no preset loaded throws NO_PRESET', async () => {
+    const { transport } = setup({ autoload: false });
+    await expect(transport.play()).rejects.toMatchObject({ code: 'NO_PRESET' });
+    await expect(transport.seek(1)).rejects.toMatchObject({ code: 'NO_PRESET' });
+  });
+
+  it('A9: setMasterTrim clamps to 0..1 and ignores non-finite', async () => {
+    const { transport, fakeCtx } = setup();
+    await transport.play();
+    const mg = lastMasterGain(fakeCtx);
+    transport.setMasterTrim(2); // clamp to 1
+    expect(lastRampTarget(mg, 'linearRampToValueAtTime')).toBeCloseTo(1);
+    transport.setMasterTrim(-1); // clamp to 0
+    expect(lastRampTarget(mg, 'linearRampToValueAtTime')).toBeCloseTo(0);
+    const before = mg.events.length;
+    transport.setMasterTrim(Number.NaN); // ignored — no new ramp written
+    expect(mg.events.length).toBe(before);
+  });
+
+  it('H1: position() is frozen when stopped and reads startOffset while idle', async () => {
+    const { transport, fakeCtx } = setup({ duration: 100 });
+    await transport.seek(40);
+    expect(transport.position()).toBe(40); // idle → startOffset
+    await transport.play();
+    fakeCtx.currentTime = 10;
+    const playingPos = transport.position();
+    expect(playingPos).toBeGreaterThan(40);
+    await transport.stop();
+    const frozen = transport.position();
+    fakeCtx.currentTime = 90; // clock keeps advancing after stop
+    expect(transport.position()).toBe(frozen); // still frozen
+  });
+
+  it('on/off add and remove handlers by identity; statechange fires on transitions', async () => {
+    const { transport } = setup();
+    const h = vi.fn();
+    transport.on('statechange', h);
+    await transport.play();
+    expect(h).toHaveBeenCalledWith({ state: 'playing' });
+    expect(h).toHaveBeenCalledTimes(1);
+    transport.off('statechange', h);
+    await transport.stop();
+    expect(h).toHaveBeenCalledTimes(1); // not called after off()
+  });
+});
+
+// =====================================================================================
+// Task 6 — play start sequence, pause/resume, seek reschedule, fades, tick, end timer
+// =====================================================================================
+
+describe('play() start sequence (Task 6 — §6 / B5 / I1 / I2)', () => {
+  it('§6/B5: fires resume() and starts the source at t0 in the gesture; masterGain fades 0→trim', async () => {
+    const { transport, fakeCtx, scheduler } = setup({ masterGain: 0.7 });
+    await transport.play();
+
+    expect(fakeCtx.resumeCalls).toBeGreaterThanOrEqual(1); // resume fired
+    const oscs = fakeCtx.created.oscillators;
+    const oscL = oscs[oscs.length - 2];
+    expect(oscL.started).toBe(true);
+    expect(oscL.startTime).toBeCloseTo(0.02); // t0 = currentTime(0) + startLeadSec
+
+    const mg = lastMasterGain(fakeCtx);
+    expect(mg.events[0]).toMatchObject({ method: 'cancelAndHoldAtTime' });
+    const anchor = mg.events.find((e) => e.method === 'setValueAtTime');
+    expect(anchor?.value).toBeCloseTo(0); // begins at 0
+    expect(lastRampTarget(mg, 'linearRampToValueAtTime')).toBeCloseTo(0.7); // fades to trim
+
+    expect(scheduler.apply).toHaveBeenCalledTimes(1);
+    const args = scheduler.apply.mock.calls[0];
+    expect(args[2]).toBe(0); // fromSec = startOffset
+    expect(args[3]).toBeCloseTo(0.02); // atCtxTime = t0
+    expect(args[4]).toEqual({ pulseAvailable: true });
+  });
+
+  it('I2: passes pulseAvailable=false when the worklet is not ready', async () => {
+    const { transport, scheduler, notices } = setup({
+      registerWorklet: () => Promise.reject(new Error('addModule failed')),
+    });
+    await transport.play();
+    expect(scheduler.apply.mock.calls[0][4]).toEqual({ pulseAvailable: false });
+    expect(notices.warning.some((n) => n.code === 'WORKLET_UNAVAILABLE')).toBe(true);
+  });
+
+  it('B5: play() never blocks on in-flight worklet registration (gesture-safe autoplay)', async () => {
+    // Regression: doPrime() must NOT await registerWorklet. If it did, this play()
+    // whose registration never settles during the gesture would hang here, and on real
+    // Safari ctx.resume()/voice.start() would fall outside the user-activation window.
+    let settle: () => void = () => {};
+    const registerWorklet = vi.fn(() => new Promise<void>((res) => { settle = res; }));
+    const { transport, fakeCtx, scheduler } = setup({ registerWorklet });
+
+    await transport.play(); // resolves despite registration still pending
+
+    expect(scheduler.apply).toHaveBeenCalledTimes(1);
+    expect(scheduler.apply.mock.calls[0][4]).toEqual({ pulseAvailable: false });
+    const oscs = fakeCtx.created.oscillators;
+    expect(oscs[oscs.length - 2].started).toBe(true); // voice.start() ran in the gesture
+    expect(registerWorklet).toHaveBeenCalledTimes(1);
+
+    settle(); // late registration completes harmlessly
+    await Promise.resolve();
+  });
+
+  it('I1: a scheduler.apply failure aborts the start with a fatal SCHEDULE_FAILED and no half-played session', async () => {
+    const scheduler = makeScheduler();
+    scheduler.apply.mockImplementation(() => {
+      throw new Error('boom');
+    });
+    const { transport, fakeCtx, notices } = setup({ scheduler });
+    await transport.play();
+    expect(notices.error.some((n) => n.code === 'SCHEDULE_FAILED')).toBe(true);
+    expect(transport.state).toBe('stopped');
+    expect(scheduler.cancel).toHaveBeenCalledTimes(1); // teardown(false) ran
+    const oscs = fakeCtx.created.oscillators;
+    expect(oscs[oscs.length - 1].started).toBe(false); // voice never started
+  });
+});
+
+describe('pause / resume (Task 6 — C3 / §7)', () => {
+  it('C3: pause fades to silence then suspends; resume fades up and re-arms the end timer', async () => {
+    const { transport, fakeCtx } = setup({ duration: 100 });
+    await transport.play();
+    fakeCtx.currentTime = 30; // simulate 30 s of playback
+    const mg = lastMasterGain(fakeCtx);
+
+    const pausePromise = transport.pause();
+    expect(lastRampTarget(mg, 'linearRampToValueAtTime')).toBeCloseTo(0); // fade to silence first
+    expect(fakeCtx.suspendCalls).toBe(0); // not yet — only after the fade
+    await vi.advanceTimersByTimeAsync(20); // pauseFadeSec
+    await pausePromise;
+    expect(fakeCtx.suspendCalls).toBe(1);
+    expect(transport.state).toBe('paused');
+
+    const ended = vi.fn();
+    transport.on('ended', ended);
+    await transport.play(); // resume
+    expect(transport.state).toBe('playing');
+    expect(lastRampTarget(mg, 'linearRampToValueAtTime')).toBeCloseTo(transport.position() > 0 ? 0.8 : 0.8); // fade back to trim
+
+    const remainingMs = (100 - transport.position()) * 1000;
+    await vi.advanceTimersByTimeAsync(remainingMs + 50);
+    expect(ended).toHaveBeenCalledTimes(1); // end timer was re-armed with recomputed remaining
+  });
+
+  it('§7: a seek while paused reschedules from the new offset on resume', async () => {
+    const { transport, scheduler, fakeCtx } = setup({ duration: 100 });
+    await transport.play();
+    const pausePromise = transport.pause();
+    await vi.advanceTimersByTimeAsync(20);
+    await pausePromise;
+    scheduler.cancel.mockClear();
+    scheduler.apply.mockClear();
+
+    await transport.seek(55); // paused → store + needsReschedule
+    expect(transport.position()).toBe(55);
+
+    await transport.play(); // resume → cancel + apply from 55
+    expect(scheduler.cancel).toHaveBeenCalledTimes(1);
+    expect(scheduler.apply).toHaveBeenCalledTimes(1);
+    expect(scheduler.apply.mock.calls[0][2]).toBe(55);
+    expect(fakeCtx.resumeCalls).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe('seek while playing (Task 6 — C4 / A10)', () => {
+  it('C4: fades to silence, cancels, reschedules from t, fades back, re-arms, emits one tick', async () => {
+    const { transport, scheduler, fakeCtx } = setup({ duration: 100 });
+    await transport.play();
+    scheduler.apply.mockClear();
+    const mg = lastMasterGain(fakeCtx);
+    const tick = vi.fn();
+    transport.on('tick', tick);
+
+    const seekPromise = transport.seek(60);
+    expect(lastRampTarget(mg, 'linearRampToValueAtTime')).toBeCloseTo(0); // fade down first
+    await vi.advanceTimersByTimeAsync(20); // seekFadeSec
+    await seekPromise;
+
+    expect(scheduler.cancel).toHaveBeenCalledTimes(1);
+    expect(scheduler.apply).toHaveBeenCalledTimes(1);
+    expect(scheduler.apply.mock.calls[0][2]).toBe(60); // fresh schedule from t
+    expect(lastRampTarget(mg, 'linearRampToValueAtTime')).toBeCloseTo(0.8); // fade back to trim
+    expect(tick).toHaveBeenCalled(); // snaps the playhead
+  });
+
+  it('A10: rapid successive seeks — only the latest token completes', async () => {
+    const { transport, scheduler } = setup({ duration: 100 });
+    await transport.play();
+    scheduler.apply.mockClear();
+    scheduler.cancel.mockClear();
+
+    void transport.seek(10);
+    void transport.seek(20);
+    void transport.seek(30);
+    await vi.advanceTimersByTimeAsync(20);
+    await microflush();
+
+    expect(scheduler.cancel).toHaveBeenCalledTimes(1); // only the latest reaches cancel
+    expect(scheduler.apply).toHaveBeenCalledTimes(1);
+    expect(scheduler.apply.mock.calls[0][2]).toBe(30); // latest seek
+  });
+});
+
+describe('tick loop & end-of-session (Task 6 — H3/H4/H5, ended)', () => {
+  it('emits tick with a clamped position and the current state', async () => {
+    const { transport } = setup({ duration: 100 });
+    const tick = vi.fn();
+    transport.on('tick', tick);
+    await transport.play();
+    flushRaf();
+    expect(tick).toHaveBeenCalled();
+    const payload = tick.mock.calls[0][0] as { positionSec: number; durationSec: number; state: string };
+    expect(payload.durationSec).toBe(100);
+    expect(payload.state).toBe('playing');
+    expect(payload.positionSec).toBeGreaterThanOrEqual(0);
+    expect(payload.positionSec).toBeLessThanOrEqual(100);
+  });
+
+  it('H3: the end timer is authoritative — it fires even when rAF never runs (backgrounded)', async () => {
+    const { transport } = setup({ duration: 10 });
+    const ended = vi.fn();
+    transport.on('ended', ended);
+    await transport.play();
+    // Never flushRaf() — simulate a hidden tab where rAF is throttled to zero.
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(ended).toHaveBeenCalledTimes(1);
+    expect(transport.state).toBe('stopped');
+  });
+
+  it('H4: a late/extra timer fire is harmless — ended is emitted exactly once', async () => {
+    const { transport } = setup({ duration: 10 });
+    const ended = vi.fn();
+    transport.on('ended', ended);
+    await transport.play();
+    await vi.advanceTimersByTimeAsync(10_000);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(ended).toHaveBeenCalledTimes(1);
+  });
+
+  it('H5: a 24 h duration arms the end timer without overflow', async () => {
+    const { transport } = setup({ duration: 86_400 });
+    const ended = vi.fn();
+    transport.on('ended', ended);
+    await transport.play();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(ended).not.toHaveBeenCalled(); // would fire instantly if remainingMs had wrapped
+    await vi.advanceTimersByTimeAsync(86_400_000);
+    expect(ended).toHaveBeenCalledTimes(1);
+  });
+
+  it('emits ended on natural end but NOT on a user stop()', async () => {
+    const stopped = setup({ duration: 10 });
+    const endedOnStop = vi.fn();
+    stopped.transport.on('ended', endedOnStop);
+    await stopped.transport.play();
+    await stopped.transport.stop();
+    await vi.advanceTimersByTimeAsync(600); // flush the fade-out teardown
+    expect(endedOnStop).not.toHaveBeenCalled();
+    expect(stopped.transport.state).toBe('stopped');
+  });
+});
+
+// =====================================================================================
+// Task 4 — AudioContext lifecycle, recovery, Wake Lock, teardown, destroy
+// =====================================================================================
+
+describe('AudioContext lifecycle & autoplay (Task 4 — B2/B3, J1/J2/J3/J6)', () => {
+  it('B3: with no AudioContext constructor, prime/play emit a fatal WEB_AUDIO_UNSUPPORTED and stay idle', async () => {
+    const { transport, notices } = setup({ noFactory: true });
+    await transport.prime();
+    expect(notices.error.some((n) => n.code === 'WEB_AUDIO_UNSUPPORTED')).toBe(true);
+    expect(transport.state).toBe('idle');
+    await transport.play();
+    expect(transport.state).toBe('idle'); // still cannot proceed
+  });
+
+  it('B2: prime() is idempotent and surfaces WORKLET_UNAVAILABLE when registration fails', async () => {
+    const registerWorklet = vi.fn(() => Promise.reject(new Error('addModule failed')));
+    const { transport, notices } = setup({ registerWorklet });
+    await transport.prime();
+    await transport.prime();
+    expect(registerWorklet).toHaveBeenCalledTimes(1); // idempotent
+    expect(notices.warning.some((n) => n.code === 'WORKLET_UNAVAILABLE')).toBe(true);
+  });
+
+  it('J1: many play→stop cycles reuse the same context and re-register the worklet once', async () => {
+    const registerWorklet = vi.fn(() => Promise.resolve());
+    const { transport, fakeCtx, factory } = setup({ registerWorklet });
+    await transport.play();
+    await transport.stop();
+    await vi.advanceTimersByTimeAsync(600);
+    await transport.play();
+    expect(factory).toHaveBeenCalledTimes(1); // same AudioContext reused
+    expect(registerWorklet).toHaveBeenCalledTimes(1);
+    expect(fakeCtx.created.oscillators.length).toBe(4); // a fresh voice (2 oscs) per play
+  });
+
+  it('J2: destroy() twice is a no-op (close called once)', async () => {
+    const { transport, fakeCtx } = setup();
+    await transport.prime();
+    await transport.destroy();
+    await transport.destroy();
+    expect(fakeCtx.closeCalls).toBe(1);
+  });
+
+  it('J3: destroy() while playing tears down and closes the context', async () => {
+    const { transport, fakeCtx } = setup();
+    await transport.play();
+    await transport.destroy();
+    expect(fakeCtx.closeCalls).toBe(1);
+    expect(() => transport.position()).toThrow(TransportError);
+  });
+
+  it('J6: an offline-style context (no MediaStream / rAF / mediaSession / wakeLock) degrades to no-ops', async () => {
+    vi.stubGlobal('requestAnimationFrame', undefined);
+    vi.stubGlobal('cancelAnimationFrame', undefined);
+    const { transport, fakeCtx, scheduler, notices } = setup({
+      fakeOpts: { mediaStream: false },
+      backgroundAudioMode: 'mediastream',
+      duration: 5,
+    });
+    await transport.play();
+    expect(transport.state).toBe('playing'); // core scheduling path still works
+    expect(scheduler.apply).toHaveBeenCalledTimes(1);
+    expect(fakeCtx.msDests).toHaveLength(0); // createMediaStreamDestination absent → direct
+    expect(notices.error).toHaveLength(0);
+    // The end timer (not rAF) still drives the session end.
+    const ended = vi.fn();
+    transport.on('ended', ended);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(ended).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('visibility / iOS interruption recovery (Task 4 — F2–F6)', () => {
+  it('F2: an unexpected statechange away from running marks the transport interrupted', async () => {
+    const { transport, fakeCtx, notices } = setup();
+    await transport.play();
+    fakeCtx.state = 'interrupted';
+    fakeCtx.emitStateChange();
+    expect(transport.state).toBe('interrupted');
+    expect(notices.warning.some((n) => n.code === 'CONTEXT_INTERRUPTED')).toBe(true);
+  });
+
+  it('F3/F4: returning to visible runs suspend→resume and recovers when running', async () => {
+    const { transport, fakeCtx, notices } = setup();
+    await transport.play();
+    fakeCtx.state = 'interrupted';
+    fakeCtx.emitStateChange();
+    expect(transport.state).toBe('interrupted');
+
+    const suspendBefore = fakeCtx.suspendCalls;
+    document.dispatchEvent(new Event('visibilitychange'));
+    await microflush();
+    expect(fakeCtx.suspendCalls).toBe(suspendBefore + 1); // suspend→resume unstick
+    expect(transport.state).toBe('playing');
+    expect(notices.warning.some((n) => n.code === 'CONTEXT_RECOVERED')).toBe(true);
+  });
+
+  it('F5: when resume stays stuck, the transport stays interrupted (no recovery)', async () => {
+    const { transport, fakeCtx, notices } = setup();
+    await transport.play();
+    fakeCtx.state = 'interrupted';
+    fakeCtx.emitStateChange();
+    fakeCtx.resumeFails = true;
+
+    document.dispatchEvent(new Event('visibilitychange'));
+    await microflush();
+    expect(transport.state).toBe('interrupted');
+    expect(notices.warning.filter((n) => n.code === 'CONTEXT_RECOVERED')).toHaveLength(0);
+  });
+
+  it('F6: no recovery is attempted after a deliberate user pause()', async () => {
+    const { transport, fakeCtx } = setup();
+    await transport.play();
+    const pausePromise = transport.pause();
+    await vi.advanceTimersByTimeAsync(20);
+    await pausePromise;
+    expect(transport.state).toBe('paused');
+
+    const resumeBefore = fakeCtx.resumeCalls;
+    document.dispatchEvent(new Event('visibilitychange'));
+    await microflush();
+    expect(fakeCtx.resumeCalls).toBe(resumeBefore); // never auto-recovered
+    expect(transport.state).toBe('paused');
+  });
+});
+
+describe('Wake Lock (Task 4 — G1/G2/G3)', () => {
+  it('G1: setKeepScreenOn(true) without wakeLock support warns and stays off', async () => {
+    const { transport, notices } = setup();
+    await transport.setKeepScreenOn(true);
+    expect(notices.warning.some((n) => n.code === 'WAKE_LOCK_UNSUPPORTED')).toBe(true);
+    expect(transport.isKeepScreenOn()).toBe(false);
+  });
+
+  it('G2: a rejected wakeLock.request warns and the toggle stays off', async () => {
+    installWakeLock({ reject: true });
+    const { transport, notices } = setup();
+    await transport.setKeepScreenOn(true);
+    expect(notices.warning.some((n) => n.code === 'WAKE_LOCK_FAILED')).toBe(true);
+    expect(transport.isKeepScreenOn()).toBe(false);
+  });
+
+  it('G3: re-acquires the lock on visibilitychange while playing with the toggle on', async () => {
+    const wl = installWakeLock();
+    const { transport } = setup();
+    await transport.play();
+    await transport.setKeepScreenOn(true);
+    expect(transport.isKeepScreenOn()).toBe(true);
+    expect(wl.request).toHaveBeenCalledTimes(1);
+
+    document.dispatchEvent(new Event('visibilitychange'));
+    await microflush();
+    expect(wl.request).toHaveBeenCalledTimes(2); // transparently re-acquired
+  });
+});
+
+// =====================================================================================
+// Task 5 — background-audio bridge (D-018) and MediaSession
+// =====================================================================================
+
+describe('background-audio bridge — D-018 (Task 5 — D1/D2/D3/D5/D6)', () => {
+  it('D1: mediastream resolve routes the voice through the <audio> as the sole audible path', async () => {
+    const { transport, fakeCtx } = setup({ backgroundAudioMode: 'mediastream' });
+    await transport.play();
+    await microflush();
+    const msDest = fakeCtx.msDests[0];
+    const masterGain = fakeCtx.created.gains[fakeCtx.created.gains.length - 1];
+    expect(masterGain.isConnectedTo(msDest)).toBe(true);
+    expect(masterGain.isConnectedTo(fakeCtx.destination)).toBe(false); // not doubled
+    expect(fakeAudio.srcObject).toBe(msDest.stream);
+    expect(fakeAudio.play).toHaveBeenCalled();
+  });
+
+  it('D2: mediastream reject reconnects direct and warns BACKGROUND_AUDIO_UNAVAILABLE', async () => {
+    audioPlayBehavior = 'reject';
+    const { transport, fakeCtx, notices } = setup({ backgroundAudioMode: 'mediastream' });
+    await transport.play();
+    await microflush();
+    const masterGain = fakeCtx.created.gains[fakeCtx.created.gains.length - 1];
+    expect(masterGain.isConnectedTo(fakeCtx.destination)).toBe(true); // direct fallback
+    const msDest = fakeCtx.msDests[0];
+    expect(masterGain.isConnectedTo(msDest)).toBe(false);
+    expect(fakeAudio.pause).toHaveBeenCalled();
+    expect(notices.warning.some((n) => n.code === 'BACKGROUND_AUDIO_UNAVAILABLE')).toBe(true);
+  });
+
+  it('D3: exactly one audible path is connected at a time (no doubling)', async () => {
+    const { transport, fakeCtx } = setup({ backgroundAudioMode: 'mediastream' });
+    await transport.play();
+    await microflush();
+    const masterGain = fakeCtx.created.gains[fakeCtx.created.gains.length - 1];
+    expect(masterGain.connections).toHaveLength(1);
+    expect(masterGain.connections[0].destination).toBe(fakeCtx.msDests[0]);
+  });
+
+  it('D5: silent-file mode plays a looping <audio> of the bundled asset', async () => {
+    const { transport } = setup({ backgroundAudioMode: 'silent-file', silentFileUrl: '/silent-5s.mp3' });
+    await transport.play();
+    await microflush();
+    expect(fakeAudio.loop).toBe(true);
+    expect(fakeAudio.src).toBe('/silent-5s.mp3');
+    expect(fakeAudio.play).toHaveBeenCalled();
+  });
+
+  it('D6: none mode connects directly and attaches no MediaSession', async () => {
+    const ms = installMediaSession();
+    const { transport, fakeCtx } = setup({ backgroundAudioMode: 'none' });
+    await transport.play();
+    const masterGain = fakeCtx.created.gains[fakeCtx.created.gains.length - 1];
+    expect(masterGain.isConnectedTo(fakeCtx.destination)).toBe(true);
+    expect(fakeCtx.msDests).toHaveLength(0);
+    expect(ms.handlers.play).toBeUndefined(); // no MediaSession in none mode
+  });
+});
+
+describe('MediaSession — D-018 (Task 5 — E1/E2/E3/E4/E5)', () => {
+  it('E1: with navigator.mediaSession absent, playback is unaffected', async () => {
+    const { transport } = setup({ backgroundAudioMode: 'mediastream' });
+    await transport.play();
+    await microflush();
+    expect(transport.state).toBe('playing'); // no throw, no MediaSession
+  });
+
+  it('E2: a setActionHandler that throws for an unknown action is caught per handler', async () => {
+    const ms = installMediaSession();
+    ms.throwOnSeekto = true;
+    const { transport } = setup({ backgroundAudioMode: 'mediastream' });
+    await transport.play();
+    await microflush();
+    expect(ms.handlers.play).toBeTypeOf('function');
+    expect(ms.handlers.pause).toBeTypeOf('function');
+    expect(ms.handlers.stop).toBeTypeOf('function');
+    expect(transport.state).toBe('playing'); // the seekto throw did not break setup
+  });
+
+  it('E3/E5: lock-screen stop routes to stop() and clears handlers + playbackState', async () => {
+    const ms = installMediaSession();
+    const { transport } = setup({ backgroundAudioMode: 'mediastream' });
+    await transport.play();
+    await microflush();
+    expect(ms.playbackState).toBe('playing');
+
+    ms.handlers.stop?.({}); // lock-screen stop
+    expect(transport.state).toBe('stopped'); // routed to stop() immediately
+    await vi.advanceTimersByTimeAsync(600); // flush the fade-out teardown that clears MediaSession
+    expect(ms.handlers.play).toBeNull();
+    expect(ms.metadata).toBeNull();
+    expect(ms.playbackState).toBe('none');
+  });
+
+  it('E4: setPositionState is throttled to mediaSessionPositionThrottleMs', async () => {
+    const ms = installMediaSession();
+    const { transport } = setup({ backgroundAudioMode: 'mediastream', duration: 100 });
+    await transport.play();
+    await microflush();
+    flushRaf();
+    flushRaf();
+    flushRaf();
+    const after1s = ms.positionStates.length;
+    await vi.advanceTimersByTimeAsync(1_000);
+    flushRaf();
+    flushRaf();
+    expect(ms.positionStates.length).toBe(after1s + 1); // at most one more per throttle window
+  });
+});
+
+// =====================================================================================
+// Task 6 — reapply (live edit, I3b)
+// =====================================================================================
+
+describe('reapply() — live edit (Task 6 — I3b / §10)', () => {
+  it('routes through scheduler.retarget while playing without moving the playhead', async () => {
+    const { transport, scheduler } = setup();
+    await transport.play();
+    const pos = transport.position();
+    transport.reapply();
+    expect(scheduler.retarget).toHaveBeenCalledTimes(1);
+    expect(transport.position()).toBeCloseTo(pos); // playhead unchanged
+  });
+
+  it('is a no-op while idle/stopped and throws NO_PRESET with nothing loaded', async () => {
+    const idle = setup();
+    idle.transport.reapply(); // idle → no-op
+    expect(idle.scheduler.retarget).not.toHaveBeenCalled();
+
+    const empty = setup({ autoload: false });
+    expect(() => empty.transport.reapply()).toThrow(TransportError);
+  });
+});
+
+// =====================================================================================
+// Shepard "lift" overlay — a parallel aux path (independent live layer)
+// =====================================================================================
+
+describe('setLift() — the parallel Shepard "lift" aux path', () => {
+  // The shepard node feeds an aux fade-gain; that gain connects to the output target.
+  function liftFadeGain(node: MockGainNode): MockGainNode {
+    return node.connections[0].destination as unknown as MockGainNode;
+  }
+
+  it('attaches a parallel aux path (shepard → aux gain → output target), fading in click-free', async () => {
+    const { transport, fakeCtx, shepard } = setup({ backgroundAudioMode: 'none' });
+    await transport.play();
+    // Voice output = the last gain created during play (masterGain); capture its routing.
+    const voiceMaster = fakeCtx.created.gains[fakeCtx.created.gains.length - 1];
+    const voiceConnsBefore = voiceMaster.connections.length;
+    expect(voiceMaster.isConnectedTo(fakeCtx.destination)).toBe(true);
+
+    transport.setLift({ speed: 0.3, gain: 0.4 });
+    await microflush();
+
+    expect(shepard.register).toHaveBeenCalledTimes(1); // register-before-create
+    expect(shepard.create).toHaveBeenCalledTimes(1);
+    const node = shepard.handles[0].node;
+    const aux = liftFadeGain(node);
+    expect(node.isConnectedTo(aux)).toBe(true); // shepard → aux gain
+    expect(aux.isConnectedTo(fakeCtx.destination)).toBe(true); // aux → same target as the voice
+
+    // Click-free 10 ms fade-in: anchored at 0, ramps to 1.
+    expect(lastRampTarget(aux.gain, 'linearRampToValueAtTime')).toBeCloseTo(1);
+    const anchor = aux.gain.events.find((e) => e.method === 'setValueAtTime');
+    expect(anchor?.value).toBeCloseTo(0);
+
+    // The voice/bridge routing is untouched (a strictly parallel path).
+    expect(voiceMaster.connections.length).toBe(voiceConnsBefore);
+    expect(voiceMaster.isConnectedTo(fakeCtx.destination)).toBe(true);
+  });
+
+  it('updates speed/gain live on the running node without rebuilding it', async () => {
+    const { transport, shepard } = setup();
+    await transport.play();
+    transport.setLift({ speed: 0.3, gain: 0.4 });
+    await microflush();
+    expect(shepard.create).toHaveBeenCalledTimes(1);
+    const { speedParam, gainParam } = shepard.handles[0];
+
+    transport.setLift({ speed: -0.6, gain: 0.8 }); // descending, louder
+    await microflush();
+
+    expect(shepard.create).toHaveBeenCalledTimes(1); // SAME node — not rebuilt (phase continuity)
+    expect(lastRampTarget(speedParam, 'linearRampToValueAtTime')).toBeCloseTo(-0.6);
+    expect(lastRampTarget(gainParam, 'linearRampToValueAtTime')).toBeCloseTo(0.8);
+  });
+
+  it('setLift(null) fades the aux gain out and disposes the node', async () => {
+    const { transport, shepard } = setup();
+    await transport.play();
+    transport.setLift({ speed: 0.3, gain: 0.4 });
+    await microflush();
+    const node = shepard.handles[0].node;
+    const aux = liftFadeGain(node);
+
+    transport.setLift(null);
+    expect(lastRampTarget(aux.gain, 'linearRampToValueAtTime')).toBeCloseTo(0); // fade to silence
+    await vi.advanceTimersByTimeAsync(50); // > trimRampSec → disposal fires
+    expect(node.disconnectCalls).toBeGreaterThan(0);
+    expect(aux.disconnectCalls).toBeGreaterThan(0);
+  });
+
+  it('disposes the lift on teardown (stop) and ignores non-finite speed/gain', async () => {
+    const { transport, shepard } = setup({ duration: 100 });
+    await transport.play();
+    transport.setLift({ speed: 0.3, gain: 0.4 });
+    await microflush();
+    const node = shepard.handles[0].node;
+    const aux = liftFadeGain(node);
+
+    transport.setLift({ speed: Number.NaN, gain: 0.5 }); // ignored — no rebuild, no throw
+    await microflush();
+    expect(shepard.create).toHaveBeenCalledTimes(1);
+
+    await transport.stop();
+    await vi.advanceTimersByTimeAsync(600); // flush the fade-out teardown
+    expect(node.disconnectCalls).toBeGreaterThan(0);
+    expect(aux.disconnectCalls).toBeGreaterThan(0);
+  });
+
+  it('stores the lift while idle and applies it on the next play(); a user stop() clears it', async () => {
+    const { transport, shepard } = setup();
+    transport.setLift({ speed: 0.3, gain: 0.4 }); // idle → stored, not yet applied
+    expect(shepard.create).not.toHaveBeenCalled();
+
+    await transport.play();
+    await microflush();
+    expect(shepard.create).toHaveBeenCalledTimes(1); // re-applied on play
+
+    await transport.stop();
+    await vi.advanceTimersByTimeAsync(600);
+    await transport.play(); // a fresh session
+    await microflush();
+    expect(shepard.create).toHaveBeenCalledTimes(1); // intent was cleared on stop → not re-created
+  });
+});

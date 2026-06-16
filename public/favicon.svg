@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- TODO(stub): placeholder brand mark — final logo SVG resolves in a branding pass; all icon sizes/config/refs already fixed (drop-in swap + re-run generate-pwa-assets) -->
+<!--
+  Single source icon art for @vite-pwa/assets-generator (minimal-2023 preset).
+  1024-unit square. The mark lives inside the central 80% (40% radius = 409.6px)
+  maskable safe circle so adaptive masks never clip it; the dark brand color fills
+  the full edge so generated maskable/apple icons have no transparent corners.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <rect width="1024" height="1024" fill="#0B0F14"/>
+  <g fill="none" stroke="#5EC8E5" stroke-width="56" stroke-linecap="round">
+    <circle cx="512" cy="512" r="300"/>
+    <circle cx="512" cy="512" r="150"/>
+  </g>
+  <circle cx="512" cy="512" r="40" fill="#5EC8E5"/>
+</svg>

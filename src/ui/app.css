@@ -1,0 +1,97 @@
+/* app.css — global design tokens, reset, and safe-area scaffolding for the dark
+ * Phase-1 shell (design §13). pwa-shell's critical inline CSS in index.html DEFINES the
+ * safe-area insets and --app-bg; this file CONSUMES them and must not redefine them. Colors/spacing are
+ * CSS custom properties so a future light theme is a token swap (§13). All tap targets
+ * are >= --tap-min (48px) and the layout switches at --wide (720px). */
+
+:root {
+  /* Palette (dark default). */
+  --bg: var(--app-bg, #0b0f14);
+  --surface: #131a22;
+  --surface-2: #1b242e;
+  --border: #27323d;
+  --text: #e6edf3;
+  --text-dim: #9aa7b4;
+  --accent: #4aa8ff;
+  --accent-contrast: #04111f;
+  --danger: #ff5d5d;
+  --warning: #ffb454;
+  --info: #66d9c0;
+  --ok: #5ad17a;
+
+  /* Spacing scale. */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+
+  --radius: 12px;
+  --radius-lg: 20px;
+
+  /* Behavioral sizes mirrored from lib/constants.ts (§14). */
+  --tap-min: 48px;
+  --play-diameter: 120px;
+  --wide: 720px;
+
+  --font: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--font);
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  line-height: 1.4;
+}
+
+#app {
+  min-height: 100dvh;
+}
+
+button {
+  font-family: inherit;
+  font-size: 1rem;
+  color: inherit;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+input,
+select {
+  font-family: inherit;
+  color: inherit;
+}
+
+/* Visually-hidden but accessible label text. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
