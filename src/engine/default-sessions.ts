@@ -4,13 +4,15 @@
 // runtime-validated when seeded (persistence's "every built-in passes validate" test) and
 // by default-presets.test.ts, so the cast below can never smuggle in an invalid preset.
 //
-// Three power naps: descend fast, hold, then ascend to a gentle isochronic wake.
+// One full-night sleep journey (~90-min cycles, theta<->delta, morning wake ramp) +
+// three power naps (descend fast, hold, then ascend to a gentle isochronic wake).
 import type { Preset } from './session-model';
 
+import sleep8h from '../../presets/8h-sleep-cycles.json';
 import nap20 from '../../presets/power-nap-20.json';
 import nap40 from '../../presets/power-nap-40.json';
 import nap60 from '../../presets/power-nap-60.json';
 
 // JSON infers schemaVersion as `number`, not the literal `3`; cast once. Validity is
 // guaranteed at runtime by the seed-time validate(), not by this cast.
-export const DEFAULT_SESSIONS: Preset[] = [nap20, nap40, nap60] as unknown as Preset[];
+export const DEFAULT_SESSIONS: Preset[] = [sleep8h, nap20, nap40, nap60] as unknown as Preset[];
