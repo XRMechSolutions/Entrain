@@ -1,6 +1,11 @@
 # Entrain
 
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+[![Deploy to GitHub Pages](https://github.com/XRMech/entrain/actions/workflows/deploy.yml/badge.svg)](https://github.com/XRMech/entrain/actions/workflows/deploy.yml)
+
 **An offline-first web app for binaural beats, isochronic tones, spatial pan, and breath‑paced sessions — with exact‑frequency Web Audio synthesis and full per‑node automation.**
+
+🔊 **Live demo (installable PWA): [xrmech.github.io/entrain](https://xrmech.github.io/entrain/)** — open it on your phone and choose **Install** / **Add to Home Screen**. Headphones recommended for the binaural effect.
 
 Entrain is a Progressive Web App (PWA): it runs in any modern browser, installs to your phone or desktop, and works **fully offline** after the first load. Everything is synthesized live in the browser — no audio files, no account, no tracking, no server.
 

@@ -17,10 +17,12 @@ const viteConfig = readFileSync(join(root, 'vite.config.ts'), 'utf8');
 const assetsConfig = readFileSync(join(root, 'pwa-assets.config.ts'), 'utf8');
 
 describe('vite.config.ts — VitePWA manifest', () => {
-  it('pins a stable install identity (id/start_url/scope = /)', () => {
-    expect(viteConfig).toMatch(/id:\s*'\/'/);
-    expect(viteConfig).toMatch(/start_url:\s*'\/'/);
-    expect(viteConfig).toMatch(/scope:\s*'\/'/);
+  it('derives a build-aware base (default "/") and uses it for the manifest identity', () => {
+    // base = process.env.BASE_PATH || '/' — root locally, the repo subpath on GitHub Pages.
+    expect(viteConfig).toMatch(/const base\s*=\s*process\.env\.BASE_PATH\s*\|\|\s*'\/'/);
+    expect(viteConfig).toMatch(/id:\s*base/);
+    expect(viteConfig).toMatch(/start_url:\s*base/);
+    expect(viteConfig).toMatch(/scope:\s*base/);
   });
 
   it('declares display standalone and dark theme/background (Chromium install criteria)', () => {
