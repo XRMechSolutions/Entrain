@@ -22,7 +22,7 @@ Entrain is a Progressive Web App (PWA): it runs in any modern browser, installs 
 - **Modulators on any parameter** — sine / triangle / square / pulse / **box** (a breath‑shaped trapezoid: inhale‑ramp → hold → exhale‑ramp → hold), so you can warble a frequency or breathe‑pace anything.
 - **A live experimentation console** — every setting is a slider on the main page; tweak it, hear it instantly.
 - **An advanced node editor** — add/move/remove nodes on a timeline and edit each node with the full control set plus its interpolation.
-- **A built‑in session library** — 20 / 40 / 60‑minute power naps (sleep fast → hold → ascend to a gentle wake), plus band/use starters. Import/export your own sessions as JSON.
+- **A built‑in session library** — focus & deep‑work sessions (binaural beta with beat warble + spatial drift), creative alpha and alpha→theta flows, isochronic focus pulses (beta 15 / 18 + a 40 Hz gamma, no headphones needed), 20 / 40 / 60‑minute power naps (sleep fast → hold → ascend to a gentle wake), a full‑night sleep journey, plus band/use starters. Import/export your own sessions as JSON.
 - **PWA**: installable, offline, with mobile background‑audio handling.
 
 ---

@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 5,
+  "name": "Create — Alpha 10 Hz (Warble + Drift)",
+  "durationSec": 1800,
+  "masterGain": 0.7,
+  "nodes": [
+    {
+      "t": 0,
+      "carrier": { "value": 240 },
+      "beat": { "value": 10, "transition": "linear" },
+      "volume": { "value": 0, "transition": "linear" },
+      "spatial": {
+        "value": 0,
+        "transition": "linear",
+        "mod": { "shape": "sine", "periodSec": 22, "depth": 0.36, "transition": "glide" }
+      }
+    },
+    { "t": 20, "volume": { "value": 1, "transition": "linear" } },
+    {
+      "t": 60,
+      "beat": {
+        "value": 10,
+        "transition": "linear",
+        "mod": { "shape": "sine", "periodSec": 26, "depth": 0.09, "transition": "glide" }
+      }
+    },
+    { "t": 1780, "volume": { "value": 1, "transition": "linear" } },
+    { "t": 1800, "beat": { "value": 10 }, "volume": { "value": 0 } }
+  ]
+}

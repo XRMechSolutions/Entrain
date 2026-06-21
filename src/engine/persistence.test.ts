@@ -490,7 +490,7 @@ describe('savePreset', () => {
 describe('default presets', () => {
   it('every built-in passes session-model.validate with the documented invariants', () => {
     const defs = buildDefaultLibraryPresets();
-    expect(defs).toHaveLength(8);
+    expect(defs).toHaveLength(15);
 
     for (const p of defs) {
       const res = sessionModel.validate(p);
@@ -521,7 +521,7 @@ describe('default presets', () => {
 
   it('I3: seed on a fresh library adds the built-ins and returns their summaries; second call is []', () => {
     const added = seedDefaultPresets();
-    expect(added).toHaveLength(8);
+    expect(added).toHaveLength(15);
     // The original four band/use starters seed first, in order.
     expect(added.slice(0, 4).map((s) => s.name)).toEqual([
       'Relax — Alpha 10 Hz',
@@ -534,10 +534,10 @@ describe('default presets', () => {
     expect(names.some((n) => n.startsWith('Power Nap — 20'))).toBe(true);
     expect(names.some((n) => n.startsWith('Power Nap — 60'))).toBe(true);
     for (const s of added) expect(s.id).toMatch(UUID_RE);
-    expect(listPresets()).toHaveLength(8);
+    expect(listPresets()).toHaveLength(15);
 
     expect(seedDefaultPresets()).toEqual([]);
-    expect(listPresets()).toHaveLength(8);
+    expect(listPresets()).toHaveLength(15);
   });
 
   it('I4: deleting all defaults then re-seeding stays empty (seeded gate)', () => {
@@ -551,8 +551,8 @@ describe('default presets', () => {
   it('clearLibrary then seedDefaultPresets re-seeds (factory reset)', () => {
     seedDefaultPresets();
     clearLibrary();
-    expect(seedDefaultPresets()).toHaveLength(8);
-    expect(listPresets()).toHaveLength(8);
+    expect(seedDefaultPresets()).toHaveLength(15);
+    expect(listPresets()).toHaveLength(15);
   });
 });
 
@@ -563,14 +563,14 @@ describe('default presets', () => {
 describe('restoreDefaultPresets (non-destructive top-up)', () => {
   const DEFAULT_NAMES = buildDefaultLibraryPresets().map((p) => p.name);
 
-  it('R1: a FRESH library gains all 8 built-ins and they are returned, in order', () => {
+  it('R1: a FRESH library gains all 15 built-ins and they are returned, in order', () => {
     const added = restoreDefaultPresets();
-    expect(added).toHaveLength(8);
+    expect(added).toHaveLength(15);
     expect(added.map((s) => s.name)).toEqual(DEFAULT_NAMES); // same order as buildDefaultLibraryPresets
     for (const s of added) expect(s.id).toMatch(UUID_RE);
 
     const list = listPresets();
-    expect(list).toHaveLength(8);
+    expect(list).toHaveLength(15);
     // Every returned id is actually present in the library.
     const presentIds = new Set(list.map((s) => s.id));
     for (const s of added) expect(presentIds.has(s.id)).toBe(true);
@@ -595,8 +595,8 @@ describe('restoreDefaultPresets (non-destructive top-up)', () => {
 
     const added = restoreDefaultPresets();
 
-    // Only the 5 defaults NOT already present were added (8 total - 3 pre-seeded).
-    expect(added).toHaveLength(5);
+    // Only the defaults NOT already present were added (15 total - 3 pre-seeded).
+    expect(added).toHaveLength(12);
     const addedNames = added.map((s) => s.name);
     expect(addedNames).not.toContain(defs[0].name);
     expect(addedNames).not.toContain(defs[1].name);
@@ -611,8 +611,8 @@ describe('restoreDefaultPresets (non-destructive top-up)', () => {
       expect(JSON.stringify(stillThere)).toBe(json); // byte-identical
     }
 
-    // Total = 4 pre-existing + 5 appended = 9, with the user preset still present once.
-    expect(after.records).toHaveLength(9);
+    // Total = 4 pre-existing + 12 appended = 16, with the user preset still present once.
+    expect(after.records).toHaveLength(16);
     expect(after.records.filter((r) => r.id === 'user-1')).toHaveLength(1);
     // No default name appears twice (no duplicates created).
     const allNames = listPresets().map((s) => s.name);
@@ -630,7 +630,7 @@ describe('restoreDefaultPresets (non-destructive top-up)', () => {
     expect(restoreDefaultPresets()).toEqual([]);
     expect(setSpy).not.toHaveBeenCalled();
     expect(localStorage.getItem(STORAGE_KEY)).toBe(snapshot); // unchanged bytes
-    expect(listPresets()).toHaveLength(8);
+    expect(listPresets()).toHaveLength(15);
   });
 
   it('R4: after deleting two defaults, restore re-adds EXACTLY those two', () => {
@@ -639,12 +639,12 @@ describe('restoreDefaultPresets (non-destructive top-up)', () => {
     // Delete two specific defaults by id.
     const victims = [list[0], list[1]];
     for (const v of victims) deletePreset(v.id);
-    expect(listPresets()).toHaveLength(6);
+    expect(listPresets()).toHaveLength(13);
 
     const added = restoreDefaultPresets();
     expect(added).toHaveLength(2);
     expect(new Set(added.map((s) => s.name))).toEqual(new Set(victims.map((v) => v.name)));
-    expect(listPresets()).toHaveLength(8);
+    expect(listPresets()).toHaveLength(15);
 
     // And it's idempotent again.
     expect(restoreDefaultPresets()).toEqual([]);

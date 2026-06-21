@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 5,
+  "name": "Deep Work — Beta 18 Hz (Isochronic + Drift)",
+  "durationSec": 2700,
+  "masterGain": 0.7,
+  "nodes": [
+    {
+      "t": 0,
+      "carrier": { "value": 280 },
+      "beat": { "value": 0 },
+      "volume": {
+        "value": 0,
+        "transition": "linear",
+        "mod": {
+          "shape": "pulse",
+          "periodSec": 0.05556,
+          "depth": 1,
+          "transition": "glide",
+          "pulseWidth": 0.5,
+          "edgeMs": 4
+        }
+      },
+      "spatial": {
+        "value": 0,
+        "transition": "linear",
+        "mod": { "shape": "sine", "periodSec": 16, "depth": 0.25, "transition": "glide" }
+      }
+    },
+    { "t": 15, "volume": { "value": 1, "transition": "linear" } },
+    {
+      "t": 2680,
+      "volume": { "value": 1, "transition": "linear" },
+      "spatial": {
+        "value": 0,
+        "transition": "linear",
+        "mod": { "shape": "sine", "periodSec": 16, "depth": 0.3, "transition": "glide" }
+      }
+    },
+    { "t": 2700, "volume": { "value": 0 } }
+  ]
+}

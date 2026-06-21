@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 5,
+  "name": "Create — Alpha→Theta 10→7 Hz (Warble + Drift)",
+  "durationSec": 2400,
+  "masterGain": 0.7,
+  "nodes": [
+    {
+      "t": 0,
+      "carrier": { "value": 240 },
+      "beat": { "value": 10, "transition": "linear" },
+      "volume": { "value": 0, "transition": "linear" },
+      "spatial": {
+        "value": 0,
+        "transition": "linear",
+        "mod": { "shape": "sine", "periodSec": 24, "depth": 0.36, "transition": "glide" }
+      }
+    },
+    { "t": 20, "volume": { "value": 1, "transition": "linear" } },
+    {
+      "t": 120,
+      "beat": {
+        "value": 10,
+        "transition": "smooth",
+        "mod": { "shape": "sine", "periodSec": 28, "depth": 0.1, "transition": "glide" }
+      }
+    },
+    {
+      "t": 900,
+      "beat": {
+        "value": 7,
+        "transition": "smooth",
+        "mod": { "shape": "sine", "periodSec": 28, "depth": 0.1, "transition": "glide" }
+      }
+    },
+    {
+      "t": 1500,
+      "beat": {
+        "value": 7,
+        "transition": "smooth",
+        "mod": { "shape": "sine", "periodSec": 28, "depth": 0.1, "transition": "glide" }
+      }
+    },
+    {
+      "t": 2280,
+      "beat": {
+        "value": 10,
+        "transition": "smooth",
+        "mod": { "shape": "sine", "periodSec": 28, "depth": 0.1, "transition": "glide" }
+      }
+    },
+    { "t": 2380, "volume": { "value": 1, "transition": "linear" } },
+    { "t": 2400, "beat": { "value": 10 }, "volume": { "value": 0 } }
+  ]
+}
