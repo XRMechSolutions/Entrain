@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatAgo, formatClock, formatHz, formatPan, formatPercent } from './format';
+import { formatAgo, formatBytes, formatClock, formatHz, formatPan, formatPercent } from './format';
 
 describe('formatClock', () => {
   it('formats mm:ss (the canonical example)', () => {
@@ -56,6 +56,24 @@ describe('formatPan', () => {
   it('renders non-finite safely as Center', () => {
     expect(formatPan(NaN)).toBe('Center');
     expect(formatPan(Infinity)).toBe('Center');
+  });
+});
+
+describe('formatBytes (Phase-2, design §21)', () => {
+  it('formats the canonical examples', () => {
+    expect(formatBytes(512)).toBe('512 B');
+    expect(formatBytes(683008)).toBe('667 KB');
+    expect(formatBytes(1363149)).toBe('1.3 MB');
+  });
+  it('drops a trailing .0 (whole KB/MB show no decimal)', () => {
+    expect(formatBytes(1024)).toBe('1 KB');
+    expect(formatBytes(1024 * 1024)).toBe('1 MB');
+  });
+  it('renders 0 / negative / non-finite safely (never "NaN KB")', () => {
+    expect(formatBytes(0)).toBe('0 B');
+    expect(formatBytes(-100)).toBe('0 B');
+    expect(formatBytes(NaN)).toBe('0 B');
+    expect(formatBytes(Infinity)).toBe('0 B');
   });
 });
 

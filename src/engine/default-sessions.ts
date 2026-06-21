@@ -13,6 +13,6 @@ import nap20 from '../../presets/power-nap-20.json';
 import nap40 from '../../presets/power-nap-40.json';
 import nap60 from '../../presets/power-nap-60.json';
 
-// JSON infers schemaVersion as `number`, not the literal `3`; cast once. Validity is
+// JSON infers schemaVersion as `number`, not the literal `5`; cast once. Validity is
 // guaranteed at runtime by the seed-time validate(), not by this cast.
 export const DEFAULT_SESSIONS: Preset[] = [sleep8h, nap20, nap40, nap60] as unknown as Preset[];

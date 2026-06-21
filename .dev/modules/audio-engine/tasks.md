@@ -105,6 +105,62 @@ Layer-1 module that consumes a `Voice`.
   - Ref: .dev/planning/modules/audio-engine/edge-cases.md
   - Verify the module's observable behavior matches its interfaces.md + edge-cases.md: trace every public interface (createVoice, registerPulseWorklet, all Voice params/setters/helpers/lifecycle, the pulse worklet) input → implementation → observable output; confirm every documented edge case (A–H) has evidence of handling and no silent valid-looking default; PASS required before the module is considered complete.
 
+## Feature: master flag (Phase 2)
+
+Adds `VoiceOptions.master?: 'internal' | 'bus'` (default `'internal'`, D-036) so the
+same `createVoice` builds either a standalone destination-connected voice (Phase-1,
+unchanged) or a unity-passthrough source for the Phase-2 unified mixer bus. Purely
+additive: `masterGainParam`, `setMasterGain`, `masterTrim`, `DEFAULT_MASTER`, and the
+`masterGain → ctx.destination` connection at :311 all stay. The normative two-mode
+contract is .dev/planning/phase2-audio-architecture.md §2.1 (restated engine-locally in
+design.md §13). Consumers `transport` and `renderer` always construct `{ master: 'bus' }`.
+
+Cohesion guardrails (acceptance criteria): the existing `audio-engine.test.ts` must run
+green BEFORE and AFTER this change with ZERO edits to its Phase-1 cases (every Phase-1
+case calls `createVoice(ctx)` at the `'internal'` default → silent-start
+`masterGain.gain === 0`, `setMasterGain` ramp + trim, `masterGain → ctx.destination`
+routing all stay byte-identical). No-click rule (D-008) and single-writer-on-master
+(D-019) are preserved: bus mode does NOT add a second writer to the master timeline.
+`automation.test.ts` and `transport-master-gain.test.ts` are unrelated guardrails here —
+not touched by this feature, and must remain unchanged/green.
+
+- [x] [impl] Add additive VoiceOptions.master 'internal'|'bus' flag to createVoice — bus mode sets masterGain.gain=1 and makes setMasterGain a guarded no-op | file: src/engine/audio-engine.ts | model: T1
+  - Ref: .dev/planning/phase2-audio-architecture.md @ §2.1 audio-engine.ts — additive `master` flag (LOW risk) (normative two-mode table + the :273 / :311 line edges)
+  - Ref: .dev/planning/phase2-audio-architecture.md @ §6 Cross-Module Contract Spine (audio-engine row: `VoiceOptions { …; master?: 'internal' | 'bus' /* default 'internal' */ }`)
+  - Ref: .dev/planning/modules/audio-engine/design.md @ §13 Master placement — the `master` flag (D-036) (mode table + why-unity / why-inert / why-unconditional-connect)
+  - Ref: .dev/planning/modules/audio-engine/interfaces.md @ VoiceOptions (master field, lines 23-32) + Authoritative contract (phase2 §6 verbatim, lines 60-69)
+  - Ref: .dev/planning/modules/audio-engine/edge-cases.md @ A8 (unknown/omitted `master` → default `'internal'`, never throws) + A9 (`setMasterGain(non-finite)` in bus mode still throws) + A1 (non-finite poison rejection — contract parity both modes)
+  - Accepts: createVoice(ctx, options?: VoiceOptions) where VoiceOptions.master?: 'internal' | 'bus' (default 'internal'); A8 — omitted or unrecognized string is treated as 'internal', never throws
+  - Creates: bus mode — construction sets masterGain.gain.value = 1 (unity passthrough; the construction-time `= 0` write at audio-engine.ts:273 is skipped); setMasterGain becomes a guarded no-op that still runs the non-finite check (throws INVALID_PARAMETER on NaN/±Infinity, A9/A1) but performs NO 10 ms ramp and records NO trim; internal mode — unchanged Phase-1 (masterGain.gain.value = DEFAULT_MASTER = 0 at :273; setMasterGain ramps + records the trim ceiling)
+  - Behavior: ~12 lines, all behind the flag; masterGainParam stays exposed in both modes; the unconditional `masterGain.connect(ctx.destination)` at audio-engine.ts:311 STAYS (default voice audible with no wiring; bus voice has a well-defined output node before the composer drops that edge and rewires to mixer.bedInput); deletes nothing (masterGainParam / setMasterGain / masterTrim / DEFAULT_MASTER all remain)
+  - Ripple: transport + renderer construct `createVoice(ctx, { master: 'bus' })`; no signature break for standalone callers (master is optional, defaults to 'internal')
+  - Tests: happy — internal default builds masterGain.gain=0 and setMasterGain ramps+records trim exactly as Phase-1 (no behavior change); bus mode builds masterGain.gain.value === 1 (unity), setMasterGain(finite) is a no-op (no ramp recorded, trim unchanged), masterGain still connected to ctx.destination at construction; error — bus-mode setMasterGain(NaN/±Infinity) still throws INVALID_PARAMETER (A9/A1); edge — omitted master → 'internal' (A8), unrecognized string → treated as 'internal' not thrown (A8), masterGainParam exposed and identical-shaped in both modes
+  - Acceptance: existing audio-engine.test.ts Phase-1 cases run green with ZERO edits (the `'internal'` default keeps masterGain.gain===0 silent-start, setMasterGain ramp+trim, destination routing byte-identical); :311 destination connect stays unconditional; no second writer added to the master timeline (D-019 preserved); no-click 0→trim fade stays the mixer/transport's job in bus mode (D-008 preserved)
+
+- [x] [test] Keep existing audio-engine.test.ts Phase-1 cases byte-identical and add one new bus-mode assertion block | file: src/engine/audio-engine.test.ts | model: T1
+  - Ref: .dev/planning/phase2-audio-architecture.md @ §2.1 (Test impact: zero edits to existing audio-engine.test.ts; add ONE bus-mode assertion — masterGain.gain===1 and setMasterGain no-op, non-finite still throws)
+  - Ref: .dev/planning/phase2-audio-architecture.md @ §6 Test retargets (existing files): audio-engine.test.ts → no edits; add one bus-mode assertion
+  - Ref: .dev/planning/modules/audio-engine/design.md @ §13.1 Test impact (additive only) — the exact (a)/(b)/(c) bus-mode assertions
+  - Ref: .dev/planning/modules/audio-engine/edge-cases.md @ A9 (setMasterGain non-finite in bus mode still throws) + A8 (default selection)
+  - Accepts: existing audio-engine.test.ts (every Phase-1 case constructs createVoice(ctx) at the 'internal' default)
+  - Creates: ONE new bus-mode test block constructing createVoice(ctx, { master: 'bus' }) asserting (a) masterGain.gain.value === 1 after construction, (b) setMasterGain(finite v) is a no-op — no ramp recorded, trim ceiling unchanged, (c) setMasterGain(NaN/±Infinity) still throws INVALID_PARAMETER
+  - Behavior: do NOT modify any existing Phase-1 case — add the bus-mode block alongside them; the Phase-1 lines (silent start ===0, setMasterGain ramp+trim, ctx.destination routing) stay byte-identical
+  - Tests: happy — new bus-mode block: masterGain.gain.value === 1, setMasterGain(0.5) records no trim and schedules no ramp; error — setMasterGain(NaN) and setMasterGain(Infinity) in bus mode both throw INVALID_PARAMETER; edge — the full existing suite (Phase-1 internal-default cases) still passes unchanged
+  - Acceptance: `audio-engine.test.ts` green BEFORE and AFTER; existing Phase-1 cases have zero diffs (the only delta is the one appended bus-mode block); the bus-mode block is the single test delta for this feature
+
+- [x] [audit] Behavioral audit: master flag feature | file: .dev/.task-state/audio-engine/behavioral-audit-master-flag.md | model: T1
+  - Ref: C:/Projects/.dev-shared/behavioral-audit.md — Module Behavioral Audit checklist
+  - Ref: .dev/planning/phase2-audio-architecture.md @ §2.1 + §6 (the master-flag contract this feature delivers)
+  - Ref: .dev/planning/modules/audio-engine/design.md @ §13 / §13.1
+  - Ref: .dev/planning/modules/audio-engine/interfaces.md @ VoiceOptions (master) + createVoice
+  - Ref: .dev/planning/modules/audio-engine/edge-cases.md @ A8, A9, A1
+  - Trace input→output for both modes: createVoice(ctx) [internal] → masterGain.gain===0, setMasterGain ramps+records trim, masterGain→ctx.destination; createVoice(ctx,{master:'bus'}) → masterGain.gain===1, setMasterGain guarded no-op (finite ignored, non-finite throws), masterGain still connected to ctx.destination
+  - Consumer verification: confirm transport + renderer construct `{ master: 'bus' }` and that voice.output (= masterGain) is a unity-passthrough node they disconnect from ctx.destination and rewire to mixer.bedInput — no double attenuation, no second writer on the master timeline (D-019)
+  - Failure path: confirm bus-mode setMasterGain throws loudly on non-finite (A9/A1) rather than silently swallowing it; confirm no silent valid-looking default masks a missing mode (A8 default is explicit 'internal')
+  - Edge cases: confirm A8 (omitted/unknown → 'internal', never throws) and A9 (non-finite throw in bus mode) have evidence in the code; confirm masterGainParam exposed identically in both modes
+  - Guardrails: confirm audio-engine.test.ts Phase-1 cases are byte-identical and green, the single bus-mode block exists and passes, and automation.test.ts + transport-master-gain.test.ts remain unchanged and green
+  - Write findings to .dev/.task-state/audio-engine/behavioral-audit-master-flag.md; PASS required before the feature is considered complete
+
 ## Completion Criteria
 - [ ] All tasks marked [x] — zero tasks left [ ] (Pending) or [!] (Needs-Attention)
 - [ ] Zero active stubs for this module in .dev/.task-state/stub-registry.md

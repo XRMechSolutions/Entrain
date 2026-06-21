@@ -4,7 +4,9 @@
      panel edits any node's modulator. THE ONE INVIOLABLE RULE is honoured: every control is
      ONE-WAY. Displays derive from the plain preset through session.revision; commits flow OUT
      through session.setNodeMod(index, param, patch) (off → null/clear, on → a ModPoint). Rate
-     is shown in Hz and converted to periodSec = 1/rate (clamped 0.01–40 Hz, periodSec > 0). -->
+     is shown in Hz and converted to periodSec = 1/rate (clamped 0.01–40 Hz, periodSec > 0); a
+     read-only cycle-time readout (seconds per cycle) sits beside it so a slow pan/breath sweep
+     reads as a cadence (e.g. 0.06 Hz ≈ 16 s) you can match to a breathing pattern. -->
 <script lang="ts">
   import { getAppContext } from '../context';
   import { CONTROL, type ControlSpec } from '../lib/controls';
@@ -42,10 +44,12 @@
   const RATE_MIN_HZ = 0.01;
   const RATE_MAX_HZ = 40;
   const RATE_SPEC: ControlSpec = { min: RATE_MIN_HZ, max: RATE_MAX_HZ, step: 0.01, unit: 'Hz' };
-  // Depth units are the param's own units: Hz for carrier/beat, 0–1 (shown %) for volume.
+  // Depth is a 0–1 fraction for every param (shown %): for carrier/beat it is the warble
+  // swing as a fraction of the base frequency (±%), for volume the tremolo amount, for
+  // spatial the position swing. (carrier/beat were absolute Hz before schema v5.)
   const DEPTH_SPEC: Readonly<Record<AutomatableParam, ControlSpec>> = {
-    carrier: { min: 0, max: 50, step: 0.5, unit: 'Hz' },
-    beat: { min: 0, max: 20, step: 0.1, unit: 'Hz' },
+    carrier: { min: 0, max: 1, step: 0.01, unit: '%' },
+    beat: { min: 0, max: 1, step: 0.01, unit: '%' },
     volume: { min: 0, max: 1, step: 0.01, unit: '%' },
     spatial: { min: 0, max: 1, step: 0.01, unit: '' },
   };
@@ -64,8 +68,8 @@
     if (param === 'volume') {
       return { shape: 'pulse', periodSec: 0.1, depth: 0.9, transition: 'glide', pulseWidth: 0.5, edgeMs: 2 };
     }
-    if (param === 'beat') return { shape: 'sine', periodSec: 10, depth: 2, transition: 'glide' };
-    return { shape: 'sine', periodSec: 5, depth: 5, transition: 'glide' };
+    if (param === 'beat') return { shape: 'sine', periodSec: 10, depth: 0.15, transition: 'glide' };
+    return { shape: 'sine', periodSec: 5, depth: 0.03, transition: 'glide' };
   }
 
   function clampRate(hz: number): number {
@@ -101,6 +105,10 @@
   const shape = $derived<ModShape>(mod.shape ?? (param === 'volume' ? 'pulse' : 'sine'));
   const transition = $derived<ModTransition>(mod.transition ?? 'glide');
   const rateHz = $derived(rateFromPeriod(mod.periodSec));
+  // Cycle time (seconds per full cycle) shown next to the Hz rate so a slow sweep reads as a
+  // breathing cadence — e.g. 0.06 Hz ≈ 16 s/cycle — instead of an opaque fraction of a hertz.
+  const cycleSec = $derived(1 / rateHz);
+  const cycleLabel = $derived(cycleSec >= 10 ? `${cycleSec.toFixed(1)} s` : `${cycleSec.toFixed(2)} s`);
   const depth = $derived(mod.depth ?? defaultMod().depth ?? 0);
   const pulseWidth = $derived(mod.pulseWidth ?? 0.5);
   const edgeMs = $derived(mod.edgeMs ?? 0);
@@ -163,6 +171,7 @@
       </label>
 
       <ParamControl label="Rate" spec={RATE_SPEC} value={rateHz} oninput={() => {}} oncommit={commitRate} />
+      <p class="cycle" data-testid={`mod-cycle-${param}`}>≈ {cycleLabel} per cycle</p>
       <ParamControl label="Depth" spec={DEPTH_SPEC[param]} value={depth} oninput={() => {}} oncommit={(v) => patch({ depth: v })} />
 
       <label class="select">
@@ -268,6 +277,14 @@
     border: 1px solid var(--border);
     border-radius: 8px;
     text-transform: capitalize;
+  }
+  .cycle {
+    /* Pull the readout up under the Rate control (countering the .body gap) so it reads as a
+       sub-label of the rate, not a separate row. */
+    margin: calc(-1 * var(--sp-2)) 0 0;
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    font-variant-numeric: tabular-nums;
   }
   .warn {
     margin: 0;

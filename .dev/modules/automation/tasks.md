@@ -126,6 +126,92 @@ preset. It is consumed by `transport` (its normal entry point is `scheduleAll`) 
 - [x] [cleanup] Doc drift: document the `box` (breath trapezoid) shape and the four-lane (`spatial`) `INVALID_PARAM` set in the automation planning docs | file: .dev/planning/modules/automation/{interfaces.md,edge-cases.md,design.md} | model: T2
   - Ref: behavioral audit 2026-06-15 — `box` shape (trapezoid trajectory, h=0 triangle / h=1 square degenerate cases, steps-ignored, volume [1−depth,1] map, always-rebuild-on-retarget) and the spatial pan-range clamp are implemented + tested in `automation.ts` but absent from the planning docs. `interfaces.md §1` still reads `param not in {'carrier','beat','volume'}` though source (`automation.ts:55`) and session-model already use the four-lane set `{carrier,beat,volume,spatial}`. Deterministic doc-only fix; code is correct, docs are stale.
 
+## Feature: scheduleLane extraction (Phase 2)
+
+Phase-2 (layered audio / render-export) needs ONE no-click base-param writer shared by the
+four binaural lanes, the layer lanes (`layer-scheduler`), and the duck (`mixer.scheduleDuck`).
+This feature extracts this module's existing in-closure base-curve writer (`scheduleBaseCurve`
+`automation.ts:603–655` + helper `scheduleSmoothSegment` `:657–678`) into the exported free
+function `scheduleLane(param, points, opts)` and refactors the four binaural lanes to call it via
+a thin in-closure adapter. It is a **pure refactor**: the op-sequence emitted onto every
+`AudioParam` is byte-identical before and after, and `automation.test.ts` is the guardrail that
+proves it. The normative contract (signature, `opts` fields, routing) lives in
+phase2-audio-architecture.md §3 + §6 (D-036/D-037) and is restated verbatim in interfaces.md §5b —
+this feature builds to that contract, it does not alter it. No new modulator, retarget, or
+teardown behavior is introduced; only the *home* of the base-curve writer moves.
+
+Cohesion guardrails (acceptance criteria below): the three existing suites are byte-identical
+behavioral guardrails and must run **green before AND after** this work with no edits —
+`automation.test.ts` (the scheduleLane op-sequence), `audio-engine.test.ts` (master-flag default
+stays `'internal'`), and `transport-master-gain.test.ts` (unchanged). No-click ramps (D-008) and
+single-writer params (D-019) are preserved structurally, not by `scheduleLane` (it is stateless).
+
+- [x] [prereq] Confirm `LanePoint` is exported from `session-model` (single source of truth — D-036 fix); add the `export interface LanePoint { t: number; value: number; transition?: ParamTransition }` to `src/engine/session-model.ts` only if absent, and do NOT re-declare or re-export it in `automation.ts`. | file: src/engine/session-model.ts | model: T3
+  - Ref: .dev/planning/modules/automation/interfaces.md @ 5b. `scheduleLane` (the `import type { LanePoint } from './session-model'` note — automation imports it, never re-declares/re-exports)
+  - Ref: C:/Projects/BinauralAudio/.dev/planning/phase2-audio-architecture.md @ 3. The Shared `scheduleLane` Primitive (`LanePoint` shape); @ 6. Cross-Module Contract Spine (session-model is L0, owns the schema)
+  - Ref: .dev/planning/modules/automation/edge-cases.md @ J. The extracted `scheduleLane` primitive (J-intro — single source of truth)
+  - Accepts: the current `session-model.ts` type surface
+  - Creates: `export interface LanePoint { t: number; value: number; transition?: ParamTransition }` in `session-model.ts` IF NOT ALREADY PRESENT (no-op if it exists); no new runtime behavior, no `automation.ts` change in this task
+  - Behavior: `LanePoint` is OWNED by `session-model` (D-036 fix); `automation.ts` will `import type { LanePoint }` from it (never declare a local copy) — this prereq guarantees the import target exists before the extraction task
+  - Tests (happy): `session-model.test.ts` still green (byte-identical guardrail — schema-only addition is additive); `LanePoint` is importable as a type from `./session-model`
+  - Tests (error/edge): if `LanePoint` already exists, this task is a verified no-op (do NOT create a duplicate declaration — a duplicate is a compile error); confirm exactly one declaration exists project-wide
+  - Ripple: `automation.ts` (imports the type), `layer-scheduler.ts` + `mixer.ts` (Phase-2 callers import the same type) — all import, none re-declare
+
+- [x] [impl] Extract `scheduleBaseCurve` + `scheduleSmoothSegment` verbatim out of the `schedule` closure into the exported free function `scheduleLane(param: AudioParam, points: readonly LanePoint[], opts: ScheduleLaneOpts)`, lifting its three captured dependencies into `opts` (`anchorValue`, `valueAt`, `policy`) with zero behavior change. | file: src/engine/automation.ts | model: T1
+  - Ref: .dev/planning/modules/automation/design.md @ 8.7 `scheduleLane` — the extracted shared base-curve writer (D-036)
+  - Ref: .dev/planning/modules/automation/design.md @ 3. Base transitions (3.1 exp→linear fallback; 3.2 smooth polyline; 3.3 volume micro-ramp vs frequency step — the §8.2 algorithm is UNCHANGED, only its home moves)
+  - Ref: .dev/planning/modules/automation/design.md @ 11. Constants (SMOOTH_* / VOLUME_MICRORAMP_SEC stay module-level; only `policy.stepRampSec` + `policy.expFallback` cross the opts boundary)
+  - Ref: .dev/planning/modules/automation/interfaces.md @ 5b. `scheduleLane` — the shared no-click param writer (signature + `ScheduleLaneOpts` restated VERBATIM from ARCH §6/§3; both `anchorValue` AND `valueAt` are load-bearing)
+  - Ref: .dev/planning/modules/automation/edge-cases.md @ J. The extracted `scheduleLane` primitive (J1 mid-segment seek anchor; J3 stepRampSec fork; J4 exp fallback; J6 op-sequence byte-identical)
+  - Ref: C:/Projects/BinauralAudio/.dev/planning/phase2-audio-architecture.md @ 3. The Shared `scheduleLane` Primitive (NORMATIVE signature, `opts` fields, "Extract verbatim"); @ 6. Cross-Module Contract Spine (automation REFACTORED row) + Build order
+  - Ref: .dev/knowledge/web-audio/audioparam-automation.md (anchor before ramping; only `setValueAtTime` + linear/exp ramps — never `setValueCurveAtTime`)
+  - Accepts: `param: AudioParam`, `points: readonly LanePoint[]` (`{ t, value, transition }`), `opts: ScheduleLaneOpts = { startTime, startOffsetSec, floorTime, anchorValue, valueAt, policy: { stepRampSec, expFallback } }`
+  - Creates: `export function scheduleLane(param, points, opts): void` and `export interface ScheduleLaneOpts` in `automation.ts`; `import type { LanePoint } from './session-model'` (NEVER a local re-declaration — single source of truth, D-036 fix)
+  - Behavior: anchor-first (`setValueAtTime(opts.anchorValue, floorT(startTime))` — never `param.value`); per-segment primitive selection from `transition`; mid-segment seek start uses `opts.valueAt(segStartPt)` when `segStartPt !== ti` (J1 — BOTH `anchorValue` and `valueAt` are required, a single anchor is insufficient); `policy.stepRampSec > 0` ⇒ 10 ms volume micro-ramp, `=== 0` ⇒ bare click-free `setValueAtTime` step (J3 / D-008); `policy.expFallback: true` ⇒ exp→linear on non-finite/zero/sign-change endpoints (J4 / §3.1); SMOOTH_* read from module scope, NOT from opts; returns void, throws nothing of its own (caller-validated inputs)
+  - Handles: J5 — `scheduleLane` is stateless and adds no second writer (single-writer D-019 stays the caller's invariant); never uses `setValueCurveAtTime` (Firefox bug 1752775 / edge-cases D5/D7)
+  - Tests (happy): op-sequence onto each `AudioParam` (every `setValueAtTime`/`linearRampToValueAtTime`/`exponentialRampToValueAtTime` order + args) is byte-identical to pre-extraction `scheduleBaseCurve` for linear / exp / hold / smooth segments (J6 — `automation.test.ts` green before & after)
+  - Tests (error): an `exp` segment with a 0 / sign-change endpoint under `expFallback: true` emits a `linearRamp`, never an `exponentialRamp` and never throws (J4)
+  - Tests (edge): a seek landing INSIDE a segment (`segStartPt !== ti`) anchors the straddling segment at `opts.valueAt(segStartPt)`, not `opts.anchorValue` (J1); volume `policy.stepRampSec = VOLUME_MICRORAMP_SEC` ⇒ micro-ramp, carrier/beat/spatial `stepRampSec = 0` ⇒ true step (J3); no `setValueCurveAtTime` ever emitted (D5/D7)
+  - Stubs expected: none — modulator (`:681–1024`) and retarget/stop (`:1061–1124`) stay in-closure, untouched
+  - Ripple: the in-closure binaural callers (initial schedule + retarget reschedule `:1102`) — resolved by the next task; the Phase-2 cross-module callers (`layer-scheduler`, `mixer.scheduleDuck`) consume this same primitive
+
+- [x] [impl] Refactor the four binaural lanes (carrier/beat/volume/spatial) to call `scheduleLane` via a thin in-closure adapter that binds `baseParam → param`, `laneKeyframes(p,param) → points`, `baseCore → { anchorValue, valueAt }`, and the volume fork → `policy.stepRampSec`; leave the modulator and retarget/stop paths untouched in the closure. | file: src/engine/automation.ts | model: T1
+  - Ref: .dev/planning/modules/automation/design.md @ 8.7 `scheduleLane` (the in-closure adapter: binds lane data + policy then delegates; "the adapter is the only binaural-specific code left"; modulator + retarget paths stay in-closure)
+  - Ref: .dev/planning/modules/automation/design.md @ 8.2 Schedule the base curve (the algorithm the adapter feeds); @ 9 retarget (the `oldAnchor = baseCore(curPreset,…)` at `:1071` flows into `opts.anchorValue` via `anchorOverride`)
+  - Ref: .dev/planning/modules/automation/interfaces.md @ 5b. `scheduleLane` (worked example — the binaural carrier lane scheduled via the in-closure adapter); @ 3/§4 (the lane's outward contract `schedule`/`ScheduledLane` is UNCHANGED)
+  - Ref: .dev/planning/modules/automation/edge-cases.md @ J. (J1 mid-segment seek; J2 never anchor from `param.value` — adapter supplies `baseCore`; J6 byte-identical)
+  - Ref: C:/Projects/BinauralAudio/.dev/planning/phase2-audio-architecture.md @ 3. (Callers → "Binaural lanes" bullet — the adapter binding); @ 6. (automation REFACTORED consumer = "in-closure binaural adapter (4 lanes)")
+  - Accepts: the existing `schedule(preset, param, voice, options?)` closure state (`curPreset`, `dur`, `startTime`, `startOffsetSec`, `floorTime`, `anchorOverride`, `baseParam`, `laneKeyframes`, `baseCore`, `clampTime`)
+  - Creates: the in-closure adapter that maps lane keyframes → `LanePoint[]` and computes `anchorValue = anchorOverride ?? baseCore(p, param, clampTime(startOffsetSec, dur))`, `valueAt = (t) => baseCore(p, param, t)`, `policy = { stepRampSec: param === 'volume' ? VOLUME_MICRORAMP_SEC : 0, expFallback: true }`, then calls `scheduleLane(baseParam, points, opts)`
+  - Behavior: both binaural call sites — the initial schedule at the top of `schedule` AND the retarget reschedule at `:1102` — now go through the adapter; carrier/beat/spatial pass `stepRampSec: 0`, volume passes `VOLUME_MICRORAMP_SEC`; `anchorValue` is ALWAYS a JS-tracked `baseCore` value, NEVER `param.value` (J2 / edge-cases E2); the outward `ScheduledLane`/`SessionSchedule` contract and the modulator/retarget logic are unchanged
+  - Handles: retarget feeds `oldAnchor` (`:1071`) as `anchorOverride → opts.anchorValue`; the modulator identity reconcile and Firefox cancelAndHold/anchor fallback (§9) stay in-closure
+  - Tests (happy): all four lanes render the same base op-sequence post-adapter as pre-extraction; `automation.test.ts` green with NO edits (J6); `valueAt` preview still equals OfflineAudioContext-rendered playback for every transition (preview == playback parity preserved)
+  - Tests (error): a stopped voice still propagates `AudioEngineError('VOICE_STOPPED')` (modulator/teardown path untouched — H4)
+  - Tests (edge): a mid-session `retarget` reschedules the base via the adapter with `anchorValue = oldAnchor` and keeps the modulator when identity is unchanged (phase continuous, C3); a seek (`startOffsetSec > 0`) landing mid-segment anchors via `valueAt` (J1); volume lane micro-ramps a `hold`, carrier/beat/spatial true-step it (J3 / D3/D4)
+  - Resolves stubs: none
+  - Ripple: `transport`/`ui` consume `schedule`/`scheduleAll`/`ScheduledLane` unchanged — outward contract is byte-stable
+
+- [x] [test] Run `automation.test.ts` GREEN before and after the extraction as the byte-identical op-sequence guardrail (no edits to the test file); confirm `audio-engine.test.ts` and `transport-master-gain.test.ts` also stay green. | file: src/engine/automation.test.ts | model: T1
+  - Ref: .dev/planning/modules/automation/design.md @ 8.7 (`automation.test.ts` is the byte-identical guardrail — "green before and after the extraction with no edits"; any op-sequence diff is an extraction bug, not a spec change)
+  - Ref: .dev/planning/modules/automation/edge-cases.md @ J6 (op-sequence diff after extraction = extraction bug, cannot be tolerated)
+  - Ref: C:/Projects/BinauralAudio/.dev/planning/phase2-audio-architecture.md @ 3. (Guardrail: "Extract verbatim; run green before and after"); @ 6. Test retargets (`automation.test.ts` → unchanged; `audio-engine.test.ts` → no edits add one bus-mode assertion; transport-master-gain unchanged)
+  - Accepts: the existing `automation.test.ts` op-sequence assertions (the scheduleLane extraction guardrail), `audio-engine.test.ts`, `transport-master-gain.test.ts`
+  - Creates: NO new test logic and NO edits to `automation.test.ts` — this task is the verification that the refactor preserved behavior; it captures a baseline run BEFORE the impl tasks and a re-run AFTER
+  - Behavior: byte-identical op-sequence proves the extraction is a pure refactor; if any op order/arg differs, the impl is wrong (fix the code, never the guardrail test)
+  - Tests (happy): `npx vitest run src/engine/automation.test.ts` passes identically pre- and post-extraction (same assertion count, same pass count)
+  - Tests (error): a deliberate op-sequence divergence (e.g. an accidental extra `setValueAtTime`) makes `automation.test.ts` FAIL — confirming the test is a real guardrail, not a tautology
+  - Tests (edge): full-suite cohesion — `npx vitest run` stays green including `audio-engine.test.ts` (master-flag default `'internal'` unchanged) and `transport-master-gain.test.ts` (unchanged)
+  - Ripple: none — verification only
+
+- [x] [audit] Module behavioral audit: scheduleLane extraction (Phase 2) | file: .dev/.task-state/automation/behavioral-audit-scheduleLane.md | model: T1
+  - Ref: C:/Projects/.dev-shared/behavioral-audit.md — Module Behavioral Audit checklist
+  - Ref: .dev/planning/modules/automation/interfaces.md @ 5b. `scheduleLane` — trace the exported `scheduleLane` from caller input (`param`, `points`, `opts`) to the observable `AudioParam` op-sequence; verify `import type { LanePoint } from './session-model'` (no local re-declaration / re-export — single source of truth, D-036 fix)
+  - Ref: .dev/planning/modules/automation/design.md @ 8.7 — verify the extraction is base-curve-only and the modulator/retarget/teardown paths are byte-stable in-closure
+  - Ref: .dev/planning/modules/automation/edge-cases.md @ J. (J1–J6) — every documented `scheduleLane` edge case has evidence of handling (J1 mid-segment seek both fields load-bearing; J2 never `param.value`; J3 stepRampSec fork; J4 exp fallback; J5 single-writer is caller's invariant; J6 op-sequence byte-identical)
+  - Verify: the four binaural lanes reach `scheduleLane` via the in-closure adapter and produce a byte-identical op-sequence (`automation.test.ts` green with no edits); the primitive is exported, reachable, and free of stubs/hardcoded defaults; `anchorValue` is always JS-tracked (never `param.value`); the three guardrail suites (`automation.test.ts`, `audio-engine.test.ts`, `transport-master-gain.test.ts`) are green before and after
+  - Write findings to .dev/.task-state/automation/behavioral-audit-scheduleLane.md
+  - PASS required before the scheduleLane feature is considered complete
+
 ## Completion Criteria
 - [ ] All tasks above marked [x] — none left [ ] (Pending) or [!] (Needs-Attention)
       ← NOT yet: one open `## Cleanup` doc-drift task (behavioral audit 2026-06-15). All impl/test/audit tasks are [x].

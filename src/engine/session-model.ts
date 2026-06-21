@@ -11,7 +11,7 @@
 // 1. Schema-version constants
 // ---------------------------------------------------------------------------
 
-export const CURRENT_SCHEMA_VERSION = 3;
+export const CURRENT_SCHEMA_VERSION = 5;
 export const MIN_SUPPORTED_SCHEMA_VERSION = 2;
 
 // ---------------------------------------------------------------------------
@@ -31,6 +31,12 @@ export type AutomatableParam = 'carrier' | 'beat' | 'volume' | 'spatial';
 export interface ModPoint {
   shape?: ModShape;
   periodSec?: number;
+  /** Warble/pulse amount, in the param's depth units (all bounded [0,1]):
+   *  - carrier/beat: a FRACTION of the lane's base frequency (e.g. 0.02 = ±2%). Automation
+   *    converts it to a Hz swing at each keyframe's base value, so a constant fraction gives
+   *    a proportional swing whatever the base. (v5+; v4 stored this as absolute Hz.)
+   *  - volume: tremolo depth as a 0..1 multiplier amount.
+   *  - spatial: position swing as a 0..1 offset. */
   depth?: number;
   transition?: ModTransition;
   pulseWidth?: number;
@@ -54,11 +60,50 @@ export interface TimeNode {
 }
 
 export interface Preset {
-  schemaVersion: 3;
+  schemaVersion: 5;
   name: string;
   durationSec: number;
   masterGain: number;
   nodes: TimeNode[];
+  layers?: Layer[]; // NEW (v4): stacked audio layers; absent = pure-binaural
+}
+
+// ---------------------------------------------------------------------------
+// 3a. Schema v4 — Layer types (Phase 2)
+// ---------------------------------------------------------------------------
+
+export type LayerKind = 'tone' | 'ambiance' | 'voice';
+
+export interface ToneSpec {
+  shape: Waveform; // reuse the oscillator enum
+  freqHz: number; // [20, 20000] finite — bell/tone pitch
+  attackSec: number; // ≥ 0 finite — envelope attack
+  releaseSec: number; // ≥ 0 finite — envelope release; one-shot len = attack+release
+}
+
+export type LayerSource = { synth: ToneSpec } | { clipId: string };
+
+export interface LanePoint {
+  t: number; // ≥ 0 finite — seconds RELATIVE to the layer's start
+  value: number; // gain: [0,1]; spatial: [-1,1]
+  transition?: ParamTransition; // toward next point; default 'linear'
+}
+
+export interface DuckIntent {
+  toGain: number; // [0,1] finite — target gain the bed sub-bus dips TO (reuses RANGES.volume)
+  attackSec: number; // ≥ 0 finite — ramp-down time into the dip
+  releaseSec: number; // ≥ 0 finite — ramp-back time out of the dip when the cue ends
+}
+
+export interface Layer {
+  id: string; // non-empty; unique within layers[]
+  kind: LayerKind;
+  source: LayerSource;
+  t: number; // layer start on the SESSION timeline; [0, durationSec]
+  loop?: boolean; // default false; ambiance typically true
+  gain?: LanePoint[]; // relative-time gain automation; absent = constant unity
+  spatial?: LanePoint[]; // relative-time pan automation; absent = center (0)
+  duck?: DuckIntent; // NEW (v4): dip the bed sub-bus to toGain while this cue plays (D-038); absent = no duck
 }
 
 // ---------------------------------------------------------------------------
@@ -90,6 +135,25 @@ export type ValidationCode =
   | 'MOD_EDGE_MS_NOT_FINITE' | 'MOD_EDGE_MS_NEGATIVE'
   | 'MOD_STEPS_NOT_ARRAY' | 'MOD_STEPS_EMPTY' | 'MOD_STEP_NOT_FINITE' | 'MOD_STEP_OUT_OF_RANGE'
   | 'WAVEFORM_INVALID'
+  // ---- v4 layer errors (set ok:false) ----
+  | 'LAYERS_NOT_ARRAY' | 'LAYER_NOT_OBJECT'
+  | 'LAYER_ID_NOT_STRING' | 'LAYER_ID_EMPTY' | 'LAYER_ID_DUPLICATE'
+  | 'LAYER_KIND_INVALID' | 'LAYER_SOURCE_INVALID'
+  | 'LAYER_CLIP_ID_NOT_STRING' | 'LAYER_CLIP_ID_EMPTY'
+  | 'TONE_SHAPE_INVALID' | 'TONE_FREQ_NOT_FINITE' | 'TONE_FREQ_OUT_OF_RANGE'
+  | 'TONE_ATTACK_NOT_FINITE' | 'TONE_ATTACK_NEGATIVE'
+  | 'TONE_RELEASE_NOT_FINITE' | 'TONE_RELEASE_NEGATIVE'
+  | 'LAYER_T_NOT_FINITE' | 'LAYER_T_NEGATIVE' | 'LAYER_T_EXCEEDS_DURATION'
+  | 'LAYER_LOOP_NOT_BOOLEAN'
+  | 'LANE_NOT_ARRAY' | 'LANE_POINT_NOT_OBJECT'
+  | 'LANE_T_NOT_FINITE' | 'LANE_T_NEGATIVE'
+  | 'LANE_VALUE_NOT_FINITE' | 'LANE_VALUE_OUT_OF_RANGE'
+  | 'LANE_TRANSITION_INVALID' | 'LANE_NOT_SORTED' | 'LANE_DUPLICATE_T'
+  | 'LANE_EXP_THROUGH_ZERO'
+  | 'DUCK_NOT_OBJECT'
+  | 'DUCK_TO_GAIN_NOT_FINITE' | 'DUCK_TO_GAIN_OUT_OF_RANGE'
+  | 'DUCK_ATTACK_NOT_FINITE' | 'DUCK_ATTACK_NEGATIVE'
+  | 'DUCK_RELEASE_NOT_FINITE' | 'DUCK_RELEASE_NEGATIVE'
   // ---- warnings (ok stays true) ----
   | 'UNKNOWN_FIELD' | 'IGNORED_FIELD_FOR_SHAPE'
   | 'MOD_EDGE_EXCEEDS_HALF_PERIOD' | 'STEPS_OVERRIDE_DEPTH' | 'STEPS_REQUIRE_JUMP';
@@ -139,8 +203,10 @@ export const RANGES = {
   masterGain: { min: 0, max: 1 },
   pulseWidth: { min: 0, max: 1 },
   depthVolume: { min: 0, max: 1 },
+  depthFreq: { min: 0, max: 1 }, // carrier/beat warble depth as a fraction of base (0..1 = 0..100%) (v5)
   spatial: { min: -1, max: 1 },
   depthSpatial: { min: 0, max: 1 },
+  toneFreq: { min: 20, max: 20000 }, // bell/tone pitch (wider than carrier; bells ring high) (v4)
 } as const;
 
 export const LIMITS = {
@@ -162,16 +228,22 @@ export const DEFAULTS = {
 // Internal: canonical key sets, enum membership, small helpers
 // ---------------------------------------------------------------------------
 
-const PRESET_KEYS = ['schemaVersion', 'name', 'durationSec', 'masterGain', 'nodes'] as const;
+const PRESET_KEYS = ['schemaVersion', 'name', 'durationSec', 'masterGain', 'nodes', 'layers'] as const;
 const NODE_KEYS = ['t', 'carrier', 'beat', 'volume', 'waveform', 'spatial'] as const;
 const PARAM_POINT_KEYS = ['value', 'transition', 'mod'] as const;
 const MOD_POINT_KEYS = ['shape', 'periodSec', 'depth', 'transition', 'pulseWidth', 'edgeMs', 'steps'] as const;
 const PARAM_NAMES = ['carrier', 'beat', 'volume', 'spatial'] as const;
+const LAYER_KEYS = ['id', 'kind', 'source', 't', 'loop', 'gain', 'spatial', 'duck'] as const;
+const LANE_POINT_KEYS = ['t', 'value', 'transition'] as const;
+const TONE_SPEC_KEYS = ['shape', 'freqHz', 'attackSec', 'releaseSec'] as const;
+const DUCK_KEYS = ['toGain', 'attackSec', 'releaseSec'] as const;
+const LANE_NAMES = ['gain', 'spatial'] as const;
 
 const WAVEFORMS = ['sine', 'triangle', 'square', 'sawtooth'] as const;
 const PARAM_TRANSITIONS = ['linear', 'exp', 'hold', 'smooth'] as const;
 const MOD_SHAPES = ['sine', 'triangle', 'square', 'pulse', 'box'] as const;
 const MOD_TRANSITIONS = ['glide', 'jump'] as const;
+const LAYER_KINDS = ['tone', 'ambiance', 'voice'] as const;
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -192,6 +264,9 @@ function isModShape(v: unknown): v is ModShape {
 }
 function isModTransition(v: unknown): v is ModTransition {
   return typeof v === 'string' && (MOD_TRANSITIONS as readonly string[]).includes(v);
+}
+function isLayerKind(v: unknown): v is LayerKind {
+  return typeof v === 'string' && (LAYER_KINDS as readonly string[]).includes(v);
 }
 
 function typeName(v: unknown): string {
@@ -274,6 +349,8 @@ export function validate(value: unknown): ValidationResult {
   validateMasterGain(root, issues);
   // Phases 6, 7, 8, 9, 10, 11: nodes container, per-node, ordering, bounds, carrier, exp.
   validateNodes(root, issues, duration);
+  // Phase 12: layers subtree (independent of node errors).
+  validateLayers(root, issues, duration);
   // Forward-compat: unknown root keys dropped + warned.
   checkUnknownKeys(root, PRESET_KEYS, '', issues);
 
@@ -500,7 +577,8 @@ function validateModPoint(
     }
   }
 
-  // depth — finite, >= 0; volume/spatial also <= 1 (carrier/beat have no upper cap).
+  // depth — finite, in [0,1] for every param: volume (multiplier), spatial (position), and
+  // carrier/beat (fraction of base frequency, v5; previously an uncapped absolute Hz).
   if ('depth' in mod) {
     const d = mod.depth;
     if (!isFiniteNumber(d)) {
@@ -509,8 +587,8 @@ function validateModPoint(
       err(issues, 'MOD_DEPTH_NEGATIVE', `${path}.depth`, `"${param}.mod.depth" must be ≥ 0, got ${d}`);
     } else {
       const depthMax =
-        param === 'volume' ? RANGES.depthVolume.max : param === 'spatial' ? RANGES.depthSpatial.max : undefined;
-      if (depthMax !== undefined && d > depthMax) {
+        param === 'volume' ? RANGES.depthVolume.max : param === 'spatial' ? RANGES.depthSpatial.max : RANGES.depthFreq.max;
+      if (d > depthMax) {
         err(issues, 'MOD_DEPTH_OUT_OF_RANGE', `${path}.depth`, `"${param}.mod.depth" must be within [0, ${depthMax}], got ${d}`);
       }
     }
@@ -645,17 +723,288 @@ function validateExpThroughZero(infos: NodeInfo[], issues: ValidationIssue[]): v
   }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 12: layers subtree (v4). Independent of node errors — an invalid binaural
+// voice does not suppress layer diagnostics (§6.1/§6.3 step 12).
+// ---------------------------------------------------------------------------
+
+function validateLayers(root: Record<string, unknown>, issues: ValidationIssue[], duration: number | undefined): void {
+  if (!('layers' in root)) return; // absent = pure-binaural; no checks.
+  const layers = root.layers;
+  if (!Array.isArray(layers)) {
+    err(issues, 'LAYERS_NOT_ARRAY', 'layers', '"layers" must be an array');
+    return; // stop layer checks; siblings already ran.
+  }
+
+  // First pass: per-layer structure + fields. Track ids for the uniqueness scan.
+  const seenIds = new Set<string>();
+  for (let i = 0; i < layers.length; i++) {
+    validateLayer(layers[i], i, issues, duration, seenIds);
+  }
+}
+
+function validateLayer(
+  layer: unknown,
+  i: number,
+  issues: ValidationIssue[],
+  duration: number | undefined,
+  seenIds: Set<string>,
+): void {
+  const base = `layers[${i}]`;
+  if (!isPlainObject(layer)) {
+    err(issues, 'LAYER_NOT_OBJECT', base, 'Layer must be an object');
+    return; // skip inner checks; excluded from id-uniqueness scan.
+  }
+
+  // id — non-empty string, unique across layers.
+  const id = layer.id;
+  if (typeof id !== 'string') {
+    err(issues, 'LAYER_ID_NOT_STRING', `${base}.id`, 'Layer "id" must be a string');
+  } else if (id.trim().length < 1) {
+    err(issues, 'LAYER_ID_EMPTY', `${base}.id`, 'Layer "id" must not be empty');
+  } else if (seenIds.has(id)) {
+    err(issues, 'LAYER_ID_DUPLICATE', `${base}.id`, `Duplicate layer id ${display(id)}; layer ids must be unique`);
+  } else {
+    seenIds.add(id);
+  }
+
+  // kind — enum. Independent of source.
+  if (!isLayerKind(layer.kind)) {
+    err(issues, 'LAYER_KIND_INVALID', `${base}.kind`, 'Layer "kind" must be one of tone, ambiance, voice');
+  }
+
+  // source — exactly one of { synth } | { clipId }.
+  validateLayerSource(layer.source, base, issues);
+
+  // t — finite, ≥ 0, and ≤ durationSec (gated on a valid duration, like node phase 9).
+  const t = layer.t;
+  if (!isFiniteNumber(t)) {
+    err(issues, 'LAYER_T_NOT_FINITE', `${base}.t`, 'Layer "t" must be a finite number');
+  } else {
+    if (t < 0) {
+      err(issues, 'LAYER_T_NEGATIVE', `${base}.t`, `Layer "t" must be ≥ 0, got ${t}`);
+    }
+    if (duration !== undefined && t > duration) {
+      err(issues, 'LAYER_T_EXCEEDS_DURATION', `${base}.t`, `Layer "t" ${t} exceeds durationSec ${duration}`);
+    }
+  }
+
+  // loop — boolean if present.
+  if ('loop' in layer && typeof layer.loop !== 'boolean') {
+    err(issues, 'LAYER_LOOP_NOT_BOOLEAN', `${base}.loop`, 'Layer "loop" must be a boolean');
+  }
+
+  // gain / spatial lanes.
+  for (const lane of LANE_NAMES) {
+    if (lane in layer) {
+      validateLane(layer[lane], lane, base, issues);
+    }
+  }
+
+  // duck — DuckIntent if present.
+  if ('duck' in layer) {
+    validateDuck(layer.duck, base, issues);
+  }
+
+  checkUnknownKeys(layer, LAYER_KEYS, base, issues);
+}
+
+function validateLayerSource(source: unknown, base: string, issues: ValidationIssue[]): void {
+  const path = `${base}.source`;
+  if (!isPlainObject(source)) {
+    err(issues, 'LAYER_SOURCE_INVALID', path, 'Layer "source" must be exactly one of { synth } or { clipId }');
+    return;
+  }
+  const hasSynth = 'synth' in source;
+  const hasClip = 'clipId' in source;
+  if (hasSynth === hasClip) {
+    // neither or both — ambiguous, rejected.
+    err(issues, 'LAYER_SOURCE_INVALID', path, 'Layer "source" must be exactly one of { synth } or { clipId }');
+    return;
+  }
+
+  if (hasClip) {
+    const clipId = source.clipId;
+    if (typeof clipId !== 'string') {
+      err(issues, 'LAYER_CLIP_ID_NOT_STRING', `${path}.clipId`, '"source.clipId" must be a string');
+    } else if (clipId.trim().length < 1) {
+      err(issues, 'LAYER_CLIP_ID_EMPTY', `${path}.clipId`, '"source.clipId" must not be empty');
+    }
+    // clip existence NOT validated (D-023).
+    return;
+  }
+
+  // synth — a ToneSpec object.
+  const synth = source.synth;
+  if (!isPlainObject(synth)) {
+    err(issues, 'LAYER_SOURCE_INVALID', path, 'Layer "source" must be exactly one of { synth } or { clipId }');
+    return;
+  }
+  const synthPath = `${path}.synth`;
+
+  if (!isWaveform(synth.shape)) {
+    err(issues, 'TONE_SHAPE_INVALID', `${synthPath}.shape`, '"source.synth.shape" must be one of sine, triangle, square, sawtooth');
+  }
+
+  const freqHz = synth.freqHz;
+  if (!isFiniteNumber(freqHz)) {
+    err(issues, 'TONE_FREQ_NOT_FINITE', `${synthPath}.freqHz`, '"source.synth.freqHz" must be a finite number');
+  } else if (freqHz < RANGES.toneFreq.min || freqHz > RANGES.toneFreq.max) {
+    err(issues, 'TONE_FREQ_OUT_OF_RANGE', `${synthPath}.freqHz`, `"source.synth.freqHz" must be within [20, 20000], got ${freqHz}`);
+  }
+
+  const attackSec = synth.attackSec;
+  if (!isFiniteNumber(attackSec)) {
+    err(issues, 'TONE_ATTACK_NOT_FINITE', `${synthPath}.attackSec`, '"source.synth.attackSec" must be a finite number');
+  } else if (attackSec < 0) {
+    err(issues, 'TONE_ATTACK_NEGATIVE', `${synthPath}.attackSec`, `"source.synth.attackSec" must be ≥ 0, got ${attackSec}`);
+  }
+
+  const releaseSec = synth.releaseSec;
+  if (!isFiniteNumber(releaseSec)) {
+    err(issues, 'TONE_RELEASE_NOT_FINITE', `${synthPath}.releaseSec`, '"source.synth.releaseSec" must be a finite number');
+  } else if (releaseSec < 0) {
+    err(issues, 'TONE_RELEASE_NEGATIVE', `${synthPath}.releaseSec`, `"source.synth.releaseSec" must be ≥ 0, got ${releaseSec}`);
+  }
+
+  checkUnknownKeys(synth, TONE_SPEC_KEYS, synthPath, issues);
+}
+
+function validateLane(lane: unknown, name: 'gain' | 'spatial', base: string, issues: ValidationIssue[]): void {
+  const path = `${base}.${name}`;
+  if (!Array.isArray(lane)) {
+    err(issues, 'LANE_NOT_ARRAY', path, `"${name}" must be an array of lane points`);
+    return;
+  }
+  const range = name === 'gain' ? RANGES.volume : RANGES.spatial;
+
+  // Per-point checks. Track each point's analysis for the ordering + exp passes.
+  interface LanePointInfo {
+    index: number;
+    t: number | undefined; // finite t, else undefined (excluded from ordering/exp).
+    valueValid: boolean;
+    value: number | undefined;
+    transition: ParamTransition | undefined;
+  }
+  const infos: LanePointInfo[] = [];
+
+  for (let j = 0; j < lane.length; j++) {
+    const pPath = `${path}[${j}]`;
+    const info: LanePointInfo = { index: j, t: undefined, valueValid: false, value: undefined, transition: undefined };
+    const point = lane[j];
+    if (!isPlainObject(point)) {
+      err(issues, 'LANE_POINT_NOT_OBJECT', pPath, `"${name}" point must be an object with a "value"`);
+      infos.push(info); // excluded from ordering/exp (t undefined).
+      continue;
+    }
+
+    const t = point.t;
+    if (!isFiniteNumber(t)) {
+      err(issues, 'LANE_T_NOT_FINITE', `${pPath}.t`, `"${name}.t" must be a finite number`);
+    } else {
+      info.t = t;
+      if (t < 0) {
+        err(issues, 'LANE_T_NEGATIVE', `${pPath}.t`, `"${name}.t" must be ≥ 0, got ${t}`);
+      }
+    }
+
+    const value = point.value;
+    if (!isFiniteNumber(value)) {
+      err(issues, 'LANE_VALUE_NOT_FINITE', `${pPath}.value`, `"${name}.value" must be a finite number`);
+    } else if (value < range.min || value > range.max) {
+      err(issues, 'LANE_VALUE_OUT_OF_RANGE', `${pPath}.value`, `"${name}.value" must be within [${range.min}, ${range.max}], got ${value}`);
+    } else {
+      info.valueValid = true;
+      info.value = value;
+    }
+
+    if ('transition' in point) {
+      if (!isParamTransition(point.transition)) {
+        err(issues, 'LANE_TRANSITION_INVALID', `${pPath}.transition`, `"${name}.transition" must be one of linear, exp, hold, smooth`);
+      } else {
+        info.transition = point.transition;
+      }
+    }
+
+    checkUnknownKeys(point, LANE_POINT_KEYS, pPath, issues);
+    infos.push(info);
+  }
+
+  // Ordering — reject out-of-order (no pre-sort); no first-at-zero requirement.
+  const valid = infos.filter((p) => p.t !== undefined) as Array<LanePointInfo & { t: number }>;
+  for (let k = 1; k < valid.length; k++) {
+    const prev = valid[k - 1].t;
+    const cur = valid[k].t;
+    if (cur < prev) {
+      err(issues, 'LANE_NOT_SORTED', `${path}[${valid[k].index}].t`, `"${name}" points must be sorted ascending by "t"`);
+    } else if (cur === prev) {
+      err(issues, 'LANE_DUPLICATE_T', `${path}[${valid[k].index}].t`, `Two "${name}" points share t=${cur}; lane point times must be unique`);
+    }
+  }
+
+  // Per-lane exp-through-zero (§7.5 reused). Use value-valid, finite-t points in array order.
+  const sub = infos.filter((p) => p.t !== undefined && p.valueValid && p.value !== undefined) as Array<
+    LanePointInfo & { t: number; value: number }
+  >;
+  for (let k = 0; k + 1 < sub.length; k++) {
+    const p0 = sub[k];
+    if (p0.transition !== 'exp') continue;
+    const v0 = p0.value;
+    const v1 = sub[k + 1].value;
+    if (v0 === 0 || v1 === 0 || Math.sign(v0) !== Math.sign(v1)) {
+      err(issues, 'LANE_EXP_THROUGH_ZERO', `${path}[${p0.index}].transition`,
+        `"exp" transition cannot ramp to or across zero (${v0} → ${v1}); use linear/smooth or keep both endpoints the same nonzero sign`);
+    }
+  }
+}
+
+function validateDuck(duck: unknown, base: string, issues: ValidationIssue[]): void {
+  const path = `${base}.duck`;
+  if (!isPlainObject(duck)) {
+    err(issues, 'DUCK_NOT_OBJECT', path, '"duck" must be an object with "toGain", "attackSec", and "releaseSec"');
+    return;
+  }
+
+  const toGain = duck.toGain;
+  if (!isFiniteNumber(toGain)) {
+    err(issues, 'DUCK_TO_GAIN_NOT_FINITE', `${path}.toGain`, '"duck.toGain" must be a finite number');
+  } else if (toGain < RANGES.volume.min || toGain > RANGES.volume.max) {
+    err(issues, 'DUCK_TO_GAIN_OUT_OF_RANGE', `${path}.toGain`, `"duck.toGain" must be within [0, 1], got ${toGain}`);
+  }
+
+  const attackSec = duck.attackSec;
+  if (!isFiniteNumber(attackSec)) {
+    err(issues, 'DUCK_ATTACK_NOT_FINITE', `${path}.attackSec`, '"duck.attackSec" must be a finite number');
+  } else if (attackSec < 0) {
+    err(issues, 'DUCK_ATTACK_NEGATIVE', `${path}.attackSec`, `"duck.attackSec" must be ≥ 0, got ${attackSec}`);
+  }
+
+  const releaseSec = duck.releaseSec;
+  if (!isFiniteNumber(releaseSec)) {
+    err(issues, 'DUCK_RELEASE_NOT_FINITE', `${path}.releaseSec`, '"duck.releaseSec" must be a finite number');
+  } else if (releaseSec < 0) {
+    err(issues, 'DUCK_RELEASE_NEGATIVE', `${path}.releaseSec`, `"duck.releaseSec" must be ≥ 0, got ${releaseSec}`);
+  }
+
+  checkUnknownKeys(duck, DUCK_KEYS, path, issues);
+}
+
 // Normalized clone — built only when validation succeeds, so every read below is of
 // already-validated data. Copies known keys in canonical order; drops unknowns;
 // preserves mod:null and absent optionals; produces a fresh, unshared object graph.
 function normalizePreset(root: Record<string, unknown>): Preset {
-  return {
-    schemaVersion: CURRENT_SCHEMA_VERSION as 3,
+  const out: Preset = {
+    schemaVersion: CURRENT_SCHEMA_VERSION as 5,
     name: root.name as string,
     durationSec: root.durationSec as number,
     masterGain: root.masterGain as number,
     nodes: (root.nodes as unknown[]).map((n) => normalizeNode(n as Record<string, unknown>)),
   };
+  // Absent `layers` stays absent (sparse); a present array (even empty) is preserved.
+  if ('layers' in root) {
+    out.layers = (root.layers as unknown[]).map((l) => normalizeLayer(l as Record<string, unknown>));
+  }
+  return out;
 }
 
 function normalizeNode(node: Record<string, unknown>): TimeNode {
@@ -690,20 +1039,119 @@ function normalizeMod(mod: Record<string, unknown>): ModPoint {
   return out;
 }
 
+// Layer normalization (v4): canonical key order id,kind,source,t,loop,gain,spatial,duck.
+// Empty gain/spatial arrays are DROPPED (treat-as-absent); absent loop/duck not created.
+function normalizeLayer(layer: Record<string, unknown>): Layer {
+  const out = {
+    id: layer.id as string,
+    kind: layer.kind as LayerKind,
+    source: normalizeLayerSource(layer.source as Record<string, unknown>),
+    t: layer.t as number,
+  } as Layer;
+  if ('loop' in layer) out.loop = layer.loop as boolean;
+  for (const lane of LANE_NAMES) {
+    if (lane in layer) {
+      const points = layer[lane] as unknown[];
+      // Empty lane → treat-as-absent (key not created).
+      if (points.length > 0) {
+        out[lane] = points.map((p) => normalizeLanePoint(p as Record<string, unknown>));
+      }
+    }
+  }
+  if ('duck' in layer) out.duck = normalizeDuckIntent(layer.duck as Record<string, unknown>);
+  return out;
+}
+
+function normalizeLayerSource(source: Record<string, unknown>): LayerSource {
+  // Validated to carry exactly one discriminant; copy only the present one.
+  if ('synth' in source) {
+    return { synth: normalizeToneSpec(source.synth as Record<string, unknown>) };
+  }
+  return { clipId: source.clipId as string };
+}
+
+function normalizeToneSpec(synth: Record<string, unknown>): ToneSpec {
+  return {
+    shape: synth.shape as Waveform,
+    freqHz: synth.freqHz as number,
+    attackSec: synth.attackSec as number,
+    releaseSec: synth.releaseSec as number,
+  };
+}
+
+function normalizeLanePoint(point: Record<string, unknown>): LanePoint {
+  const out: LanePoint = { t: point.t as number, value: point.value as number };
+  if ('transition' in point) out.transition = point.transition as ParamTransition;
+  return out;
+}
+
+function normalizeDuckIntent(duck: Record<string, unknown>): DuckIntent {
+  return {
+    toGain: duck.toGain as number,
+    attackSec: duck.attackSec as number,
+    releaseSec: duck.releaseSec as number,
+  };
+}
+
 // ---------------------------------------------------------------------------
-// 9. migrate — version gating + structural up-migration to the v2 shape
+// 9. migrate — version gating + structural up-migration to the v4 shape
 // ---------------------------------------------------------------------------
 
 // Registry of structural up-migrations: MIGRATIONS[from] transforms a from-version
-// object into the (from+1)-version shape. MIGRATIONS[2] (v2→v3) is a pure version-bump:
-// `spatial` is a new optional TimeNode field (absent = centered), so no structural change
-// is needed beyond stamping schemaVersion=3 (D-021). There is no MIGRATIONS[1] — D-011
+// object into the (from+1)-version shape.
+//   MIGRATIONS[2] (v2→v3): `spatial` is a new optional TimeNode field (absent = centered);
+//     a pure version-bump stamping schemaVersion=3 (D-021).
+//   MIGRATIONS[3] (v3→v4): `layers` is a new optional Preset field (absent = pure-binaural);
+//     a pure version-bump stamping schemaVersion=4 (D-022; design §11.6).
+//   MIGRATIONS[4] (v4→v5): carrier/beat `mod.depth` changes MEANING from an absolute Hz
+//     offset to a FRACTION of the lane's base frequency (percentage warble). The transform
+//     rewrites each carrier/beat modulator depth to `depth / value` (the sibling ParamPoint
+//     value at that node), clamped to [0,1]; a non-positive/absent base yields 0 (a base of
+//     0 Hz has no proportional warble — the engine already floors it to 0). volume/spatial
+//     depths are already fractional/positional and `steps` are explicit offsets, so both are
+//     left untouched. This is the one value-rewriting migration; the rest are version-bumps.
+// So a v4 preset walks v4→v5, a v3 preset v3→v4→v5, a v2 preset v2→v3→v4→v5; all stamp to the
+// current version, so the normalized output is always v5. There is no MIGRATIONS[1] — D-011
 // replaced the never-released v1 model and no v1 JSON contract exists, so any schemaVersion
 // < 2 returns SCHEMA_TOO_OLD (a loud failure, not fake success).
-// TODO(stub): future schemaVersion migrations register at MIGRATIONS[from] — next entry resolves when a >v3 schema is introduced
+// TODO(stub): future schemaVersion migrations register at MIGRATIONS[from] — next entry resolves when a >v5 schema is introduced
 const MIGRATIONS: Record<number, (obj: Record<string, unknown>) => Record<string, unknown>> = {
   2: (obj) => ({ ...obj, schemaVersion: 3 }),
+  3: (obj) => ({ ...obj, schemaVersion: 4 }),
+  4: (obj) => migrateV4ToV5(obj),
 };
+
+// v4→v5: convert carrier/beat warble depth from absolute Hz to a fraction of the base
+// frequency (see MIGRATIONS comment). Defensive over untrusted input — only rewrites when
+// both the base value and the depth are finite numbers with base > 0 and depth ≥ 0;
+// anything else is left as-is for `validate` to diagnose. Never mutates the input.
+function migrateV4ToV5(obj: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...obj, schemaVersion: 5 };
+  if (Array.isArray(obj.nodes)) {
+    out.nodes = obj.nodes.map((n) => (isPlainObject(n) ? convertFreqWarbleDepth(n) : n));
+  }
+  return out;
+}
+
+function convertFreqWarbleDepth(node: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...node };
+  for (const param of ['carrier', 'beat'] as const) {
+    const pp = node[param];
+    if (!isPlainObject(pp)) continue;
+    const mod = pp.mod;
+    if (!isPlainObject(mod) || !('depth' in mod)) continue;
+    const base = pp.value;
+    const depth = mod.depth;
+    if (
+      typeof base === 'number' && Number.isFinite(base) && base > 0 &&
+      typeof depth === 'number' && Number.isFinite(depth) && depth >= 0
+    ) {
+      const frac = Math.min(RANGES.depthFreq.max, depth / base);
+      out[param] = { ...pp, mod: { ...mod, depth: frac } };
+    }
+  }
+  return out;
+}
 
 export function migrate(raw: unknown): MigrateResult {
   if (!isPlainObject(raw)) {
@@ -821,11 +1269,12 @@ export function clonePreset(preset: Preset): Preset {
 
 export function createDefaultPreset(): Preset {
   return {
-    schemaVersion: CURRENT_SCHEMA_VERSION as 3,
+    schemaVersion: CURRENT_SCHEMA_VERSION as 5,
     name: 'Untitled Session',
     durationSec: 300,
     masterGain: 0.8,
     nodes: [{ t: 0, carrier: { value: 200 }, beat: { value: 8 }, volume: { value: 1 } }],
+    // layers omitted — a fresh session is pure-binaural; the author adds layers later.
   };
 }
 

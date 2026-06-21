@@ -7,6 +7,7 @@
   import './app.css';
   import { getAppContext } from './context';
   import NavBar from './components/NavBar.svelte';
+  import TransportBar from './components/TransportBar.svelte';
   import BannerStack from './components/BannerStack.svelte';
   import UpdateToast from './components/UpdateToast.svelte';
   import PlayerScreen from './screens/PlayerScreen.svelte';
@@ -26,14 +27,23 @@
 </script>
 
 <div class="app" class:wide={ui.isWide}>
-  <div class="overlays">
-    <BannerStack items={notices.items} ondismiss={(id) => notices.dismiss(id)} />
-    <UpdateToast
-      updateReady={install.updateReady}
-      offlineReady={install.offlineReady}
-      onreload={() => install.applyUpdate()}
-      ondismiss={() => install.dismissUpdate()}
-    />
+  <!-- Sticky top chrome: the GLOBAL transport (every screen), the tab bar on wide, and the
+       banner sheet — one sticky stack so nothing fights for top:0. The tab bar stays a
+       bottom thumb-bar on mobile (rendered below the screen). -->
+  <div class="chrome">
+    <TransportBar />
+    {#if ui.isWide}
+      <NavBar tab={ui.tab} onselect={(t) => ui.setTab(t)} />
+    {/if}
+    <div class="overlays">
+      <BannerStack items={notices.items} ondismiss={(id) => notices.dismiss(id)} />
+      <UpdateToast
+        updateReady={install.updateReady}
+        offlineReady={install.offlineReady}
+        onreload={() => install.applyUpdate()}
+        ondismiss={() => install.dismissUpdate()}
+      />
+    </div>
   </div>
 
   <main class="screen">
@@ -46,9 +56,11 @@
     {/if}
   </main>
 
-  <div class="navbar">
-    <NavBar tab={ui.tab} onselect={(t) => ui.setTab(t)} />
-  </div>
+  {#if !ui.isWide}
+    <div class="navbar">
+      <NavBar tab={ui.tab} onselect={(t) => ui.setTab(t)} />
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -58,10 +70,17 @@
     min-height: 100dvh;
     padding: var(--safe-top) var(--safe-right) var(--safe-bottom) var(--safe-left);
   }
-  .overlays {
+  /* One sticky top stack: transport bar, tabs (wide), then the banner sheet — so the global
+     transport is reachable from every screen and nothing else competes for top:0. */
+  .chrome {
     position: sticky;
     top: 0;
     z-index: 10;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg);
+  }
+  .overlays {
     display: flex;
     flex-direction: column;
     gap: var(--sp-2);
@@ -77,19 +96,10 @@
     flex: 1;
     overflow-y: auto;
   }
+  /* Mobile: the tab bar is a bottom thumb-bar (design §13). On wide it renders inside the
+     sticky top chrome instead, so there is no bottom .navbar. */
   .navbar {
     position: sticky;
     bottom: 0;
-  }
-
-  /* Wide: nav moves to the top (design §13). */
-  .app.wide {
-    flex-direction: column;
-  }
-  .app.wide .navbar {
-    order: -1;
-    position: sticky;
-    top: 0;
-    bottom: auto;
   }
 </style>

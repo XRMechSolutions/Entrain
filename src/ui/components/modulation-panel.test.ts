@@ -81,6 +81,19 @@ describe('ModulationPanel — rate ↔ periodSec conversion (periodSec = 1/rateH
     expect(modOf(ctx, 'carrier')?.periodSec).toBeCloseTo(0.1, 6);
   });
 
+  it('shows the cycle time in seconds beside the Hz rate (so a sweep reads as a breathing cadence)', async () => {
+    const { getByLabelText, getByTestId } = renderPanel('spatial');
+    await fireEvent.click(getByLabelText('Warble enabled'));
+    await tick();
+    // default spatial sweep periodSec = 5 → 0.2 Hz ≈ "5.00 s per cycle"
+    expect(getByTestId('mod-cycle-spatial').textContent).toMatch(/5\.00 s/);
+
+    // dial a 16 s box-breath cadence (0.0625 Hz) and the readout follows
+    await fireEvent.change(getByLabelText('Rate value'), { target: { value: '0.0625' } });
+    await tick();
+    expect(getByTestId('mod-cycle-spatial').textContent).toMatch(/16\.0 s/);
+  });
+
   it('clamps an out-of-range rate so periodSec stays finite and > 0', async () => {
     const { ctx, getByLabelText } = renderPanel('carrier');
     await fireEvent.click(getByLabelText('Warble enabled'));
@@ -104,9 +117,9 @@ describe('ModulationPanel — shape / depth / transition commit through the sess
     await tick();
     expect(modOf(ctx, 'beat')?.shape).toBe('square');
 
-    await fireEvent.change(getByLabelText('Depth value'), { target: { value: '3.5' } });
+    await fireEvent.change(getByLabelText('Depth value'), { target: { value: '0.35' } });
     await tick();
-    expect(modOf(ctx, 'beat')?.depth).toBeCloseTo(3.5, 6);
+    expect(modOf(ctx, 'beat')?.depth).toBeCloseTo(0.35, 6);
 
     await fireEvent.change(getByLabelText('Warble transition'), { target: { value: 'jump' } });
     await tick();

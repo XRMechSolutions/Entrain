@@ -15,13 +15,17 @@
 import { mount } from 'svelte';
 import { createTransport as defaultCreateTransport } from '../../engine/transport';
 import { createDefaultPreset } from '../../engine/session-model';
+import { get as getClip, importVia } from '../../engine/clip-library';
+import { createTtsAdapter } from '../../engine/clip-sources/tts-local';
 import { APP_ICONS } from '../../pwa/icons';
 import { SILENT_LOOP_URL } from '../../pwa/assets';
 import { consumeBufferedInstallPrompt } from '../../pwa/install-buffer';
 import { createSchedulerAdapter } from './scheduler-adapter';
+import { createLayerScheduler } from './layer-scheduler-adapter';
 import { createNoticeStore, createUiStore } from '../stores/notices.svelte';
 import { createPlaybackStore, createSessionStore } from '../stores/session.svelte';
-import { createInstallStore, createLibraryStore } from '../stores/library.svelte';
+import { createClipStore, createInstallStore, createLibraryStore } from '../stores/library.svelte';
+import { createRenderStore, createVoiceScriptStore } from '../stores/authoring.svelte';
 import App from '../App.svelte';
 import { APP_CONTEXT_KEY, type AppContext } from '../context';
 
@@ -61,8 +65,13 @@ export function bootstrap(target?: HTMLElement, overrides: BootstrapOverrides = 
 
   const createTransport = overrides.createTransport ?? defaultCreateTransport;
 
-  // 1. scheduler adapter → 2. transport (artwork + silentFileUrl stubs resolved here).
+  // 1. scheduler adapter + 1a. layer-scheduler factory → 2. transport (artwork +
+  //    silentFileUrl stubs resolved here). The layerScheduler is injected with the SAME
+  //    IoC shape as `scheduler` (design §16.2, arch §2.2/§6); transport builds the
+  //    LayerNodes and drives it alongside the binaural scheduler on start/seek/reapply. A
+  //    preset with no layers stays byte-identical to Phase-1 (the injection is additive).
   const scheduler = createSchedulerAdapter();
+  const layerScheduler = createLayerScheduler();
   // The MediaStream→<audio> bridge (D-018) exists only to hold Android background/locked-
   // screen audio focus. On desktop it adds a glitchy media hop (startup stutter/dropouts)
   // with no benefit, so use direct Web Audio output there. Engage the bridge only on
@@ -71,18 +80,40 @@ export function bootstrap(target?: HTMLElement, overrides: BootstrapOverrides = 
     typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
   const transport = createTransport({
     scheduler,
+    layerScheduler,
     artwork: APP_ICONS,
     silentFileUrl: SILENT_LOOP_URL,
     backgroundAudioMode: wantsBackgroundBridge ? 'mediastream' : 'none',
   });
 
-  // 3. + 4. the six stores, wired to transport (playback/notices subscribe in their ctors).
+  // 3. + 4. the stores, wired to transport (playback/notices subscribe in their ctors).
   const notices = createNoticeStore();
   const playback = createPlaybackStore({ transport, notices });
   const session = createSessionStore({ transport, playback });
   const library = createLibraryStore({ session, notices });
   const { store: install, hooks, setUpdateSW } = createInstallStore();
   const ui = createUiStore();
+
+  // Phase-2 authoring stores (design §16.2). Each gets only the deps it needs so it stays
+  // unit-testable in isolation; none holds a Layer/Mixer/LayerNode — they call pure async
+  // engine entry points (clip-library, renderToFile, compileVoiceScript) that return
+  // blobs / metadata / plain Layer[] (the audio-path-purity rule is about live nodes).
+  const clips = createClipStore({ notices });
+  const render = createRenderStore({
+    session,
+    notices,
+    clipLib: { hasClip: async (id) => (await getClip(id)) !== undefined },
+  });
+  // device:'wasm' — pin TTS to the threaded-WASM ONNX path (reliable; with the Vite
+  // cross-origin-isolation headers it uses worker threads and is fast enough). WebGPU/JSEP
+  // inference can hang on some GPUs; re-enable `device:'auto'` once it's validated (D-039).
+  const tts = createTtsAdapter({ device: 'wasm' });
+  const voiceScript = createVoiceScriptStore({
+    session,
+    notices,
+    tts,
+    clipLib: { importVia },
+  });
 
   // 5. seed the library once (idempotent) and adopt the working preset BY REFERENCE so
   //    duration() > 0 and the scrubber has a range from the first frame.
@@ -99,7 +130,18 @@ export function bootstrap(target?: HTMLElement, overrides: BootstrapOverrides = 
     setUpdateSW(updateSW);
   }
 
-  const ctx: AppContext = { transport, session, playback, library, notices, install, ui };
+  const ctx: AppContext = {
+    transport,
+    session,
+    playback,
+    library,
+    notices,
+    install,
+    ui,
+    clips,
+    render,
+    voiceScript,
+  };
   current = ctx;
 
   // 8. On App mount (autoplay-safe, OFF gesture): create the suspended context + load the

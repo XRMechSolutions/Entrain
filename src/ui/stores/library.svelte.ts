@@ -20,7 +20,17 @@ import {
   seedDefaultPresets,
   type PresetSummary,
 } from '../../engine/persistence';
+import {
+  ClipLibraryError,
+  createFileImportAdapter as defaultCreateFileImportAdapter,
+  importVia as defaultImportVia,
+  list as defaultListClips,
+  remove as defaultRemoveClip,
+  totalBytes as defaultTotalBytes,
+  type Clip,
+} from '../../engine/clip-library';
 import type { ValidationIssue } from '../../engine/session-model';
+import type { ClipPanelMode } from '../lib/constants';
 import type { SessionStore } from './session.svelte';
 import type { NoticeStore } from './notices.svelte';
 
@@ -367,6 +377,194 @@ export function createInstallStore(): InstallStoreBundle {
     },
     setUpdateSW(fn: UpdateSW) {
       updateSW = fn;
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Clip store (Phase-2) — co-located with LibraryStore (design §16.2, interfaces §13)
+// ---------------------------------------------------------------------------
+
+export interface ClipStore {
+  readonly clips: ReadonlyArray<Clip>; // list() metadata, newest first
+  readonly loading: boolean;
+  readonly totalBytes: number; // from clip-library.totalBytes()
+  readonly mode: ClipPanelMode; // 'pick' when choosing a layer source
+  readonly importing: boolean;
+
+  /** list() + totalBytes() → $state. UNSUPPORTED → notice (degrade read-disabled). */
+  refresh(): void;
+  /** Import a picked file (gesture): importVia(createFileImportAdapter(), file). A dedup
+   *  hit toasts "already in your library" (same clip.id, no second copy). Maps
+   *  ClipLibraryErrorCode → notice (DECODE_FAILED / QUOTA_EXCEEDED / UNSUPPORTED). */
+  importFile(file: File): void;
+  /** Delete (confirm): a courtesy "used by N presets" scan first, then remove(id). */
+  removeClip(id: string): void;
+
+  // pick-mode flow (driven by the layer source picker, §17.2):
+  openPicker(onPick: (clipId: string) => void): void; // mode='pick'
+  pick(id: string): void; // returns clip.id, closes picker
+  closePicker(): void; // mode='browse'
+}
+
+/** Injection seams so the ClipStore stays unit-testable without IndexedDB. Default to the
+ *  live clip-library module functions. */
+export interface ClipLibraryDeps {
+  list: typeof defaultListClips;
+  totalBytes: typeof defaultTotalBytes;
+  remove: typeof defaultRemoveClip;
+  importVia: typeof defaultImportVia;
+  createFileImportAdapter: typeof defaultCreateFileImportAdapter;
+  /** Scan saved presets for layers referencing a clipId (courtesy "used by N presets", M3).
+   *  Returns the number of saved presets referencing the id. Best-effort; never throws. */
+  countPresetsUsingClip?: (clipId: string) => number;
+}
+
+function defaultCountPresetsUsingClip(clipId: string): number {
+  try {
+    const summaries = listPresets();
+    let count = 0;
+    for (const summary of summaries) {
+      const saved = loadPreset(summary.id);
+      const layers = saved?.preset.layers ?? [];
+      if (layers.some((l) => 'clipId' in l.source && l.source.clipId === clipId)) count++;
+    }
+    return count;
+  } catch {
+    return 0; // a faulty scan must never block a delete (it is only a courtesy)
+  }
+}
+
+function confirmDeleteClip(usedBy: number): boolean {
+  const note = usedBy > 0 ? ` It's used by ${usedBy} saved preset${usedBy === 1 ? '' : 's'}.` : '';
+  if (typeof window === 'undefined' || typeof window.confirm !== 'function') return true;
+  return window.confirm(`Delete this clip?${note} This cannot be undone.`);
+}
+
+export function createClipStore(deps: { notices: NoticeStore; clipLib?: Partial<ClipLibraryDeps> }): ClipStore {
+  const { notices } = deps;
+  const lib: ClipLibraryDeps = {
+    list: deps.clipLib?.list ?? defaultListClips,
+    totalBytes: deps.clipLib?.totalBytes ?? defaultTotalBytes,
+    remove: deps.clipLib?.remove ?? defaultRemoveClip,
+    importVia: deps.clipLib?.importVia ?? defaultImportVia,
+    createFileImportAdapter: deps.clipLib?.createFileImportAdapter ?? defaultCreateFileImportAdapter,
+    countPresetsUsingClip: deps.clipLib?.countPresetsUsingClip ?? defaultCountPresetsUsingClip,
+  };
+
+  let clips = $state<Clip[]>([]);
+  let loading = $state(false);
+  let total = $state(0);
+  let mode = $state<ClipPanelMode>('browse');
+  let importing = $state(false);
+  let onPickCb: ((clipId: string) => void) | undefined;
+
+  function handleClipError(e: unknown): void {
+    if (e instanceof ClipLibraryError) {
+      switch (e.code) {
+        case 'DECODE_FAILED':
+          notices.push({ severity: 'error', message: "Couldn't read that as audio." });
+          return;
+        case 'QUOTA_EXCEEDED':
+          notices.push({ severity: 'error', message: 'Storage is full — delete some clips to free space.' });
+          return;
+        case 'UNSUPPORTED':
+          notices.push({ severity: 'error', message: "Clip storage isn't available here." });
+          return;
+        default:
+          notices.push({ severity: 'error', message: e.message || 'Clip storage error.' });
+          return;
+      }
+    }
+    notices.push({ severity: 'error', message: e instanceof Error ? e.message : String(e) });
+  }
+
+  function refresh(): void {
+    loading = true;
+    Promise.all([lib.list(), lib.totalBytes()])
+      .then(([list, bytes]) => {
+        // list() order is unspecified; show newest first by createdAt.
+        clips = [...list].sort((a, b) => b.createdAt - a.createdAt);
+        total = bytes;
+      })
+      .catch(handleClipError)
+      .finally(() => {
+        loading = false;
+      });
+  }
+
+  function importFile(file: File): void {
+    // Gesture: importVia is called with NO await before it (the file-picker policy, M8).
+    importing = true;
+    const known = new Set(clips.map((c) => c.id));
+    lib
+      .importVia(lib.createFileImportAdapter(), file)
+      .then((clip) => {
+        if (known.has(clip.id)) {
+          // Dedup hit: the SAME id came back (content hash). Don't store a second copy — just
+          // surface it and, in pick mode, select it (M5).
+          notices.push({ severity: 'info', message: `"${clip.meta.name}" is already in your library.` });
+        } else {
+          notices.push({ severity: 'info', message: `Imported "${clip.meta.name}".` });
+        }
+        refresh();
+        if (mode === 'pick' && onPickCb) {
+          const cb = onPickCb;
+          onPickCb = undefined;
+          mode = 'browse';
+          cb(clip.id);
+        }
+      })
+      .catch(handleClipError)
+      .finally(() => {
+        importing = false;
+      });
+  }
+
+  function removeClip(id: string): void {
+    const usedBy = lib.countPresetsUsingClip ? lib.countPresetsUsingClip(id) : 0;
+    if (!confirmDeleteClip(usedBy)) return;
+    lib
+      .remove(id)
+      .then(() => {
+        // remove(false) = unknown/already-gone id (M4) — treat as removed, no error.
+        refresh();
+      })
+      .catch(handleClipError);
+  }
+
+  return {
+    get clips() {
+      return clips;
+    },
+    get loading() {
+      return loading;
+    },
+    get totalBytes() {
+      return total;
+    },
+    get mode() {
+      return mode;
+    },
+    get importing() {
+      return importing;
+    },
+    refresh,
+    importFile,
+    removeClip,
+    openPicker(onPick: (clipId: string) => void) {
+      onPickCb = onPick;
+      mode = 'pick';
+    },
+    pick(id: string) {
+      const cb = onPickCb;
+      onPickCb = undefined;
+      mode = 'browse';
+      cb?.(id);
+    },
+    closePicker() {
+      onPickCb = undefined;
+      mode = 'browse';
     },
   };
 }

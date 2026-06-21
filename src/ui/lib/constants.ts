@@ -29,3 +29,34 @@ export const MIN_NODE_DT_SEC = 0.01;
 
 /** Max zoom-in: the editor view always spans at least this many seconds. */
 export const EDITOR_MIN_VIEW_SEC = 5;
+
+// ---------------------------------------------------------------------------
+// Phase-2 layer-authoring constants + shared literal types (design §21).
+// These join the existing single-source-of-truth file so the authoring stores
+// and components share one definition (no new CSS tokens — §21).
+// ---------------------------------------------------------------------------
+
+import type { ToneSpec } from '../../engine/session-model';
+
+/** The default ToneSpec a fresh `tone` layer gets — a soft, audible bell. Within
+ *  RANGES.toneFreq {20,20000} with a one-shot envelope (session-model §10 / arch §6),
+ *  so addLayer('tone') always produces a valid, playable synth source (design §21). */
+export const DEFAULT_TONE_SPEC: ToneSpec = {
+  shape: 'sine',
+  freqHz: 528,
+  attackSec: 0.005,
+  releaseSec: 3,
+};
+
+/** The two offered export formats (design §19): WAV dependency-free, MP3 compressed. */
+export type RenderFormat = 'wav' | 'mp3';
+
+/** The clip panel's two roles (design §18): browse manages the library; pick returns a
+ *  clipId to a layer source. */
+export type ClipPanelMode = 'browse' | 'pick';
+
+/** RenderStore lifecycle phases (design §19). */
+export type RenderPhase = 'idle' | 'rendering' | 'encoding' | 'done' | 'error';
+
+/** VoiceScriptStore lifecycle phases (design §20). */
+export type VoiceScriptPhase = 'idle' | 'compiling' | 'done' | 'error';

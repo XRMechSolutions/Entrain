@@ -16,6 +16,23 @@ const base = process.env.BASE_PATH || '/';
 
 export default defineConfig({
   base,
+  // Cross-origin isolation so onnxruntime-web's threaded WASM (the kokoro-js TTS backend) can
+  // use SharedArrayBuffer + worker threads — without it the `-threaded` build stalls and any
+  // single-threaded inference is very slow. `credentialless` keeps the first-run HuggingFace
+  // model fetch working without requiring CORP headers on the cross-origin response.
+  // (Static hosts like GitHub Pages must send these headers themselves for prod isolation.)
+  server: {
+    headers: {
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'credentialless',
+    },
+  },
+  preview: {
+    headers: {
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'credentialless',
+    },
+  },
   plugins: [
     svelte(),
     VitePWA({
@@ -47,7 +64,20 @@ export default defineConfig({
       },
       workbox: {
         // wav = the silent loop (§6.3); js = the pulse AudioWorklet chunk (§6.4).
-        globPatterns: ['**/*.{js,css,html,svg,png,ico,woff2,wav}'],
+        // onnx/bin = a self-hosted Kokoro q8 model (the optional fully-offline-first-run
+        // path, D-039); wasm = the onnxruntime-web execution backend kokoro-js loads. These
+        // are large (the q8 model is tens of MB, the ort wasm a few MB), so they MUST be
+        // admitted by maximumFileSizeToCacheInBytes below — Workbox's default (~2 MB)
+        // silently drops them from the precache manifest, which would break offline TTS
+        // (tts-local dependencies.md @ D-017, design §6).
+        globPatterns: ['**/*.{js,css,html,svg,png,ico,woff2,wav,onnx,bin,wasm}'],
+        // Admit the tens-of-MB Kokoro q8 model + multi-MB onnxruntime wasm into precache.
+        // Under D-039 the model is fetched from the HF hub on first use and the browser
+        // caches it (online once, offline thereafter); this limit + the globs above cover
+        // the same-origin ort wasm and the optional self-hosted weights so neither is
+        // silently excluded by the default size cap (tts-local design §6, dependencies.md
+        // @ D-017). registerType:'prompt' is unaffected — the assets are content-hashed.
+        maximumFileSizeToCacheInBytes: 100 * 1024 * 1024,
         // Relative — Workbox resolves it against the SW location, so it works at both
         // origin root and a subpath without hardcoding the base.
         navigateFallback: 'index.html',

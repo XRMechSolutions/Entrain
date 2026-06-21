@@ -11,8 +11,11 @@
     state: TransportState;
     canPlay: boolean;
     onprimary: () => void;
+    /** Compact form for the global transport bar: a small glyph-only circle (no text label,
+     *  tap-min diameter) instead of the 120px hero. The accessible name is unchanged. */
+    compact?: boolean;
   }
-  let { state, canPlay, onprimary }: Props = $props();
+  let { state, canPlay, onprimary, compact = false }: Props = $props();
 
   // §5 table: playing → Pause; everything else → Play/Resume.
   const label = $derived(
@@ -25,13 +28,14 @@
   type="button"
   class="play"
   class:is-pause={isPause}
-  style="--d: {PLAY_BUTTON_DIAMETER_PX}px"
+  class:compact
+  style="--d: {compact ? 'var(--tap-min)' : `${PLAY_BUTTON_DIAMETER_PX}px`}"
   disabled={!canPlay}
   aria-label={label}
   onclick={onprimary}
 >
   <span class="glyph" aria-hidden="true">{isPause ? '⏸' : '▶'}</span>
-  <span class="text">{label}</span>
+  {#if !compact}<span class="text">{label}</span>{/if}
 </button>
 
 <style>
@@ -57,6 +61,14 @@
     background: var(--surface-2);
     color: var(--text);
     box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
+  }
+  /* Compact form (global transport bar): a small glyph-only circle, no hero shadow. */
+  .play.compact {
+    flex: none;
+    box-shadow: none;
+  }
+  .play.compact .glyph {
+    font-size: 1.25rem;
   }
   .glyph {
     font-size: 2.4rem;

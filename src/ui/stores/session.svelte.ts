@@ -22,13 +22,19 @@ import {
   RANGES,
   sortNodes,
   type AutomatableParam,
+  type Layer,
+  type LayerKind,
+  type LayerSource,
+  type LanePoint,
   type ModPoint,
   type ParamPoint,
   type ParamTransition,
   type Preset,
   type TimeNode,
+  type ToneSpec,
   type Waveform,
 } from '../../engine/session-model';
+import { DEFAULT_TONE_SPEC } from '../lib/constants';
 import type { LiftOptions, Transport, TransportNotice, TransportState } from '../../engine/transport';
 import type { NoticeStore } from './notices.svelte';
 
@@ -197,6 +203,31 @@ export interface SessionStore {
 
   applyLiveEdit(): void;
 
+  // ----- Phase-2 layer authoring (design §17; interfaces §14). Each clamps to v4 RANGES,
+  //       bumps revision, sets dirty, and calls applyLiveEdit() — so a live layer edit
+  //       reschedules at the unchanged position via transport.reapply(). They never author
+  //       a preset that fails session-model.validate (kind/source pairings stay valid). -----
+  /** Append a valid default Layer of `kind`; returns its generated unique id. tone →
+   *  DEFAULT_TONE_SPEC; ambiance/voice → unbound clip source (silent until a clip is picked). */
+  addLayer(kind: LayerKind): string;
+  removeLayer(id: string): void;
+  setLayerKind(id: string, kind: LayerKind): void;
+  setLayerSource(id: string, source: LayerSource): void;
+  setLayerToneSpec(id: string, patch: Partial<ToneSpec>): void;
+  setLayerStart(id: string, t: number): void;
+  setLayerLoop(id: string, loop: boolean): void;
+
+  // per-layer gain / spatial (pan) lanes — LanePoint[] relative to the layer's start
+  addLayerLanePoint(id: string, lane: 'gain' | 'spatial', t: number): number; // returns point index
+  moveLayerLanePoint(id: string, lane: 'gain' | 'spatial', index: number, t: number): void;
+  setLayerLaneValue(id: string, lane: 'gain' | 'spatial', index: number, value: number): void;
+  setLayerLaneTransition(id: string, lane: 'gain' | 'spatial', index: number, tr: ParamTransition): void;
+  removeLayerLanePoint(id: string, lane: 'gain' | 'spatial', index: number): void;
+
+  /** Append compiled VoiceScript layers into preset.layers (their absolute t already
+   *  computed by the compiler — design §20). Bumps revision, dirty, applyLiveEdit(). */
+  injectLayers(layers: readonly Layer[]): void;
+
   // --- state transitions used by the library store's save/import flows (these change
   //     selectedId/dirty WITHOUT reloading transport, which reset() would do) ---
   /** Record a successful save: adopt the saved id, mark clean. */
@@ -257,6 +288,80 @@ export function createSessionStore(deps: { transport: Transport; playback: Playb
     applyLiveEdit();
   }
 
+  // ----- Phase-2 layer helpers -----------------------------------------------------------
+
+  /** The mutable layers array, lazily created (createDefaultPreset omits `layers`). */
+  function layers(): Layer[] {
+    if (!preset.layers) preset.layers = [];
+    return preset.layers;
+  }
+
+  function findLayer(id: string): Layer | undefined {
+    return preset.layers?.find((l) => l.id === id);
+  }
+
+  /** A collision-free unique layer id (never asks the user to type one — L1). */
+  function freshLayerId(): string {
+    const existing = new Set((preset.layers ?? []).map((l) => l.id));
+    let n = existing.size + 1;
+    let id = `layer_${n}`;
+    while (existing.has(id)) id = `layer_${++n}`;
+    return id;
+  }
+
+  function clampToneFreq(freqHz: number): number {
+    const r = RANGES.toneFreq;
+    return Math.min(r.max, Math.max(r.min, freqHz));
+  }
+
+  /** Clamp a lane point value to the lane's range (gain = volume {0,1}, spatial {−1,1}). */
+  function clampLaneValue(lane: 'gain' | 'spatial', value: number): number | null {
+    if (!Number.isFinite(value)) return null;
+    const r = lane === 'gain' ? RANGES.volume : RANGES.spatial;
+    return Math.min(r.max, Math.max(r.min, value));
+  }
+
+  /** Keep a lane sorted ascending by t and free of duplicate t (mirrors LANE_NOT_SORTED /
+   *  LANE_DUPLICATE_T). A point landing on an existing t is nudged by MIN_NODE_DT analogue. */
+  function normalizeLane(points: LanePoint[]): LanePoint[] {
+    const sorted = [...points].sort((a, b) => a.t - b.t);
+    const out: LanePoint[] = [];
+    let lastT = -Infinity;
+    for (const p of sorted) {
+      let t = p.t;
+      if (t <= lastT) t = lastT + 0.01; // dedup-t: never two points at the same relative t
+      out.push({ ...p, t });
+      lastT = t;
+    }
+    return out;
+  }
+
+  function getLane(layer: Layer, lane: 'gain' | 'spatial'): LanePoint[] {
+    let arr = layer[lane];
+    if (!arr) {
+      arr = [];
+      layer[lane] = arr;
+    }
+    return arr;
+  }
+
+  /** A layer's start clamp — [0, durationSec]. */
+  function clampLayerStart(t: number): number {
+    if (!Number.isFinite(t)) return 0;
+    return Math.min(preset.durationSec, Math.max(0, t));
+  }
+
+  /** Default loop for a kind (ambiance must loop; tone/voice default off). */
+  function defaultLoopFor(kind: LayerKind): boolean {
+    return kind === 'ambiance';
+  }
+
+  /** A valid default source for a kind: tone ⇒ a synth ToneSpec; ambiance/voice ⇒ an
+   *  unbound clip placeholder (empty clipId = the "Pick a clip" state, L7). */
+  function defaultSourceFor(kind: LayerKind): LayerSource {
+    return kind === 'tone' ? { synth: { ...DEFAULT_TONE_SPEC } } : { clipId: '' };
+  }
+
   const store: SessionStore = {
     get preset() {
       return preset;
@@ -312,6 +417,16 @@ export function createSessionStore(deps: { transport: Transport; playback: Playb
       // Clamp to (0, LIMITS max]: a session must be at least 1s and at most 24h.
       const clamped = Math.min(LIMITS.durationMaxSec, Math.max(1, Math.round(sec)));
       preset.durationSec = clamped;
+      // Re-clamp nodes and layers whose t now exceeds the new duration (J5, L4).
+      for (let i = 1; i < preset.nodes.length; i++) {
+        if (preset.nodes[i].t > clamped) preset.nodes[i].t = clamped;
+      }
+      if (preset.nodes.length > 1) preset.nodes = sortNodes(preset.nodes);
+      if (preset.layers) {
+        for (const layer of preset.layers) {
+          if (layer.t > clamped) layer.t = clamped;
+        }
+      }
       // NOT a live edit — no reapply(); the new length is read by the next play() (B6).
       dirty = true;
       bump();
@@ -370,6 +485,142 @@ export function createSessionStore(deps: { transport: Transport; playback: Playb
     },
 
     applyLiveEdit,
+
+    // ----- Phase-2 layer authoring -----
+
+    addLayer(kind: LayerKind): string {
+      const id = freshLayerId();
+      const layer: Layer = {
+        id,
+        kind,
+        source: defaultSourceFor(kind),
+        t: 0,
+        loop: defaultLoopFor(kind),
+      };
+      layers().push(layer);
+      commit();
+      return id;
+    },
+
+    removeLayer(id: string) {
+      const arr = preset.layers;
+      if (!arr) return;
+      const idx = arr.findIndex((l) => l.id === id);
+      if (idx === -1) return;
+      arr.splice(idx, 1); // the referenced clip stays in the library (shared, L10)
+      commit();
+    },
+
+    setLayerKind(id: string, kind: LayerKind) {
+      const layer = findLayer(id);
+      if (!layer) return;
+      if (layer.kind === kind) return;
+      layer.kind = kind;
+      // Re-validate the source against the new kind constraint (L3): a tone needs a synth
+      // source; ambiance/voice need a clip source. Swap to a valid default when the current
+      // source no longer fits, so the inspector can never produce a LAYER_SOURCE_INVALID.
+      const hasSynth = 'synth' in layer.source;
+      const needsSynth = kind === 'tone';
+      if (needsSynth !== hasSynth) layer.source = defaultSourceFor(kind);
+      layer.loop = defaultLoopFor(kind); // ambiance must loop; tone/voice default off
+      commit();
+    },
+
+    setLayerSource(id: string, source: LayerSource) {
+      const layer = findLayer(id);
+      if (!layer) return;
+      layer.source = source;
+      commit();
+    },
+
+    setLayerToneSpec(id: string, patch: Partial<ToneSpec>) {
+      const layer = findLayer(id);
+      if (!layer || !('synth' in layer.source)) return; // only a synth source has a ToneSpec
+      const spec = layer.source.synth;
+      if (patch.shape !== undefined) spec.shape = patch.shape;
+      if (patch.freqHz !== undefined && Number.isFinite(patch.freqHz)) spec.freqHz = clampToneFreq(patch.freqHz);
+      if (patch.attackSec !== undefined && Number.isFinite(patch.attackSec)) spec.attackSec = Math.max(0, patch.attackSec);
+      if (patch.releaseSec !== undefined && Number.isFinite(patch.releaseSec)) spec.releaseSec = Math.max(0, patch.releaseSec);
+      commit();
+    },
+
+    setLayerStart(id: string, t: number) {
+      const layer = findLayer(id);
+      if (!layer) return;
+      layer.t = clampLayerStart(t);
+      commit();
+    },
+
+    setLayerLoop(id: string, loop: boolean) {
+      const layer = findLayer(id);
+      if (!layer) return;
+      // ambiance must loop (the clip is a bed); ignore an attempt to turn it off (L3).
+      layer.loop = layer.kind === 'ambiance' ? true : loop;
+      commit();
+    },
+
+    addLayerLanePoint(id: string, lane: 'gain' | 'spatial', t: number): number {
+      const layer = findLayer(id);
+      if (!layer) return -1;
+      const arr = getLane(layer, lane);
+      const relT = Number.isFinite(t) ? Math.max(0, t) : 0;
+      // Carry-forward value so adding a point does not change the sound until it is moved:
+      // an absent gain lane = unity (1), an absent spatial lane = center (0).
+      const carry = lane === 'gain' ? RANGES.volume.max : 0;
+      const point: LanePoint = { t: relT, value: carry };
+      const normalized = normalizeLane([...arr, point]);
+      layer[lane] = normalized;
+      commit();
+      return normalized.findIndex((p) => p === point || (p.t === point.t && p.value === point.value));
+    },
+
+    moveLayerLanePoint(id: string, lane: 'gain' | 'spatial', index: number, t: number) {
+      const layer = findLayer(id);
+      if (!layer) return;
+      const arr = layer[lane];
+      if (!arr || index < 0 || index >= arr.length) return;
+      arr[index] = { ...arr[index], t: Number.isFinite(t) ? Math.max(0, t) : arr[index].t };
+      layer[lane] = normalizeLane(arr);
+      commit();
+    },
+
+    setLayerLaneValue(id: string, lane: 'gain' | 'spatial', index: number, value: number) {
+      const layer = findLayer(id);
+      if (!layer) return;
+      const arr = layer[lane];
+      if (!arr || index < 0 || index >= arr.length) return;
+      const clamped = clampLaneValue(lane, value);
+      if (clamped === null) return; // never author a non-finite lane value
+      arr[index] = { ...arr[index], value: clamped };
+      commit();
+    },
+
+    setLayerLaneTransition(id: string, lane: 'gain' | 'spatial', index: number, tr: ParamTransition) {
+      const layer = findLayer(id);
+      if (!layer) return;
+      const arr = layer[lane];
+      if (!arr || index < 0 || index >= arr.length) return;
+      arr[index] = { ...arr[index], transition: tr };
+      commit();
+    },
+
+    removeLayerLanePoint(id: string, lane: 'gain' | 'spatial', index: number) {
+      const layer = findLayer(id);
+      if (!layer) return;
+      const arr = layer[lane];
+      if (!arr || index < 0 || index >= arr.length) return;
+      arr.splice(index, 1);
+      if (arr.length === 0) delete layer[lane]; // empty lane = the implicit default
+      commit();
+    },
+
+    injectLayers(incoming: readonly Layer[]) {
+      // Append the compiled layers — their absolute t is already computed by the compiler;
+      // the UI does NOT re-time them (O6). Push by reference (they are plain Layer data).
+      const arr = layers();
+      for (const l of incoming) arr.push(l);
+      commit();
+    },
 
     markSaved(id: string) {
       selectedId = id;

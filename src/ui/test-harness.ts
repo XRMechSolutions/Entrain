@@ -7,7 +7,8 @@ import { vi } from 'vitest';
 import type { Transport, TransportEventMap, TransportState } from '../engine/transport';
 import { createNoticeStore, createUiStore } from './stores/notices.svelte';
 import { createPlaybackStore, createSessionStore } from './stores/session.svelte';
-import { createInstallStore, createLibraryStore } from './stores/library.svelte';
+import { createClipStore, createInstallStore, createLibraryStore } from './stores/library.svelte';
+import { createRenderStore, createVoiceScriptStore } from './stores/authoring.svelte';
 import type { AppContext } from './context';
 
 type Handler = (p: unknown) => void;
@@ -54,7 +55,9 @@ export function makeFakeTransport(durationSec = 300): FakeTransport {
   return fake as unknown as FakeTransport;
 }
 
-/** Build a full AppContext backed by the REAL stores and a fake transport. */
+/** Build a full AppContext backed by the REAL stores and a fake transport. The Phase-2
+ *  authoring stores use injected stubs so a harness-built context never touches a real
+ *  OfflineAudioContext / clip-library / tts model (component/screen tests stay hermetic). */
 export function makeAppContext(transport: FakeTransport = makeFakeTransport()): AppContext {
   const notices = createNoticeStore();
   const playback = createPlaybackStore({ transport, notices });
@@ -62,5 +65,33 @@ export function makeAppContext(transport: FakeTransport = makeFakeTransport()): 
   const library = createLibraryStore({ session, notices });
   const { store: install } = createInstallStore();
   const ui = createUiStore();
-  return { transport, session, playback, library, notices, install, ui };
+
+  const clips = createClipStore({
+    notices,
+    clipLib: {
+      list: vi.fn(async () => []),
+      totalBytes: vi.fn(async () => 0),
+      remove: vi.fn(async () => true),
+      importVia: vi.fn(async () => {
+        throw new Error('importVia not stubbed in this test');
+      }),
+      createFileImportAdapter: vi.fn(() => ({ source: 'file', produce: vi.fn() })) as never,
+      countPresetsUsingClip: vi.fn(() => 0),
+    },
+  });
+  const render = createRenderStore({
+    session,
+    notices,
+    renderToFile: vi.fn(async () => ({ blob: new Blob(), filename: 'x.wav', mime: 'audio/wav' })) as never,
+    hasOffline: () => true,
+  });
+  const voiceScript = createVoiceScriptStore({
+    session,
+    notices,
+    compileVoiceScript: vi.fn(async () => ({ ok: false, issues: [] })) as never,
+    tts: { source: 'tts', produce: vi.fn() } as never,
+    clipLib: { importVia: vi.fn() as never },
+  });
+
+  return { transport, session, playback, library, notices, install, ui, clips, render, voiceScript };
 }

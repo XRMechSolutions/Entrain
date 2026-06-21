@@ -5,6 +5,7 @@ import {
   exportPreset,
   importPresetFromFile,
   listPresets,
+  loadPreset,
   restoreDefaultPresets,
   savePreset,
   type PresetSummary,
@@ -101,5 +102,27 @@ describe('LibraryScreen (design §7)', () => {
     const { getByRole, ctx } = renderLibrary();
     await fireEvent.click(getByRole('button', { name: 'Save' }));
     expect(savePreset).toHaveBeenCalledWith(ctx.session.preset, undefined);
+  });
+
+  it('opening a preset loads it and jumps to the Advanced editor', async () => {
+    vi.mocked(listPresets).mockReturnValue([summary('Morning', 200)]);
+    vi.mocked(loadPreset).mockReturnValue({ id: 'Morning', createdAt: 0, updatedAt: 200, preset: createDefaultPreset(), warnings: [] });
+    const { ctx, getByText } = renderLibrary();
+    await tick();
+    expect(ctx.ui.tab).toBe('player'); // default screen
+    await fireEvent.click(getByText('Morning')); // tap the preset row
+    expect(ctx.session.selectedId).toBe('Morning'); // loaded as the working preset
+    expect(ctx.ui.tab).toBe('editor'); // …and navigated to Advanced
+  });
+
+  it('cancelling the discard on a dirty open neither loads nor navigates', async () => {
+    vi.mocked(listPresets).mockReturnValue([summary('Morning', 200)]);
+    const { ctx, getByText } = renderLibrary();
+    ctx.session.setName('edited'); // make it dirty
+    await tick();
+    vi.stubGlobal('confirm', vi.fn(() => false));
+    await fireEvent.click(getByText('Morning'));
+    expect(loadPreset).not.toHaveBeenCalled();
+    expect(ctx.ui.tab).toBe('player'); // stayed put
   });
 });

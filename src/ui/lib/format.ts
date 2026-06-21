@@ -51,6 +51,26 @@ export function formatPan(v: number): string {
   return pct === 100 ? 'R' : `R ${pct}%`;
 }
 
+/** A byte count → a short human size: 512 → "512 B", 683008 → "667 KB",
+ *  1363149 → "1.3 MB". Pure + total: 0 / negative / NaN / Infinity render the safe
+ *  "0 B" placeholder (never "NaN KB"). Uses binary (1024) units to match clip storage
+ *  size reporting (§21 / edge-cases M1). */
+export function formatBytes(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = n;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  // Bytes are whole; KB+ show one decimal but drop a trailing ".0" (667 KB, not 667.0 KB).
+  if (unit === 0) return `${Math.round(value)} B`;
+  const rounded = Math.round(value * 10) / 10;
+  const text = Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+  return `${text} ${units[unit]}`;
+}
+
 /** Relative time from an epoch (ms): "just now", "2 minutes ago", "2 days ago". `now`
  *  defaults to Date.now() (read at call time so tests can pass a fixed clock). Future
  *  or non-finite timestamps render as "just now". */

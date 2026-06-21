@@ -8,9 +8,19 @@
 //
 // See .dev/planning/modules/transport/{design,interfaces,edge-cases}.md.
 
-import type { Preset } from './session-model';
-import type { Voice } from './audio-engine';
+import type { Layer, Preset } from './session-model';
+import type { Voice, VoiceOptions } from './audio-engine';
+import type { Mixer } from './mixer';
+import type { LayerNode } from './layer-engine';
 import type { ShepardHandle, ShepardOptions } from './shepard';
+
+// Re-export the Phase-2 bus/layer contracts transport composes by injection, so the
+// ui composition root (and tests) reference one surface. These are TYPE-only imports —
+// transport never hard-imports mixer / layer-engine, it receives them through the DI
+// seams below (createMixer / layerScheduler), the same IoC pattern as `scheduler`.
+export type { Mixer, DuckSpan } from './mixer';
+export type { LayerNode } from './layer-engine';
+export type { Layer } from './session-model';
 
 // --- Public state / mode unions --------------------------------------------
 
@@ -102,6 +112,39 @@ export interface SessionScheduler {
   cancel(voice: Voice): void;
 }
 
+// --- Phase-2 contracts (the unified bus + layers — D-036) ------------------
+//
+// The AUTHORITATIVE source is phase2-audio-architecture.md §6 (the cross-module
+// contract spine). `LayerSchedule` / `LayerSchedulerFactory` are restated VERBATIM
+// from §6 / interfaces.md and must not drift — if they ever diverge, §6 wins.
+// Transport receives the `scheduleLayers` free function by injection
+// (`TransportOptions.layerScheduler`), the same IoC pattern as `SessionScheduler`,
+// and never imports `layer-scheduler` directly.
+
+/** The handle the injected layer scheduler returns (one per session). Restated
+ *  verbatim from arch §6: `{ retarget(layers, atCtx?); cancel(); dispose() }`. */
+export interface LayerSchedule {
+  /** LIVE EDIT: re-ramp the layer lanes (gain/pan) + the bed duck to the edited
+   *  layers from `atCtx`, keeping the running layer nodes (the layer analogue of
+   *  `scheduler.retarget`). Driven by transport's `reapply()`. */
+  retarget(layers: readonly Layer[], atCtx?: number): void;
+  /** Cancel the scheduled layer lane + duck automation (without disposing nodes). */
+  cancel(): void;
+  /** Dispose the schedule's owned resources. The layer NODES are owned + disposed by
+   *  transport (it builds them); this disposes the scheduler-side bookkeeping. */
+  dispose(): void;
+}
+
+/** The injected factory shape transport calls (the `automation` scheduleLayers
+ *  adapter, supplied by the ui composition root). Matches arch §6's `scheduleLayers`
+ *  free-function signature exactly; transport never imports layer-scheduler. */
+export type LayerSchedulerFactory = (
+  mixer: Mixer,
+  nodes: readonly LayerNode[],
+  layers: readonly Layer[],
+  opts: { readonly t0: number; readonly startOffsetSec: number },
+) => LayerSchedule;
+
 // --- Errors ----------------------------------------------------------------
 
 /** The only error TYPE transport throws (programmer/contract misuse).
@@ -131,6 +174,15 @@ export interface TransportOptions {
    *  transport decoupled from automation's not-yet-frozen API). */
   scheduler: SessionScheduler;
 
+  /** PHASE-2 (D-036), OPTIONAL. The layer-scheduler factory (the `automation`
+   *  `scheduleLayers` adapter), injected by the ui composition root exactly like
+   *  `scheduler`. When present, transport builds `LayerNode`s for `preset.layers`
+   *  and drives `scheduleLayers(mixer, nodes, layers, …)` alongside the binaural
+   *  scheduler (design §19.5). When absent (Phase-1 host, or a preset with no
+   *  layers), transport composes the mixer and routes the voice through it but
+   *  schedules no layers. See phase2-audio-architecture.md §2.2 / §6. */
+  layerScheduler?: LayerSchedulerFactory;
+
   /** Master fade-in / fade-out (seconds). Defaults 0.5 / 0.5. */
   fadeInSec?: number;
   fadeOutSec?: number;
@@ -152,8 +204,14 @@ export interface TransportOptions {
   audioContextFactory?: () => AudioContext;
   /** Register the pulse worklet. Default audio-engine.registerPulseWorklet. */
   registerWorklet?: (ctx: BaseAudioContext) => Promise<void>;
-  /** Build a fresh voice. Default (ctx) => audio-engine.createVoice(ctx). */
-  createVoice?: (ctx: BaseAudioContext) => Voice;
+  /** Build a fresh voice. Default (ctx, opts) => audio-engine.createVoice(ctx, opts).
+   *  PHASE-2: transport calls this with `{ master: 'bus' }` so the voice's internal
+   *  master is a unity passthrough and the `mixer` owns the only master (no
+   *  double-attenuation; phase2-audio-architecture.md §2.1 / §2.2). */
+  createVoice?: (ctx: BaseAudioContext, opts?: VoiceOptions) => Voice;
+  /** PHASE-2, OPTIONAL. Build the per-session mixer (the unified bus).
+   *  Default (ctx) => mixer.createMixer(ctx). Inject a fake in tests. */
+  createMixer?: (ctx: BaseAudioContext) => Mixer;
   /** Register the shepard ("lift") worklet. Default shepard.registerShepardWorklet. */
   registerShepard?: (ctx: BaseAudioContext) => Promise<void>;
   /** Build a shepard ("lift") node. Default shepard.createShepardNode. */

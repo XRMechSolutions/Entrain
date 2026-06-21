@@ -6,7 +6,7 @@ import type { Preset } from '../engine/session-model';
 
 // The built-in session presets live at the repo root in presets/ — the canonical files
 // the library seed imports and anyone can import/share. This guarantees they parse +
-// validate as schema v3 (i.e. import without error) and end the way they should.
+// validate as schema v5 (i.e. import without error) and end the way they should.
 const NAPS = ['power-nap-20.json', 'power-nap-40.json', 'power-nap-60.json'];
 const SLEEP_FADE = ['8h-sleep-cycles.json'];
 
@@ -14,12 +14,12 @@ function load(file: string): Preset {
   const res = parse(readFileSync(resolve(process.cwd(), 'presets', file), 'utf8'));
   if (!res.ok) {
     console.error(`${file} validation issues:`, JSON.stringify(res.issues, null, 2));
-    throw new Error(`${file} did not validate as schema v3`);
+    throw new Error(`${file} did not validate as schema v5`);
   }
   return res.preset;
 }
 
-describe('Built-in session presets are valid v3 and import cleanly', () => {
+describe('Built-in session presets are valid v5 and import cleanly', () => {
   for (const file of [...NAPS, ...SLEEP_FADE]) {
     it(`${file} parses with a positive duration`, () => {
       expect(load(file).durationSec).toBeGreaterThan(0);

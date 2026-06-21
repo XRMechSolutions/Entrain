@@ -109,3 +109,158 @@
 - [ ] Per-task audit PASS for every task
 - [ ] last-step-summary.md written for every task with a concrete Observable Verification entry
 - [ ] Behavioral audit PASS (audit-transport.md verdict = PASS)
+
+## Feature: mixer bus + layers (Phase 2)
+
+Phase 2 (D-036/D-037) moves `master` off the voice and onto a single per-session
+summation **bus** (`mixer`): the binaural voice and all layers share one master, one
+duck, and one output retarget. Transport composes that bus, retargets routing to
+`mixer.master`, rides the Shepard lift through `mixer.liftInput`, and drives the
+injected `scheduleLayers` factory. The normative contract is
+phase2-audio-architecture.md §1 / §2.2 / §4 / §5 / §6; design §19 describes only
+what transport does to honor it; where they disagree, the arch doc wins. This
+feature stays entirely within `src/engine/transport.ts`, `src/engine/transport-types.ts`,
+and `src/engine/transport.test.ts` — `mixer` / `layer-engine` / `layer-scheduler`
+are composed by injection and imported type-only, never modified here.
+
+### Dependencies (must be complete before this feature starts)
+- `session-model` v3→v4 schema bump (`Layer`, `LayerKind`, `Preset.layers`) — the §0
+  gating blocker; `Preset`/`Layer` types must exist for the type-only imports.
+- `mixer` (Layer-0, NEW) — `createMixer` and the `Mixer`/`DuckSpan` types (arch §1/§6).
+- `layer-engine` (Layer-0, NEW) — `createLayerNode` and the `LayerNode` type (arch §6).
+- `audio-engine` `VoiceOptions.master?: 'internal' | 'bus'` flag (arch §2.1/§6).
+- `layer-scheduler` (Layer-1, NEW) — the `scheduleLayers` free function the ui
+  composition root adapts into `TransportOptions.layerScheduler`. NOT required to
+  start: transport drives it through the injected `LayerSchedulerFactory` and is
+  built/tested against a fake. (Stub: the `automation`→`layerScheduler` adapter is
+  resolved in the `automation`/`ui` integration, same seam as `SessionScheduler`.)
+
+### Cohesion guardrails (acceptance criteria for EVERY task below)
+- The existing test suites are byte-identical guardrails: `automation.test.ts`
+  (scheduleLane extraction), `audio-engine.test.ts` (the `master` flag defaults to
+  `'internal'` so every Phase-1 voice test is unchanged), `transport-master-gain.test.ts`
+  (param-agnostic controller, no signature change). Run the FULL suite green BEFORE
+  and AFTER each task; any pre-existing-test diff outside `transport.test.ts` is a
+  regression, not a spec change.
+- No-click ramps only (D-008): `setValueAtTime(JS-anchor)` + `linearRampToValueAtTime`;
+  never exponential, never `setValueCurveAtTime`. `mixer.master` starts at 0, so the
+  start fade-in stays the click-free `0 → trim` ramp.
+- Single-writer params (D-019): only `transport-master-gain` writes `mixer.masterParam`;
+  only `mixer.scheduleDuck` writes `duckParam`. Transport NEVER writes `duckParam` and
+  never reads `param.value` (analytic tracking, design §4).
+
+- [x] [prereq] Add the Phase-2 bus/layer contract imports and the `layerScheduler` injection seam to `TransportOptions` | file: src/engine/transport-types.ts | model: T1-lite
+  - Ref: .dev/planning/modules/transport/interfaces.md @ Phase-2 contracts (the unified bus + layers — D-036)
+  - Ref: .dev/planning/modules/transport/interfaces.md @ Construction (TransportOptions: layerScheduler, createMixer, createVoice with VoiceOptions)
+  - Ref: .dev/planning/modules/transport/design.md @ §19.5 Layer nodes + the injected scheduleLayers
+  - Ref: .dev/planning/modules/transport/edge-cases.md @ K5 (no layers / layerScheduler not injected — optional)
+  - Ref: C:/Projects/BinauralAudio/.dev/planning/phase2-audio-architecture.md @ §6 Cross-Module Contract Spine (createMixer / createLayerNode / scheduleLayers / VoiceOptions.master — VERBATIM)
+  - Ref: C:/Projects/BinauralAudio/.dev/planning/phase2-audio-architecture.md @ §2.2 transport-types.ts (add layerScheduler to TransportOptions)
+  - Accepts: nothing (declarations only); type-only imports of `Layer` from session-model, `VoiceOptions` from audio-engine, `Mixer`/`DuckSpan` from mixer, `LayerNode` from layer-engine.
+  - Creates: type-only re-imports of `Mixer`, `LayerNode`, `Layer`; the `LayerSchedule` interface (`retarget(layers, atCtx?)`/`cancel()`/`dispose()`) and the `LayerSchedulerFactory` type — both restated VERBATIM from arch §6; three OPTIONAL `TransportOptions` fields: `layerScheduler?: LayerSchedulerFactory`, `createMixer?: (ctx: BaseAudioContext) => Mixer`, and the `createVoice` DI seam widened to `(ctx, opts?: VoiceOptions) => Voice` so `{ master: 'bus' }` is passable. Existing Phase-1 `TransportOptions` fields and `TransportError`/event map/§11 constants are untouched.
+  - Behavior: every new field is OPTIONAL (a Phase-1 host that omits them must still compile and run — K5); signatures match arch §6 byte-for-byte (`if they ever diverge, §6 wins`); imports are type-only so transport composes mixer/layer-engine by injection and never hard-imports them.
+  - Ripple: consumers of `TransportOptions` (the ui composition root, transport.ts). All additions optional → no existing call site breaks. `transport-types.test.ts` must stay green.
+  - Tests: `LayerSchedulerFactory` and `LayerSchedule` shapes compile against arch §6; `TransportOptions` with NONE of the new fields still type-checks (Phase-1 host); `TransportOptions` with `layerScheduler`/`createMixer`/`createVoice({master:'bus'})` type-checks; the new imports are type-only (no runtime import of mixer/layer-engine in the emitted module).
+
+- [x] [impl] Compose the unified bus in `startFresh`: createMixer, createVoice({master:'bus'}), rewire voice.output→mixer.bedInput, bind masterCtrl to mixer.masterParam, routeOutput(mixer) | file: src/engine/transport.ts | model: T1 [availability]
+  - Ref: .dev/planning/modules/transport/design.md @ §19.1 What changes and what does not
+  - Ref: .dev/planning/modules/transport/design.md @ §19.2 startFresh — compose the bus and bind the controller
+  - Ref: .dev/planning/modules/transport/design.md @ §6 play() — the start sequence (the in-gesture createVoice/route/schedule block this refactors)
+  - Ref: .dev/planning/modules/transport/edge-cases.md @ K1 (double-attenuation guard — master:'bus')
+  - Ref: .dev/planning/modules/transport/edge-cases.md @ K5 (mixer always composed even with no layers)
+  - Ref: C:/Projects/BinauralAudio/.dev/planning/phase2-audio-architecture.md @ §1 The Unified Bus Topology (single-fan-in, single-input master, master constructed at 0)
+  - Ref: C:/Projects/BinauralAudio/.dev/planning/phase2-audio-architecture.md @ §2.2 transport.ts — startFresh (~824-827)
+  - Ref: C:/Projects/BinauralAudio/.dev/planning/phase2-audio-architecture.md @ §2.1 audio-engine master flag (why the voice no longer self-attenuates)
+  - Accepts: the loaded `preset`; `createVoiceFn`/`createMixer` DI seams (transport-types from the prereq); the existing routing/ramp primitives; `c = ctx`.
+  - Creates: in `startFresh` (~824-827), in this fixed order so `master` always has exactly one upstream — (1) `const v = createVoiceFn(c, { master: 'bus' })`; (2) `const mixer = createMixer(c)` held in a per-session `let` (default `(ctx) => createMixerImpl(ctx)`, overridable for tests; nulled on teardown); (3) `try { v.output.disconnect(c.destination); } catch {}` (drop the voice's default destination edge — mirrors the existing mediastream rewire); (4) `v.output.connect(mixer.bedInput)` (the voice joins the BED sub-bus); (5) `masterCtrl = createMasterGainController(mixer.masterParam, () => c.currentTime)` (the controller now binds the bus master param — analytic discipline §4 unchanged); (6) `routeOutput(mixer)`.
+  - Behavior: voice created with `{ master: 'bus' }` so its internal `masterGain` is a unity passthrough and the bus master is the only master (no double-attenuation, K1); `mixer.master` constructed at 0, so `rampMaster(trim, fadeInSec)` is the same click-free `0 → trim` start fade (D-008 moves from voice DEFAULT_MASTER=0 to mixer.master at 0 — equivalent); the mixer is composed REGARDLESS of layers (binaural voice always rides bedInput — K5). Lifecycle (§2/§5-§7/§12-§17) untouched.
+  - Handles: the `try/catch` around the destination disconnect (edge may already be absent); `createMasterGainController` binding any `AudioParam` (param-agnostic — arch §2.3) so only the param identity changed.
+  - Ripple: `routeOutput`/`playBridgeElement`/`liftTarget`/`teardown` now operate against `mixer` (handed off to the next tasks). `transport-master-gain.ts` is NOT edited (comment-only at most) — its test must stay green.
+  - Tests: a session start builds the voice with `{ master: 'bus' }` (DI seam observes the opts); `voice.output` is disconnected from `ctx.destination` then connected to `mixer.bedInput` (the voice no longer connects to the destination directly); `createMasterGainController` is constructed with `mixer.masterParam`; `mixer.master` begins at 0 and the start fade ramps `0 → trim` linearly (no exponential/curve op); K5 — a preset with no `layers` still composes the mixer and routes voice→bedInput→…→master; K1 — in bus mode the voice's `masterGain.gain === 1` and `setMasterGain` is a no-op while non-finite still throws. Full suite green before & after.
+
+- [x] [impl] Retarget routing to `mixer.master` and ride the lift on `mixer.liftInput`: routeOutput/playBridgeElement move only mixer.master, liftTarget→mixer.liftInput, disposeLift keeps only the mid-session enable/disable fade | file: src/engine/transport.ts | model: T1 [availability]
+  - Ref: .dev/planning/modules/transport/design.md @ §19.3 routeOutput / playBridgeElement move only mixer.master
+  - Ref: .dev/planning/modules/transport/design.md @ §19.4 The Shepard lift rides the bus (liftInput, post-duck)
+  - Ref: .dev/planning/modules/transport/design.md @ §8 Output routing & the background-audio bridge (the routing logic being retargeted)
+  - Ref: .dev/planning/modules/transport/edge-cases.md @ K2 (routing test retarget — move only mixer.master)
+  - Ref: .dev/planning/modules/transport/edge-cases.md @ K3 (single audible path — mixer.master.connections length 1)
+  - Ref: .dev/planning/modules/transport/edge-cases.md @ K4 (lift control retarget — liftInput, keep mid-session setLift(null) self-fade)
+  - Ref: C:/Projects/BinauralAudio/.dev/planning/phase2-audio-architecture.md @ §1 (single-input-master invariant; lift is a post-duck overlay)
+  - Ref: C:/Projects/BinauralAudio/.dev/planning/phase2-audio-architecture.md @ §2.2 transport.ts — routeOutput (369-404) / playBridgeElement (415-438) / liftTarget (452-454) / disposeLift (529-561)
+  - Ref: C:/Projects/BinauralAudio/.dev/planning/phase2-audio-architecture.md @ §4 Ducking (lift is post-duck, never pumped)
+  - Accepts: the per-session `mixer` (from the prior task); the existing `msDest`/`<audio>`/`liftGain` machinery; `backgroundAudioMode`.
+  - Creates: `routeOutput` operating on `mixer` — the mediastream branch moves `mixer.master` between `ctx.destination` and `msDest` (default: `mixer.master.connect(ctx.destination)`, the voice's destination edge already dropped in startFresh); the `none`/`silent-file` branches connect/reference `mixer.master`. `playBridgeElement` (iOS `<audio>` fallback) moves ONLY `mixer.master` between destinations, with the old `liftGain` rewire block (lines 423-430) DELETED. `liftTarget` returns `mixer.liftInput` (`applyLift` connects the aux `liftGain` there via the existing `g.connect(target)`). `disposeLift` DROPS the teardown self-fade (the bus master fade-out covers the in-bus lift on `teardown(true)`) but KEEPS the aux `liftGain` fade for mid-session enable/disable (`setLift(null)` still ramps the aux gain linearly to 0 and disconnects it).
+  - Behavior: `mixer.master` is the single node with one upstream (`busSum`), so `connect`/`disconnect` move exactly one edge (single-input-master invariant — K3); the lift joins `busSum` downstream of `duckGain` so master fade/trim/teardown cover it but the bed duck never pumps it (K4, reconciles D-026); no doubling because the voice's destination edge was dropped in startFresh.
+  - Handles: the deleted `playBridgeElement` lift rewire (lift now follows `mixer.master` automatically via `liftInput` and must NOT be rewired separately — K4); teardown no longer self-fades the lift, mid-session disable still does.
+  - Ripple: `transport.test.ts` routing assertions (~822-836) and the lift/`setLift` assertions are retargeted in the test task below (K2/K3/K4). No other consumer affected (routing is internal).
+  - Tests: K2 — mediastream resolve/reject, silent-file, none, and the iOS `playBridgeElement` fallback all move ONLY `mixer.master` between `ctx.destination` and `msDest`; K3 — exactly one audible path: `mixer.master` has one upstream and one downstream destination (length 1), the voice has no direct destination edge; K4 — the aux `liftGain` connects to `mixer.liftInput`; on `teardown(true)` the lift is NOT self-faded (covered by the bus master fade) but on mid-session `setLift(null)` the aux gain still ramps linearly to 0 and disconnects (`lastRampTarget(aux.gain,'linear') === 0`, `aux.disconnectCalls > 0`); D1/D2/D3/D6 routing behaviors still hold with the bus. Full suite green before & after.
+
+- [x] [impl] Drive the injected `scheduleLayers`: build LayerNodes by kind, schedule alongside scheduler.apply/retarget, dispose+rebuild layer nodes on seek, retarget on reapply | file: src/engine/transport.ts | model: T1
+  - Ref: .dev/planning/modules/transport/design.md @ §19.5 Layer nodes + the injected scheduleLayers
+  - Ref: .dev/planning/modules/transport/design.md @ §9 Orchestrating automation through an injected SessionScheduler (the apply/retarget/cancel ordering layers ride alongside)
+  - Ref: .dev/planning/modules/transport/design.md @ §8.3 seek(t) — the only operation that re-schedules (one-shot sources rebuild)
+  - Ref: .dev/planning/modules/transport/design.md @ §10 reapply() — live-edit entry point (keep running nodes, no rebuild)
+  - Ref: .dev/planning/modules/transport/interfaces.md @ Phase-2 contracts (LayerSchedule / LayerSchedulerFactory / createLayerNode / scheduleLayers)
+  - Ref: .dev/planning/modules/transport/edge-cases.md @ K5 (no layers / layerScheduler absent — build none, schedule none)
+  - Ref: .dev/planning/modules/transport/edge-cases.md @ K6 (seek with active layers — dispose+rebuild; reapply keeps running nodes)
+  - Ref: .dev/planning/modules/transport/edge-cases.md @ K8 (duck is single-writer / coalesced in layer-scheduler — NOT transport's concern)
+  - Ref: C:/Projects/BinauralAudio/.dev/planning/phase2-audio-architecture.md @ §6 Cross-Module Contract Spine (scheduleLayers signature / layer-engine createLayerNode / connect by kind)
+  - Ref: C:/Projects/BinauralAudio/.dev/planning/phase2-audio-architecture.md @ §2.2 transport.ts — startFresh / seekWhilePlaying / reapply (build LayerNodes, call scheduleLayers)
+  - Ref: C:/Projects/BinauralAudio/.dev/planning/phase2-audio-architecture.md @ §4 Ducking (cue layers → cueInput, never duck themselves; transport never writes duckParam)
+  - Accepts: the injected `layerScheduler?: LayerSchedulerFactory` (from TransportOptions); the per-session `mixer`; `preset.layers`; `createLayerNode` (Layer-0); the existing `scheduler.apply`/`retarget` calls in startFresh/seekWhilePlaying/reapply; `t0`/`startOffsetSec`.
+  - Creates: a per-session `LayerNode[]` and a per-session `LayerSchedule | null`. In `startFresh`: for each `preset.layers` entry, `createLayerNode(ctx, layer, buffer?)`, connect its `output` to `mixer.bedInput` for `kind 'tone'|'ambiance'` or `mixer.cueInput` for `kind 'voice'`, then call `layerScheduler(mixer, nodes, layers, { t0, startOffsetSec })` RIGHT AFTER `scheduler.apply`, storing the returned `LayerSchedule`. In `seekWhilePlaying`: DISPOSE the current `LayerSchedule` + `LayerNode`s, build FRESH nodes from `preset.layers`, reconnect by kind, and call `scheduleLayers(… { t0, startOffsetSec: t })` from the new offset under the existing `seekFade` window. In `reapply`: call `LayerSchedule.retarget(preset.layers, atCtx?)` (keep running nodes — the layer analogue of §10's modulator-phase rule), NOT a rebuild.
+  - Behavior: layers ride ALONGSIDE the binaural scheduler (the `scheduler.apply`/`retarget`/`cancel` calls are unchanged — layers are additive); voice-kind cue layers route to `cueInput` (downstream of `duckGain`) so a cue never ducks itself (K8); the layer scheduler computes voice-kind duck spans and calls `mixer.scheduleDuck` itself — transport NEVER touches the duck (single-writer D-019, K8); one-shot layer sources cannot restart, so seek disposes+rebuilds (mirrors the fresh-voice-on-stop and the binaural modulator rebuild of §8.3) — looping ambiance and one-shot tone/voice restart cleanly at the new offset under the seekFade.
+  - Handles: K5 — when `layerScheduler` is absent OR `preset.layers` is empty, build NO LayerNodes and call NO scheduleLayers (the mixer is still composed; routing/master/teardown uniform); the `LayerSchedule` stays null; the stale-`seekToken` abort already guarding the binaural seek also guards the layer rebuild (rapid seeks → only the latest completes).
+  - Ripple: `teardown` must dispose the new per-session `LayerSchedule` + `LayerNode`s (handed to the teardown task). No consumer outside transport — layers are driven internally via the injected factory.
+  - Tests: with `layerScheduler` injected and a preset carrying tone/ambiance/voice layers — `createLayerNode` is called per layer, tone/ambiance connect to `mixer.bedInput`, voice connects to `mixer.cueInput`, and `scheduleLayers(mixer, nodes, layers, { t0, startOffsetSec })` is called right after `scheduler.apply` with the matching `t0`/offset; K6 — a seek while playing disposes the prior `LayerSchedule`+nodes, rebuilds fresh nodes, and calls `scheduleLayers` with `startOffsetSec: t`; reapply calls `LayerSchedule.retarget` and does NOT dispose/rebuild nodes (running-node continuity); A10 — rapid seeks only complete the latest `seekToken`'s rebuild; K5 — no `layerScheduler` (and/or empty `layers`) builds no nodes and calls no scheduleLayers but still composes the mixer; K8 — transport never calls anything that writes `duckParam`. Full suite green before & after.
+
+- [x] [impl] Teardown disposes the bus: LayerSchedule.dispose + LayerNode disposal + mixer.dispose after the single bus master fade-out, nulling the per-session mixer var | file: src/engine/transport.ts | model: T1 [availability]
+  - Ref: .dev/planning/modules/transport/design.md @ §19.6 Teardown disposes the mixer
+  - Ref: .dev/planning/modules/transport/design.md @ §13 The tick loop and end-of-session (shared teardown(fade))
+  - Ref: .dev/planning/modules/transport/design.md @ §17 Teardown — destroy()
+  - Ref: .dev/planning/modules/transport/edge-cases.md @ K7 (teardown with a live mixer + layers — fade the SUM, then dispose schedule/nodes/mixer)
+  - Ref: .dev/planning/modules/transport/edge-cases.md @ J. Resource lifecycle (context stays open; idempotent destroy)
+  - Ref: C:/Projects/BinauralAudio/.dev/planning/phase2-audio-architecture.md @ §2.2 transport.ts — teardown (716-759): add mixer.dispose() in finish() after the fade; null the per-session mixer var
+  - Ref: C:/Projects/BinauralAudio/.dev/planning/phase2-audio-architecture.md @ §1 (master fade covers voice + all layers + post-duck lift — one master, one fade)
+  - Accepts: the per-session `mixer`, `LayerSchedule | null`, and `LayerNode[]` from the prior tasks; the existing shared `teardown(fade)` and `finish()`; `mc.rampMaster(0, fadeSec)`.
+  - Creates: in the shared teardown's `finish()` (after `mc.rampMaster(0, fadeSec)` completes and alongside `v.dispose()`) — `LayerSchedule?.dispose()` (if one exists), dispose each `LayerNode`, then `mixer.dispose()`, then NULL the per-session mixer / LayerSchedule / LayerNode references.
+  - Behavior: the `rampMaster(0, fadeSec)` fade-out now fades the bus SUM (voice + every layer + the post-duck lift) to silence in ONE ramp before disposal — one master, one fade, no per-source teardown fades (this is why disposeLift dropped its teardown self-fade in the routing task); the `AudioContext` STAYS OPEN for reuse (only the per-session bus is torn down — J unchanged); ordering is fade → cancel/stop/dispose so disposal happens at silence.
+  - Handles: `LayerSchedule` may be null (no layers — K5) → skip its dispose; `mixer.dispose()` is the last per-session step; `destroy()` runs `teardown(false)` (no fade) then `ctx.close()` and stays idempotent (J2) — a second teardown finds the mixer var already nulled and no-ops.
+  - Ripple: none outside transport — teardown is internal. Confirms K7 closes the lifecycle opened by startFresh.
+  - Tests: K7 — on `teardown(true)` (stop/end) the bus master fades `trim → 0` in one ramp, THEN `LayerSchedule.dispose()`, each `LayerNode.dispose()`, and `mixer.dispose()` are called, and the per-session mixer/schedule/nodes refs are nulled; the `AudioContext` is NOT closed by teardown (stays open, J1 reuse across play→stop cycles); `destroy()` runs `teardown(false)` then closes the context and is idempotent (J2 — second call no-ops, J3 — destroy while playing tears down + closes); with no layers (K5) teardown skips the LayerSchedule dispose and still disposes voice + mixer. Full suite green before & after.
+
+- [x] [test] Retarget transport.test.ts routing + lift assertions from voice.output to mixer.master / mixer.liftInput per the arch test-retargets | file: src/engine/transport.test.ts | model: T1-lite
+  - Ref: C:/Projects/BinauralAudio/.dev/planning/phase2-audio-architecture.md @ Test retargets (existing files) — transport.test.ts routing ~822-836 → mixer.master; D3 single-audible-path → mixer.master.connections length 1; lift-control → mixer.liftInput, bus master fade on teardown, still self-fades on mid-session setLift(null)
+  - Ref: .dev/planning/modules/transport/edge-cases.md @ K2 (routing assertions → mixer.master)
+  - Ref: .dev/planning/modules/transport/edge-cases.md @ K3 (single audible path → mixer.master.connections length 1)
+  - Ref: .dev/planning/modules/transport/edge-cases.md @ K4 (lift → mixer.liftInput; teardown covered by bus fade; mid-session setLift(null) still self-fades)
+  - Ref: .dev/planning/modules/transport/edge-cases.md @ K1 (bus-mode voice masterGain.gain === 1, setMasterGain no-op)
+  - Ref: .dev/testing-standards.md — test conventions and rules
+  - Accepts: the existing `transport.test.ts` routing/lift/D-series cases (the only existing test file edited — `automation.test.ts`/`audio-engine.test.ts`/`transport-master-gain.test.ts` stay byte-identical).
+  - Creates: updated assertions — the routing block (~822-836) asserts on `mixer.master` (mediastream/silent-file/none + iOS `playBridgeElement` fallback move ONLY `mixer.master` between `ctx.destination` and `msDest`); the D3 single-audible-path assertion becomes `mixer.master.connections` length 1 with no direct `voice.output → ctx.destination` edge; the lift-control case asserts the aux `liftGain` connects to `mixer.liftInput`, is covered by the bus master fade on `teardown(true)` (no lift self-fade), and STILL self-fades on mid-session `setLift(null)` (`lastRampTarget(aux.gain,'linear') === 0`, `aux.disconnectCalls > 0`); one bus-mode assertion that the voice is created `{ master: 'bus' }` with `voice.masterGain.gain === 1` and `setMasterGain` a no-op (non-finite still throws — K1).
+  - Behavior: only `transport.test.ts` changes; the fake mixer/layer-engine/layer-scheduler used here mirror the injected DI seams; happy + error + edge are all covered (routing happy path, reject fallback, lift disable error path, single-path edge).
+  - Tests: this IS the test task — it must (a) cover the happy path (mediastream resolve → mixer.master is the sole audible edge), (b) the error path (mediastream reject → mixer.master reconnects direct + BACKGROUND_AUDIO_UNAVAILABLE), and (c) the edge (mid-session setLift(null) self-fade vs teardown bus-fade; K5 no-layers routing uniform). After this task the FULL suite is green and the three guardrail suites are byte-identical to their pre-feature state.
+
+- [x] [audit] Module behavioral audit: mixer bus + layers (Phase 2) | file: .dev/.task-state/transport/behavioral-audit-phase2-bus.md | model: T1
+  - Ref: C:/Projects/.dev-shared/behavioral-audit.md — Module Behavioral Audit checklist
+  - Ref: .dev/planning/modules/transport/interfaces.md @ Phase-2 contracts (createMixer / createLayerNode / scheduleLayers / LayerSchedulerFactory / VoiceOptions.master) and @ Construction (layerScheduler / createMixer / createVoice options)
+  - Ref: .dev/planning/modules/transport/design.md @ §19 Phase-2 refactor (§19.1–§19.7)
+  - Ref: .dev/planning/modules/transport/edge-cases.md @ K. Phase-2 unified bus + layers (K1–K8)
+  - Ref: C:/Projects/BinauralAudio/.dev/planning/phase2-audio-architecture.md @ §1 / §2.2 / §4 / §6 (the authoritative contract spine)
+  - For each Phase-2 contract: trace input → implementation → observable output — `startFresh` composes `createMixer` + `createVoice({master:'bus'})` + `voice.output → mixer.bedInput` + `masterCtrl(mixer.masterParam)` + `routeOutput(mixer)`; `routeOutput`/`playBridgeElement` move ONLY `mixer.master`; the lift rides `mixer.liftInput` and `disposeLift` keeps only the mid-session fade; `scheduleLayers` is driven alongside `scheduler.apply/retarget` with layers connected by kind (bed/cue); seek disposes+rebuilds layer nodes; reapply retargets; teardown disposes `LayerSchedule`+nodes+`mixer` after one bus master fade.
+  - Verify every K-case (K1–K8) has evidence of handling in the code, and that the invariants hold: master constructed at 0 (D-008), only transport-master-gain writes masterParam and only mixer.scheduleDuck writes duckParam (D-019), transport never reads `param.value`, the mixer is composed even with no layers (K5), and no double-attenuation (bus-mode masterGain.gain === 1, K1).
+  - Verify the cohesion guardrails: `automation.test.ts` / `audio-engine.test.ts` / `transport-master-gain.test.ts` are byte-identical to pre-feature and green; only `transport.test.ts` changed; the full suite is green.
+  - Confirm no consumer (ui composition root) is broken: the new `TransportOptions` fields are all optional (Phase-1 host still compiles — K5).
+  - Write findings to .dev/.task-state/transport/behavioral-audit-phase2-bus.md; PASS required before this feature is considered complete.
+
+## Cleanup (Phase 2)
+
+- [x] [cleanup] Fix: transport double-starts every layer source — remove the redundant node-start loop in `scheduleLayersFor` | file: src/engine/transport.ts | model: T1
+  - Ref: behavioral audit 2026-06-16 (.dev/.task-state/transport/behavioral-audit-phase2-bus.md) — CRITICAL.
+  - The injected `scheduleLayers` (production: `bootstrap.ts` → `createLayerScheduler()` → engine `scheduleLayers`) ALREADY starts each in-range source (`startSources: true`, layer-scheduler.ts:316-325). Transport's own loop at transport.ts:640-645 then calls `node.start()` again → `LayerNodeError('ALREADY_STARTED')` (layer-engine.ts:194-198) on every in-range node, swallowed by the `void scheduleLayersFor(...)` at transport.ts:999/1124. On seek it also erroneously starts out-of-range one-shots that `scheduleLayers` correctly skips.
+  - Fix: delete the `for (const node of nodes) { … node.start(at); }` loop in `scheduleLayersFor` (transport.ts:640-645). `scheduleLayers` owns source-starting — match the renderer, which starts only the voice and comments "scheduleLayers already started layer sources" (renderer.ts:611-614).
+  - Add a test that wires the REAL `scheduleLayers` (or `createLayerScheduler()`) into transport with a layered preset and asserts start/seek do NOT throw and out-of-range one-shots are not replayed — the current transport.test.ts fake (`makeFakeLayerScheduler`, transport.test.ts:298) never starts sources and masks this. Full suite green after.
+
+- [x] [cleanup] Fix: stale stub-registry entry for the ui layerScheduler wiring | file: .dev/.task-state/stub-registry.md | model: T1-lite
+  - Ref: behavioral audit 2026-06-16 — NOTE.
+  - `bootstrap.ts:74,83` already injects `createLayerScheduler()` into `createTransport`; move the "layerScheduler factory passed to createTransport" row from Active Stubs to Resolved Stubs.

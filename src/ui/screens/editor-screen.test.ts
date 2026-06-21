@@ -36,6 +36,14 @@ describe('EditorScreen / TimelineCanvas (design §12, edge I3/I4/J4)', () => {
     expect(rafSpy).toHaveBeenCalled();
   });
 
+  it('edits the preset waveform from the toolbar (relocated here from the read-only Player)', async () => {
+    const { ctx, getByRole } = renderEditor();
+    expect(ctx.session.preset.nodes[0].waveform ?? 'sine').not.toBe('square');
+    await fireEvent.click(getByRole('button', { name: /square/i }));
+    await tick();
+    expect(ctx.session.preset.nodes[0].waveform).toBe('square');
+  });
+
   it('tap on an empty lane adds a carry-forward node (no sound change, edge J4)', async () => {
     const { ctx, canvas } = renderEditor();
     const before = ctx.session.preset.nodes.length;

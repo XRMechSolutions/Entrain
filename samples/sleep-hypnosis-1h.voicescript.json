@@ -1,0 +1,115 @@
+{
+  "version": 1,
+  "purpose": "hypnosis",
+  "startAtSec": 5,
+  "voices": { "en": "af_heart" },
+  "rateScale": 0.88,
+  "duck": { "toGain": 0.4, "attackSec": 1.0, "releaseSec": 2.5 },
+  "blocks": [
+    {
+      "label": "Settling",
+      "pacing": { "gapSec": 3 },
+      "lines": [
+        { "say": "Make yourself comfortable now, and when you're ready, let your eyes gently close." },
+        { "pauseSec": 5 },
+        { "say": "There is nothing you need to do, and nowhere you need to be." },
+        { "pauseSec": 4 },
+        { "say": "Just let the bed take your weight... and allow yourself to begin to slow down." },
+        { "pauseSec": 5 },
+        { "say": "With each word I say, you can let go a little more." },
+        { "pauseSec": 5 }
+      ]
+    },
+    {
+      "label": "Breath",
+      "pacing": { "gapSec": 2 },
+      "lines": [
+        { "say": "Take a slow, easy breath in... through your nose." },
+        { "pauseSec": 4 },
+        { "say": "And let it go, softly, with a quiet sigh." },
+        { "pauseSec": 5 },
+        { "say": "Again. Breathe in calm and stillness." },
+        { "pauseSec": 4 },
+        { "say": "And breathe out, letting your shoulders sink down and soften." },
+        { "pauseSec": 6 },
+        { "say": "Now just let your breathing find its own slow rhythm. You don't need to control it at all." },
+        { "pauseSec": 8 }
+      ]
+    },
+    {
+      "label": "Relaxation",
+      "pacing": { "gapSec": 3 },
+      "lines": [
+        { "say": "Bring a gentle, warm attention to the very top of your head, and let it soften." },
+        { "pauseSec": 4 },
+        { "say": "Let that softness spread down across your forehead... your eyes... and your jaw." },
+        { "pauseSec": 5 },
+        { "say": "Feel your neck and shoulders growing heavy, and loose, and warm." },
+        { "pauseSec": 5 },
+        { "say": "That heavy relaxation flowing down your arms, all the way to your fingertips." },
+        { "pauseSec": 6 },
+        { "say": "Your chest, and your back, softening a little more with every breath out." },
+        { "pauseSec": 6 },
+        { "say": "Your hips, and your legs, growing heavier... sinking gently into the bed." },
+        { "pauseSec": 6 },
+        { "say": "All the way down to your feet. Completely, comfortably relaxed." },
+        { "pauseSec": 8 }
+      ]
+    },
+    {
+      "label": "Deepening",
+      "pacing": { "gapSec": 3 },
+      "lines": [
+        { "say": "In a moment I'll count down from ten. With each number, you can drift twice as deep." },
+        { "pauseSec": 4 },
+        { "say": "Ten. Sinking down, softly." },
+        { "pauseSec": 5 },
+        { "say": "Nine. Heavier, and calmer." },
+        { "pauseSec": 5 },
+        { "say": "Eight. Letting every muscle go." },
+        { "pauseSec": 5 },
+        { "say": "Seven. Drifting deeper, with nothing to hold onto." },
+        { "pauseSec": 5 },
+        { "say": "Six. So quiet, and so peaceful." },
+        { "pauseSec": 5 },
+        { "say": "Five. Halfway down, and still letting go." },
+        { "pauseSec": 5 },
+        { "say": "Four. Softer, and slower." },
+        { "pauseSec": 5 },
+        { "say": "Three. Your mind growing calm and still." },
+        { "pauseSec": 5 },
+        { "say": "Two. Almost there now. Ready to rest." },
+        { "pauseSec": 5 },
+        { "say": "One. All the way down. Deeply, completely relaxed." },
+        { "pauseSec": 8 }
+      ]
+    },
+    {
+      "label": "Sleep suggestions",
+      "pacing": { "gapSec": 4 },
+      "lines": [
+        { "say": "From here, sleep can come easily, all on its own. You don't need to reach for it." },
+        { "pauseSec": 6 },
+        { "say": "Every sound you hear only carries you deeper, and lets you rest more completely." },
+        { "pauseSec": 7 },
+        { "say": "Your body already knows how to sleep. You can simply allow it to happen." },
+        { "pauseSec": 8 },
+        { "say": "Drifting, softly... like sinking into warm, still water." },
+        { "pauseSec": 10 },
+        { "say": "There's nothing to think about now. Any thought can float by, like a cloud, and drift away." },
+        { "pauseSec": 12 }
+      ]
+    },
+    {
+      "label": "Drift",
+      "pacing": { "gapSec": 6 },
+      "repeat": { "count": 14, "gapSec": 150 },
+      "lines": [
+        { "say": "Deeper... and warmer... and more at peace." },
+        { "pauseSec": 8 },
+        { "say": "Letting go, drifting gently down into sleep." },
+        { "pauseSec": 10 }
+      ]
+    }
+  ]
+}

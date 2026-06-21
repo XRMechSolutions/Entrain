@@ -11,8 +11,11 @@
 //
 // See .dev/planning/modules/transport/{design,interfaces,edge-cases}.md.
 
-import type { Preset } from './session-model';
+import type { Layer, Preset } from './session-model';
 import { createVoice as defaultCreateVoice, registerPulseWorklet, type Voice } from './audio-engine';
+import { createMixer as defaultCreateMixer, type Mixer } from './mixer';
+import { createLayerNode, type LayerNode } from './layer-engine';
+import { getBlob } from './clip-library';
 import {
   createShepardNode as defaultCreateShepard,
   registerShepardWorklet as defaultRegisterShepard,
@@ -23,6 +26,8 @@ import {
   TransportError,
   TRANSPORT_DEFAULTS,
   type BackgroundAudioMode,
+  type LayerSchedule,
+  type LayerSchedulerFactory,
   type LiftOptions,
   type SessionScheduler,
   type Transport,
@@ -47,6 +52,8 @@ export type {
   TransportOptions,
   Transport,
   LiftOptions,
+  LayerSchedule,
+  LayerSchedulerFactory,
 } from './transport-types';
 export { TransportError, TRANSPORT_DEFAULTS } from './transport-types';
 
@@ -120,6 +127,8 @@ export function createTransport(options: TransportOptions): Transport {
   const audioContextFactory = options.audioContextFactory;
   const registerWorklet = options.registerWorklet ?? registerPulseWorklet;
   const createVoiceFn = options.createVoice ?? defaultCreateVoice;
+  const createMixerFn = options.createMixer ?? defaultCreateMixer;
+  const layerScheduler: LayerSchedulerFactory | undefined = options.layerScheduler;
   const registerShepardFn = options.registerShepard ?? defaultRegisterShepard;
   const createShepardFn = options.createShepard ?? defaultCreateShepard;
 
@@ -130,8 +139,16 @@ export function createTransport(options: TransportOptions): Transport {
 
   let ctx: AudioContext | undefined;
   let voice: Voice | undefined;
+  let mixer: Mixer | undefined; // the per-session summation bus (D-036); nulled on teardown
   let masterCtrl: MasterGainController | undefined;
   let pulseReady = false;
+
+  // --- Phase-2 layers (D-036) — built per session, disposed + rebuilt on seek ---
+  let layerNodes: LayerNode[] = []; // one LayerNode per preset.layers entry
+  let layerSchedule: LayerSchedule | null = null; // the injected scheduler's handle
+  // Decoded clip buffers, cached by clipId so a seek-driven rebuild reuses the decode
+  // (decodeAudioData is async + costly; the buffer never changes for a given clip).
+  const decodedClips = new Map<string, AudioBuffer>();
   let primePromise: Promise<void> | undefined;
   let workletPromise: Promise<void> | undefined;
   let webAudioUnsupported = false;
@@ -366,10 +383,14 @@ export function createTransport(options: TransportOptions): Transport {
     audioEl = el;
     return el;
   }
-  function routeOutput(v: Voice): void {
+  function routeOutput(m: Mixer): void {
     if (!ctx) return;
-    // The voice is connected to ctx.destination at construction; the lift joins the same
-    // target. Override to the mediastream dest below when the bridge is used.
+    // Phase-2: the audible edge is mixer.master's SINGLE output edge (its only upstream
+    // is busSum, so moving it moves exactly one edge — arch §1). The voice's own
+    // destination edge was already dropped in startFresh; the voice now feeds
+    // mixer.bedInput, so there is exactly one audible path. The lift rides the same SUM
+    // via mixer.liftInput. Default: connect master direct to ctx.destination.
+    m.connect(ctx.destination);
     outputTarget = ctx.destination;
     if (backgroundAudioMode === 'none') return; // direct only, no <audio>, no MediaSession (D6)
 
@@ -379,13 +400,9 @@ export function createTransport(options: TransportOptions): Transport {
       const dest = ctx.createMediaStreamDestination();
       msDest = dest;
       outputTarget = dest;
-      // Exactly one audible path: drop the direct connection, route through the stream.
-      try {
-        v.output.disconnect(ctx.destination);
-      } catch {
-        /* may not have been connected */
-      }
-      v.output.connect(dest);
+      // Exactly one audible path: move mixer.master's single output edge from the
+      // destination to the stream dest (connect() drops the prior edge internally).
+      m.connect(dest);
       const el = getAudioElement();
       if (el) {
         (el as unknown as { srcObject: MediaStream | null }).srcObject = dest.stream;
@@ -412,22 +429,11 @@ export function createTransport(options: TransportOptions): Transport {
       // holder (silent-file) and holds platform audio focus (D1).
     } catch {
       // Rejected (iOS often): fall back to the direct destination, no doubling (D2).
-      if (backgroundAudioMode === 'mediastream' && voice && ctx && msDest) {
-        try {
-          voice.output.disconnect(msDest);
-        } catch {
-          /* ignore */
-        }
-        voice.output.connect(ctx.destination);
-        // Move the parallel lift onto the same direct target so it survives the fallback.
-        if (liftGain) {
-          try {
-            liftGain.disconnect(msDest);
-          } catch {
-            /* ignore */
-          }
-          liftGain.connect(ctx.destination);
-        }
+      // Move ONLY mixer.master back to ctx.destination (its single output edge). The
+      // lift rides the bus via mixer.liftInput → busSum → master, so it follows master
+      // automatically and must NOT be rewired separately (arch §19.3).
+      if (backgroundAudioMode === 'mediastream' && mixer && ctx && msDest) {
+        mixer.connect(ctx.destination);
         outputTarget = ctx.destination;
         try {
           el.pause();
@@ -446,10 +452,15 @@ export function createTransport(options: TransportOptions): Transport {
 
   // --- Shepard "lift" overlay — a PARALLEL aux path (independent live layer) ---
   // The lift never touches the voice/bridge wiring: a dedicated aux GainNode (the
-  // click-free fade envelope) fed by the shepard node connects to the SAME outputTarget
-  // the voice uses. The shepard node's own `gain` param carries the user level; the aux
-  // gain only fades the whole layer in (enable) / out (disable).
+  // click-free fade envelope) fed by the shepard node joins the bus at mixer.liftInput
+  // (Phase-2; a POST-DUCK overlay — arch §19.4). The shepard node's own `gain` param
+  // carries the user level; the aux gain only fades the whole layer in/out (enable/disable).
   function liftTarget(): AudioNode | undefined {
+    // Phase-2: the lift is a POST-DUCK overlay summed into the bus at mixer.liftInput
+    // (downstream of duckGain, so the bed duck never pumps it; master fade/trim/teardown
+    // still cover it — arch §1/§4/§19.4). Fall back to the destination only when there is
+    // no live mixer (defensive; a session always composes the mixer before applyLift).
+    if (mixer) return mixer.liftInput;
     return outputTarget ?? (ctx ? ctx.destination : undefined);
   }
   /** No-click param write: anchor from the JS-tracked value, 10 ms linear ramp to target
@@ -490,7 +501,10 @@ export function createTransport(options: TransportOptions): Transport {
     if (!c) return;
     const intent = liftIntent;
     if (!intent) {
-      disposeLift(trimRampSec);
+      // Mid-session disable (setLift(null)): self-fade the aux gain to 0 then dispose —
+      // the bus master is NOT fading here (the session keeps playing), so the lift must
+      // fade itself (arch §19.4 "keep the aux fade for mid-session enable/disable").
+      disposeLift(trimRampSec, true);
       return;
     }
     if (!shepardReady) {
@@ -524,14 +538,18 @@ export function createTransport(options: TransportOptions): Transport {
       liftGainTracked = g;
     }
   }
-  /** Fade out (over `fadeSec`, or cut when 0) the aux gain, then disconnect + dispose the
-   *  lift nodes. The lift bypasses masterGain, so it must fade itself on teardown. */
-  function disposeLift(fadeSec: number): void {
+  /** Disconnect + dispose the lift nodes. When `selfFade` is true (mid-session
+   *  enable/disable, e.g. setLift(null)) the aux gain self-fades to 0 over `fadeSec`
+   *  before disposal. On TEARDOWN the lift rides the bus (mixer.liftInput → busSum →
+   *  master), so the single bus master fade-out already covers it — the lift no longer
+   *  self-fades at teardown (arch §19.4); the caller passes `selfFade=false` and disposal
+   *  is deferred by `fadeSec` only to keep the tail alive until the bus fade completes. */
+  function disposeLift(fadeSec: number, selfFade: boolean): void {
     const handle = liftHandle;
     const g = liftGain;
     if (!handle && !g) return;
     const sec = ctx ? fadeSec : 0;
-    if (g) {
+    if (selfFade && g) {
       rampLiftParam(g.gain, liftEnvTracked, 0, sec);
       liftEnvTracked = 0;
     }
@@ -558,6 +576,92 @@ export function createTransport(options: TransportOptions): Transport {
     }
     liftHandle = undefined;
     liftGain = undefined;
+  }
+
+  // --- Phase-2 layers (design §19.5) — build, schedule, dispose, rebuild on seek ---
+
+  /** A clip layer carries `{ clipId }`; a tone layer carries `{ synth }`. */
+  function clipIdOf(layer: Layer): string | undefined {
+    const src = layer.source as { clipId?: string };
+    return typeof src.clipId === 'string' ? src.clipId : undefined;
+  }
+
+  /** Resolve the decoded AudioBuffer for a clip layer: cached → reuse (a seek rebuild
+   *  must not re-decode); else getBlob → ctx.decodeAudioData, cached by clipId. Returns
+   *  undefined for a missing/un-decodable clip (layer-engine then builds a silent node).
+   *  Tone layers need no buffer. */
+  async function decodeClipBuffer(c: AudioContext, clipId: string): Promise<AudioBuffer | undefined> {
+    const cached = decodedClips.get(clipId);
+    if (cached) return cached;
+    if (typeof c.decodeAudioData !== 'function') return undefined;
+    try {
+      const blob = await getBlob(clipId);
+      if (!blob) return undefined;
+      const bytes = await blob.arrayBuffer();
+      const buf = await c.decodeAudioData(bytes);
+      decodedClips.set(clipId, buf);
+      return buf;
+    } catch {
+      return undefined; // missing/undecodable → silent node (D-023), never fatal
+    }
+  }
+
+  /** Build a LayerNode per `preset.layers`, connecting each output to mixer.bedInput
+   *  (tone/ambiance) or mixer.cueInput (voice-kind cue, post-duck so a cue never ducks
+   *  itself — arch §4), then drive the injected scheduleLayers(mixer, nodes, layers,
+   *  {t0, startOffsetSec}) alongside scheduler.apply. A no-op when no layerScheduler is
+   *  injected or the preset has no layers (K5): the mixer is still composed, only the
+   *  layer build/schedule is skipped. Async because clip layers decode their buffer. */
+  async function scheduleLayersFor(
+    c: AudioContext,
+    m: Mixer,
+    p: Preset,
+    t0: number,
+    startOffsetSec: number,
+  ): Promise<void> {
+    const layers = p.layers;
+    if (!layerScheduler || !layers || layers.length === 0) return; // K5: no layers
+
+    const nodes: LayerNode[] = [];
+    for (const layer of layers) {
+      const clipId = clipIdOf(layer);
+      const buffer = clipId ? await decodeClipBuffer(c, clipId) : undefined;
+      // The session may have ended (teardown nulls the mixer) while a decode awaited.
+      if (mixer !== m) {
+        for (const n of nodes) n.dispose();
+        return;
+      }
+      const node = createLayerNode(c, layer, buffer);
+      node.output.connect(layer.kind === 'voice' ? m.cueInput : m.bedInput);
+      nodes.push(node);
+    }
+    layerNodes = nodes;
+    // The injected scheduler owns source-starting: scheduleLayers starts each in-range
+    // source itself (startSources: true) and gates one-shots via inRange. Transport must
+    // NOT also start them — a second node.start() throws ALREADY_STARTED and replays
+    // out-of-range one-shots on seek (matches the renderer, which starts only the voice).
+    layerSchedule = layerScheduler(m, nodes, layers, { t0, startOffsetSec });
+  }
+
+  /** Dispose the current layer schedule + every layer node and clear the per-session
+   *  layer refs (the decode cache survives — buffers are reused across seeks/rebuilds). */
+  function disposeLayers(): void {
+    if (layerSchedule) {
+      try {
+        layerSchedule.dispose();
+      } catch {
+        /* idempotent */
+      }
+      layerSchedule = null;
+    }
+    for (const node of layerNodes) {
+      try {
+        node.dispose();
+      } catch {
+        /* idempotent */
+      }
+    }
+    layerNodes = [];
   }
 
   // --- 12. MediaSession (design §12) ---
@@ -722,10 +826,17 @@ export function createTransport(options: TransportOptions): Transport {
     clearEndTimer();
 
     const v = voice;
+    const m = mixer;
     const mc = masterCtrl;
+    const ls = layerSchedule;
+    const nodes = layerNodes;
     const fadeSec = fade ? fadeOutSec : 0;
+    // The bus master fade-out now fades the whole SUM (voice + every layer + the
+    // post-duck lift) to silence in ONE ramp before disposal — one master, one fade
+    // (arch §1/§19.6). The lift no longer self-fades here (selfFade=false); the bus
+    // master covers it.
     if (mc) mc.rampMaster(0, fadeSec);
-    disposeLift(fadeSec); // fade + dispose the parallel lift alongside the voice
+    disposeLift(fadeSec, false); // dispose the lift; the bus master fade covers its tail
     if (v) {
       scheduler.cancel(v); // cancel queued base ramps + dispose modulators (oscillators keep running)
       try {
@@ -743,6 +854,29 @@ export function createTransport(options: TransportOptions): Transport {
           /* idempotent */
         }
       }
+      // Phase-2: dispose the layer schedule + nodes, then the mixer, AFTER the fade
+      // (disposal happens at silence — K7/§19.6). The AudioContext stays open for reuse.
+      if (ls) {
+        try {
+          ls.dispose();
+        } catch {
+          /* idempotent */
+        }
+      }
+      for (const node of nodes) {
+        try {
+          node.dispose();
+        } catch {
+          /* idempotent */
+        }
+      }
+      if (m) {
+        try {
+          m.dispose();
+        } catch {
+          /* idempotent */
+        }
+      }
       teardownRouting();
       clearMediaSession();
       void releaseWakeLock();
@@ -754,7 +888,10 @@ export function createTransport(options: TransportOptions): Transport {
     }
 
     voice = undefined;
+    mixer = undefined; // null the per-session bus (a second teardown finds it absent)
     masterCtrl = undefined;
+    layerSchedule = null;
+    layerNodes = [];
     transitionTo('stopped');
   }
   function endSession(): void {
@@ -821,10 +958,24 @@ export function createTransport(options: TransportOptions): Transport {
     // suspended context is correct (audio-engine C1 / edge H7).
     if (typeof c.resume === 'function') c.resume().catch(() => {});
 
-    const v = createVoiceFn(c);
+    // Phase-2: compose the unified bus in a fixed order so mixer.master always has
+    // exactly one upstream edge (arch §1/§19.2). The voice is created in 'bus' mode so
+    // its internal masterGain is a unity passthrough (no double-attenuation — K1); the
+    // mixer owns the only master. (1) voice → (2) mixer → (3) drop the voice's default
+    // destination edge → (4) voice.output → mixer.bedInput → (5) bind the controller to
+    // mixer.masterParam (starts at 0, click-free 0→trim fade) → (6) routeOutput(mixer).
+    const v = createVoiceFn(c, { master: 'bus' });
     voice = v;
-    masterCtrl = createMasterGainController(v.masterGainParam, () => c.currentTime);
-    routeOutput(v);
+    const m = createMixerFn(c);
+    mixer = m;
+    try {
+      v.output.disconnect(c.destination); // drop the voice's default destination edge
+    } catch {
+      /* the edge may already be absent (mirrors the mediastream rewire) */
+    }
+    v.output.connect(m.bedInput); // the voice joins the BED sub-bus (ducked path)
+    masterCtrl = createMasterGainController(m.masterParam, () => c.currentTime);
+    routeOutput(m);
 
     const t0 = c.currentTime + startLeadSec;
     anchorCtxTime = t0;
@@ -840,7 +991,11 @@ export function createTransport(options: TransportOptions): Transport {
     }
 
     v.start(t0); // the source start, IN the gesture (autoplay requirement, B5)
-    masterCtrl.rampMaster(trim, fadeInSec); // master fade-in 0 → trim
+    // Layers ride ALONGSIDE the binaural scheduler (additive; the apply call is
+    // unchanged). The layer scheduler computes voice-kind duck spans and calls
+    // mixer.scheduleDuck itself — transport never writes duckParam (D-019, K8).
+    void scheduleLayersFor(c, m, p, t0, startOffset);
+    masterCtrl.rampMaster(trim, fadeInSec); // master fade-in 0 → trim (the whole bus SUM)
     void playBridgeElement(); // audio.play() for the bridge (does not block the gesture)
     attachMediaSession(p);
     setMediaPlaybackState('playing');
@@ -957,6 +1112,15 @@ export function createTransport(options: TransportOptions): Transport {
     anchorCtxTime = c.currentTime + startLeadSec;
     startOffset = t;
     scheduler.apply(v, p, t, anchorCtxTime, { pulseAvailable: pulseReady }); // fresh schedule from t
+    // Phase-2: layer one-shot sources cannot restart (audio-engine B1 analogue), so a
+    // seek DISPOSES + REBUILDS the layer nodes from the new offset (K6 / §19.5). The
+    // mixer stays (only master moved by the fade), and the rebuild rides the same
+    // seekFade window that masks the binaural reschedule. The decode cache is reused.
+    const m = mixer;
+    if (m) {
+      disposeLayers();
+      void scheduleLayersFor(c, m, p, anchorCtxTime, t);
+    }
     mc.rampMaster(trim, seekFadeSec);
     armEndTimer();
     emitTick(); // snap the UI playhead
@@ -993,7 +1157,14 @@ export function createTransport(options: TransportOptions): Transport {
     const v = voice;
     if (!c || !v) return;
     // Live edit at the SAME position: re-ramp base lanes + keep modulator phase (I3b).
-    scheduler.retarget(v, preset, c.currentTime + startLeadSec);
+    const atCtx = c.currentTime + startLeadSec;
+    scheduler.retarget(v, preset, atCtx);
+    // Phase-2: a same-position live edit RETARGETS the layer schedule (keeps the running
+    // layer nodes — the layer analogue of §10's modulator-phase rule; NOT a rebuild,
+    // which is seek-only — K6/§19.5). No-op when no layers/scheduler are active.
+    if (layerSchedule && preset.layers) {
+      layerSchedule.retarget(preset.layers, atCtx);
+    }
   }
 
   // --- Lifecycle ---
@@ -1039,6 +1210,7 @@ export function createTransport(options: TransportOptions): Transport {
       audioEl = undefined;
     }
     for (const set of Object.values(listeners)) set.clear();
+    decodedClips.clear(); // release the per-context decode cache (buffers are ctx-bound)
     ctx = undefined;
     disposed = true;
   }

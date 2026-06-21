@@ -101,3 +101,69 @@ It is a stateless store consumed by `ui` (Layer 2); nothing in Layer 0/1 depends
 - [ ] Audit PASS for every task
 - [ ] last-step-summary.md written for every task with a concrete Observable Verification entry
 - [ ] Behavioral audit PASS (see audit task above)
+
+## Feature: clip-bearing presets (Phase 2)
+
+Phase 2 bumps the preset schema to **v4** (session-model §11): a `Preset` may carry an
+optional `layers?: Layer[]`, and a `Layer` whose `source` is `{ clipId: string }` references
+a clip stored in IndexedDB by `clip-library`. Per **D-037**, JSON export stays
+**REFERENCE-ONLY** — the preset body (including every `layers` entry and its `clipId`) is
+serialized, but the referenced clip *audio* is NOT (the bytes live in IndexedDB, out of this
+module's scope — D-025). This feature adds **no new serializer code**: per design §13.1 the
+existing `persistence.ts` JSON (de)serializer already round-trips a v4 preset, because the
+library stores the whole normalized `Preset` object the delegate returns and re-stringifies it
+for `session-model.parse` on load — a v4 preset with `layers` is just a larger object, with
+canonical key order and round-trip byte-stability coming free from `JSON.stringify` exactly as
+for v2/v3. All schema knowledge stays delegated to `session-model` (§1, §10, §13.1). The work
+here is therefore a guardrail test proving the round-trip, a documented scope note, and a
+behavioral audit of the reference-only export contract.
+
+**Cohesion guardrail (applies to every task below):** the existing test suites are
+byte-identical guardrails — `persistence.test.ts` (all Phase-1 library/export/import
+behavior), `session-model.test.ts` (the v4 schema/migration guardrail), `automation.test.ts`
+(scheduleLane extraction), `audio-engine.test.ts` (master flag default `'internal'`), and
+`transport-master-gain.test.ts` (unchanged). The full suite must run **green before AND
+after** this feature. No-click ramps (D-008) and single-writer params (D-019) are audio-thread
+invariants that do **not** touch this module (edge-cases §H); this feature must not introduce
+any audio path, any new `persistence.ts` function, or any changed signature.
+
+- [x] [test] Confirm a v4 preset carrying `layers` with `clipId` references round-trips byte-stably through `savePreset`/`loadPreset` and `presetToJson`/`parsePresetJson` with no new serializer code | file: src/engine/persistence.test.ts | model: T1 [data]
+  - Ref: .dev/planning/modules/persistence/design.md @ 13.1 What changes for persistence: nothing in the (de)serializer
+  - Ref: .dev/planning/modules/persistence/design.md @ 13.3 JSON export is reference-only; a re-imported preset may have dangling clipIds (D-037)
+  - Ref: .dev/planning/modules/persistence/design.md @ 3.2 The record (stored normalized object; canonical key order; byte-stable round-trip)
+  - Ref: .dev/planning/modules/persistence/edge-cases.md @ D11 (dangling clipId imports cleanly — structurally valid)
+  - Ref: .dev/planning/modules/persistence/edge-cases.md @ D12 (v3/v2 → v4 migrates through the same delegated path; self-heal write-back §C3)
+  - Ref: C:/Projects/BinauralAudio/.dev/planning/phase2-audio-architecture.md @ 0. Gating Prerequisite (v3→v4 schema bump: `Layer`, `LayerKind`, `Preset.layers`)
+  - Ref: C:/Projects/BinauralAudio/.dev/planning/phase2-audio-architecture.md @ 6. Cross-Module Contract Spine (persistence owns no symbol — preset JSON only, unchanged by Phase-2 routing)
+  - Accepts: a `session-model.validate`-passing v4 `Preset` fixture whose `layers` includes at least one clip-source layer (`source: { clipId }`); JSON is reference-only (no clip bytes)
+  - Tests (happy): `savePreset(v4Preset)` then `loadPreset(id)` returns a preset deep-equal to the normalized v4 body, `layers`/`clipId` preserved verbatim; `presetToJson(v4Preset)` then `parsePresetJson(json)` yields `ok:true` with the same `layers`/`clipId`; the stored envelope JSON is byte-stable across a save→load→save cycle (canonical key order, §3.2)
+  - Tests (error): a v4 preset that fails `session-model.validate` (e.g. a `LAYER_*`/`LANE_*` issue from the delegate) → `savePreset` throws `INVALID_PRESET` with the upstream `issues[]`, never writes a record; `parsePresetJson` of the same returns `{ ok:false, issues }` — persistence adds no rules of its own
+  - Tests (edge): a v4 preset whose `clipId` names a clip NOT present on this device imports cleanly (`parsePresetJson` `ok:true`; `importPresetFile` resolves) — dangling reference is structurally valid and is NOT detected/repaired here (D11); a v3 (pre-`layers`) preset JSON loads/imports and migrates to v4 through the delegated `session-model.parse` path with `migratedFrom` set, and `loadPreset` self-heals the older body back (D12, §C3); `MAX_IMPORT_BYTES` still guards the JSON (a v4 preset is a few KB)
+  - Behavior: assert NO new export in `persistence.ts` and no changed signature — the test imports only the existing public surface (interfaces.md §1-§6); proves the round-trip is delivered by the unchanged serializer
+  - Stubs expected: none — this is a guardrail test over existing code plus the v4 schema owned by `session-model`
+
+- [x] [data] Document the reference-only v4 export contract in persistence.ts as a header comment: layered presets serialize `layers`/`clipId` only (no clip bytes — D-037/D-025); dangling clipIds are owned by clip-library/layer-engine at runtime, not repaired here; package/zip export is deferred (D-037) | file: src/engine/persistence.ts | model: T2 [data]
+  - Ref: .dev/planning/modules/persistence/design.md @ 13.2 Clip bytes are owned by clip-library/IndexedDB, never by persistence (D-025)
+  - Ref: .dev/planning/modules/persistence/design.md @ 13.3 JSON export is reference-only; a re-imported preset may have dangling clipIds (D-037)
+  - Ref: .dev/planning/modules/persistence/design.md @ 13.4 The audio share path is render-to-file (D-030), not the JSON
+  - Ref: .dev/planning/modules/persistence/design.md @ 13.5 Self-contained package/zip export is explicitly deferred
+  - Ref: .dev/planning/modules/persistence/edge-cases.md @ D11 (dangling clipId — not detected/repaired here; clip-library/layer-engine own missing-clip runtime case)
+  - Ref: C:/Projects/BinauralAudio/.dev/planning/phase2-audio-architecture.md @ 5. Renderer — Reuse the Bus Offline (render-to-file is the audio-bearing share path, separate module)
+  - Accepts: no inputs — documentation-only change to the existing file
+  - Creates: a doc comment near the export functions (§8 export / §9 import area) stating the reference-only contract; introduces NO `STORE_MIGRATIONS` change, NO new stub, NO `zip` dependency (design §13.5), NO signature change
+  - Tests (happy): `persistence.test.ts` and `session-model.test.ts` stay green — a comment-only edit changes no behavior; the existing suite is the proof
+  - Tests (error/edge): N/A (no code path added); confirm `dependencies.md` "zero runtime dependencies" invariant still holds (no `zip`/`idb`/`file-saver` import was added)
+  - Behavior: purely documentary — the contract is enforced structurally by NOT reading the clip store (design §13.2); this note makes the deliberate limitation discoverable at the call site so a future contributor does not "fix" the dangling-clipId case here
+  - Stubs expected: none — and explicitly registers no new stub (design §13.5: package export is a future *new* module/path, not a stub in this file)
+
+- [x] [audit] Feature behavioral audit: reference-only v4 (clip-bearing) preset export/import | file: .dev/.task-state/persistence/behavioral-audit-clip-bearing-presets.md | model: T1
+  - Ref: C:/Projects/.dev-shared/behavioral-audit.md — Module Behavioral Audit checklist
+  - Ref: .dev/planning/modules/persistence/design.md @ 13. Phase 2 — layered presets are reference-only (clip bytes out of scope) (§13.1-§13.5)
+  - Ref: .dev/planning/modules/persistence/interfaces.md @ 4-6 (library + export + import functions — verify each still round-trips a v4 preset unchanged)
+  - Ref: .dev/planning/modules/persistence/edge-cases.md @ D11, D12 (dangling clipId imports cleanly; v3→v4 migration via the delegated path)
+  - Ref: C:/Projects/BinauralAudio/.dev/planning/phase2-audio-architecture.md @ 6. Cross-Module Contract Spine (persistence owns no spine symbol; clip bytes owned by clip-library)
+  - Trace: a v4 `Preset` with `layers`/`clipId` → `savePreset`/`presetToJson` → stored/serialized JSON (clipId present, clip bytes absent) → `loadPreset`/`parsePresetJson` → observable v4 preset deep-equal to input; confirm the consumer (`ui`) reads the same `Preset`/`layers` shape it already reads, with no new field names
+  - Verify: NO new export or changed signature in `persistence.ts` (the round-trip is delivered by the unchanged serializer, design §13.1); persistence does NOT import `clip-library`, open IndexedDB, or touch clip `Blob`s (design §13.2 — its only `Blob` use stays the export-JSON wrapper); a dangling `clipId` is neither detected nor repaired here (edge-cases §D11); package/zip export introduced NO stub (design §13.5)
+  - Verify (guardrail): full suite green — `persistence.test.ts`, `session-model.test.ts`, `automation.test.ts`, `audio-engine.test.ts`, `transport-master-gain.test.ts` byte-identical/unchanged before AND after the feature; non-destructive invariant intact (no path silently wipes/overwrites user data)
+  - Write findings and PASS/FAIL to .dev/.task-state/persistence/behavioral-audit-clip-bearing-presets.md
+  - PASS required before the Phase-2 feature is considered complete

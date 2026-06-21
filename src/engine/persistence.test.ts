@@ -28,13 +28,68 @@ import type { Preset, ValidationIssue } from './session-model';
 
 function mkPreset(over: Partial<Preset> = {}): Preset {
   return {
-    schemaVersion: 3,
+    schemaVersion: 5,
     name: 'My Session',
     durationSec: 300,
     masterGain: 0.8,
     nodes: [{ t: 0, carrier: { value: 200 }, beat: { value: 8 }, volume: { value: 1 } }],
     ...over,
   };
+}
+
+/**
+ * A fully-valid v4 preset carrying `layers`: a synth tone cue, a looping ambiance
+ * CLIP layer (`source: { clipId }`), and a voice CLIP layer carrying a `duck` intent.
+ * This is the clip-bearing fixture the Phase-2 round-trip is proven against — the clip
+ * BYTES are out of scope (JSON is reference-only per D-037); only the `clipId` references
+ * travel through serialize/parse.
+ */
+function layeredFixture(over: Partial<Preset> = {}): Preset {
+  return {
+    schemaVersion: 5,
+    name: 'Guided Drift',
+    durationSec: 1800,
+    masterGain: 0.8,
+    nodes: [{ t: 0, carrier: { value: 200 }, beat: { value: 8 }, volume: { value: 1 } }],
+    layers: [
+      {
+        id: 'open-bell',
+        kind: 'tone',
+        t: 0,
+        source: { synth: { shape: 'sine', freqHz: 528, attackSec: 0.005, releaseSec: 3 } },
+      },
+      {
+        id: 'rain',
+        kind: 'ambiance',
+        t: 0,
+        loop: true,
+        source: { clipId: 'clip_rain01' },
+        gain: [
+          { t: 0, value: 0 },
+          { t: 8, value: 0.4 },
+        ],
+      },
+      {
+        id: 'guide',
+        kind: 'voice',
+        t: 60,
+        source: { clipId: 'clip_breathe_es' },
+        spatial: [
+          { t: 0, value: -1, transition: 'linear' },
+          { t: 6, value: 1 },
+        ],
+        duck: { toGain: 0.3, attackSec: 0.4, releaseSec: 1.5 },
+      },
+    ],
+    ...over,
+  };
+}
+
+/** The canonical normalized form of `layeredFixture()` (session-model key order). */
+function normalizedLayeredPreset(): Preset {
+  const res = sessionModel.validate(layeredFixture());
+  if (!res.ok) throw new Error('layeredFixture must be valid');
+  return res.preset;
 }
 
 /** Run fn, returning the PersistenceError it throws (fails if it does not throw). */
@@ -308,7 +363,7 @@ describe('loadPreset / deletePreset', () => {
           id: 'x',
           createdAt: 1,
           updatedAt: 1,
-          preset: { schemaVersion: 3, name: '', durationSec: 300, masterGain: 0.8, nodes: [{ t: 0, carrier: { value: 200 } }] },
+          preset: { schemaVersion: 5, name: '', durationSec: 300, masterGain: 0.8, nodes: [{ t: 0, carrier: { value: 200 } }] },
         },
       ],
     });
@@ -327,7 +382,7 @@ describe('loadPreset / deletePreset', () => {
           id: 'f',
           createdAt: 1,
           updatedAt: 1,
-          preset: { schemaVersion: 4, name: 'Future', durationSec: 300, masterGain: 0.8, nodes: [{ t: 0, carrier: { value: 200 } }] },
+          preset: { schemaVersion: 6, name: 'Future', durationSec: 300, masterGain: 0.8, nodes: [{ t: 0, carrier: { value: 200 } }] },
         },
       ],
     });
@@ -435,12 +490,12 @@ describe('savePreset', () => {
 describe('default presets', () => {
   it('every built-in passes session-model.validate with the documented invariants', () => {
     const defs = buildDefaultLibraryPresets();
-    expect(defs).toHaveLength(7);
+    expect(defs).toHaveLength(8);
 
     for (const p of defs) {
       const res = sessionModel.validate(p);
       expect(res.ok).toBe(true);
-      expect(p.schemaVersion).toBe(3);
+      expect(p.schemaVersion).toBe(5);
       expect(p.masterGain).toBeGreaterThan(0);
       expect(p.masterGain).toBeLessThanOrEqual(1);
       expect(p.nodes[0].t).toBe(0); // carrier at the start node, t === 0
@@ -466,7 +521,7 @@ describe('default presets', () => {
 
   it('I3: seed on a fresh library adds the built-ins and returns their summaries; second call is []', () => {
     const added = seedDefaultPresets();
-    expect(added).toHaveLength(7);
+    expect(added).toHaveLength(8);
     // The original four band/use starters seed first, in order.
     expect(added.slice(0, 4).map((s) => s.name)).toEqual([
       'Relax — Alpha 10 Hz',
@@ -479,10 +534,10 @@ describe('default presets', () => {
     expect(names.some((n) => n.startsWith('Power Nap — 20'))).toBe(true);
     expect(names.some((n) => n.startsWith('Power Nap — 60'))).toBe(true);
     for (const s of added) expect(s.id).toMatch(UUID_RE);
-    expect(listPresets()).toHaveLength(7);
+    expect(listPresets()).toHaveLength(8);
 
     expect(seedDefaultPresets()).toEqual([]);
-    expect(listPresets()).toHaveLength(7);
+    expect(listPresets()).toHaveLength(8);
   });
 
   it('I4: deleting all defaults then re-seeding stays empty (seeded gate)', () => {
@@ -496,8 +551,8 @@ describe('default presets', () => {
   it('clearLibrary then seedDefaultPresets re-seeds (factory reset)', () => {
     seedDefaultPresets();
     clearLibrary();
-    expect(seedDefaultPresets()).toHaveLength(7);
-    expect(listPresets()).toHaveLength(7);
+    expect(seedDefaultPresets()).toHaveLength(8);
+    expect(listPresets()).toHaveLength(8);
   });
 });
 
@@ -508,14 +563,14 @@ describe('default presets', () => {
 describe('restoreDefaultPresets (non-destructive top-up)', () => {
   const DEFAULT_NAMES = buildDefaultLibraryPresets().map((p) => p.name);
 
-  it('R1: a FRESH library gains all 7 built-ins and they are returned, in order', () => {
+  it('R1: a FRESH library gains all 8 built-ins and they are returned, in order', () => {
     const added = restoreDefaultPresets();
-    expect(added).toHaveLength(7);
+    expect(added).toHaveLength(8);
     expect(added.map((s) => s.name)).toEqual(DEFAULT_NAMES); // same order as buildDefaultLibraryPresets
     for (const s of added) expect(s.id).toMatch(UUID_RE);
 
     const list = listPresets();
-    expect(list).toHaveLength(7);
+    expect(list).toHaveLength(8);
     // Every returned id is actually present in the library.
     const presentIds = new Set(list.map((s) => s.id));
     for (const s of added) expect(presentIds.has(s.id)).toBe(true);
@@ -540,8 +595,8 @@ describe('restoreDefaultPresets (non-destructive top-up)', () => {
 
     const added = restoreDefaultPresets();
 
-    // Only the 4 defaults NOT already present were added (7 total - 3 pre-seeded).
-    expect(added).toHaveLength(4);
+    // Only the 5 defaults NOT already present were added (8 total - 3 pre-seeded).
+    expect(added).toHaveLength(5);
     const addedNames = added.map((s) => s.name);
     expect(addedNames).not.toContain(defs[0].name);
     expect(addedNames).not.toContain(defs[1].name);
@@ -556,8 +611,8 @@ describe('restoreDefaultPresets (non-destructive top-up)', () => {
       expect(JSON.stringify(stillThere)).toBe(json); // byte-identical
     }
 
-    // Total = 4 pre-existing + 4 appended = 8, with the user preset still present once.
-    expect(after.records).toHaveLength(8);
+    // Total = 4 pre-existing + 5 appended = 9, with the user preset still present once.
+    expect(after.records).toHaveLength(9);
     expect(after.records.filter((r) => r.id === 'user-1')).toHaveLength(1);
     // No default name appears twice (no duplicates created).
     const allNames = listPresets().map((s) => s.name);
@@ -575,7 +630,7 @@ describe('restoreDefaultPresets (non-destructive top-up)', () => {
     expect(restoreDefaultPresets()).toEqual([]);
     expect(setSpy).not.toHaveBeenCalled();
     expect(localStorage.getItem(STORAGE_KEY)).toBe(snapshot); // unchanged bytes
-    expect(listPresets()).toHaveLength(7);
+    expect(listPresets()).toHaveLength(8);
   });
 
   it('R4: after deleting two defaults, restore re-adds EXACTLY those two', () => {
@@ -584,12 +639,12 @@ describe('restoreDefaultPresets (non-destructive top-up)', () => {
     // Delete two specific defaults by id.
     const victims = [list[0], list[1]];
     for (const v of victims) deletePreset(v.id);
-    expect(listPresets()).toHaveLength(5);
+    expect(listPresets()).toHaveLength(6);
 
     const added = restoreDefaultPresets();
     expect(added).toHaveLength(2);
     expect(new Set(added.map((s) => s.name))).toEqual(new Set(victims.map((v) => v.name)));
-    expect(listPresets()).toHaveLength(7);
+    expect(listPresets()).toHaveLength(8);
 
     // And it's idempotent again.
     expect(restoreDefaultPresets()).toEqual([]);
@@ -855,5 +910,170 @@ describe('importPresetFromFile (picker)', () => {
 
     const err = await settled;
     expect(err.code).toBe('IMPORT_CANCELLED');
+  });
+});
+
+// ===========================================================================
+// Phase 2 — clip-bearing (v4 layered) presets round-trip REFERENCE-ONLY
+//
+// A v4 Preset may carry `layers`, and a layer's `source` may be `{ clipId }` —
+// a reference to an audio clip stored in IndexedDB by `clip-library`. Per D-037
+// the JSON path is REFERENCE-ONLY: `clipId`s are serialized verbatim, but the clip
+// BYTES never enter persistence (they live in IndexedDB, out of scope — D-025).
+// These tests prove the round-trip is delivered by the UNCHANGED serializer (design
+// §13.1): no new persistence.ts export, no changed signature — only the v4 schema
+// owned by `session-model`. They exercise only the existing public surface.
+// ===========================================================================
+
+describe('v4 clip-bearing presets — reference-only round-trip', () => {
+  it('savePreset → loadPreset preserves layers/clipId verbatim (deep-equal normalized body)', () => {
+    const expected = normalizedLayeredPreset();
+
+    const saved = savePreset(layeredFixture());
+    const loaded = loadPreset(saved.id);
+
+    // The whole normalized v4 body survives the localStorage round-trip, layers and all.
+    expect(loaded?.preset).toEqual(expected);
+
+    // The clip-source layers carry their clipId references unchanged (no clip bytes).
+    expect(loaded?.preset.layers?.[1].source).toEqual({ clipId: 'clip_rain01' });
+    expect(loaded?.preset.layers?.[2].source).toEqual({ clipId: 'clip_breathe_es' });
+    // The synth-tone cue and the voice duck intent are preserved too.
+    expect(loaded?.preset.layers?.[0].source).toEqual({
+      synth: { shape: 'sine', freqHz: 528, attackSec: 0.005, releaseSec: 3 },
+    });
+    expect(loaded?.preset.layers?.[2].duck).toEqual({ toGain: 0.3, attackSec: 0.4, releaseSec: 1.5 });
+  });
+
+  it('presetToJson → parsePresetJson yields ok:true with identical layers/clipId', () => {
+    const json = presetToJson(layeredFixture());
+    const res = parsePresetJson(json);
+
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.preset).toEqual(normalizedLayeredPreset());
+      expect(res.migratedFrom).toBeNull();
+      expect(res.preset.layers?.map((l) => l.source)).toEqual([
+        { synth: { shape: 'sine', freqHz: 528, attackSec: 0.005, releaseSec: 3 } },
+        { clipId: 'clip_rain01' },
+        { clipId: 'clip_breathe_es' },
+      ]);
+    }
+  });
+
+  it('the stored envelope JSON is byte-stable across a save → load → save cycle (§3.2 canonical key order)', () => {
+    // Freeze the clock so an overwrite re-save keeps the same updatedAt — this isolates the
+    // PRESET BODY's byte-stability (the only thing the layers can affect) from the timestamp.
+    vi.spyOn(Date, 'now').mockReturnValue(1000);
+
+    const saved = savePreset(layeredFixture());
+    const afterFirstSave = localStorage.getItem(STORAGE_KEY);
+
+    // loadPreset re-runs the body through session-model.parse; an overwrite re-save must
+    // re-serialize to the SAME bytes — no key-order drift, no field churn from the layers.
+    const loaded = loadPreset(saved.id);
+    expect(loaded).not.toBeNull();
+    savePreset(loaded!.preset, saved.id);
+    const afterReSave = localStorage.getItem(STORAGE_KEY);
+
+    expect(afterReSave).toBe(afterFirstSave);
+  });
+
+  it('error: a v4 preset that fails session-model.validate → INVALID_PRESET, writes no record', () => {
+    // A LAYER_* issue from the delegate: empty layer id. persistence adds no rules of its own.
+    const bad = layeredFixture({
+      layers: [{ id: '   ', kind: 'tone', t: 0, source: { clipId: 'c1' } }],
+    } as Partial<Preset>);
+
+    const e = caught(() => savePreset(bad));
+    expect(e.code).toBe('INVALID_PRESET');
+    expect(e.issues?.some((i) => i.code === 'LAYER_ID_EMPTY')).toBe(true);
+    expect(localStorage.getItem(STORAGE_KEY)).toBeNull(); // never wrote a record
+
+    // The pure import core surfaces the SAME upstream issues as { ok:false, issues }.
+    const res = parsePresetJson(JSON.stringify(bad));
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.issues.some((i) => i.code === 'LAYER_ID_EMPTY')).toBe(true);
+  });
+
+  it('edge (D11): a clipId naming a clip absent on this device imports cleanly — dangling is structurally valid', async () => {
+    // The clip bytes were never in the JSON; on a fresh device the clipId resolves to no
+    // local clip. parse/import still succeed — persistence neither detects nor repairs the
+    // dangling reference (that is the clip-library/layer-engine runtime case).
+    const danglingJson = presetToJson(layeredFixture());
+
+    const res = parsePresetJson(danglingJson);
+    expect(res.ok).toBe(true);
+    if (res.ok) expect(res.preset.layers?.[1].source).toEqual({ clipId: 'clip_rain01' });
+
+    const file = fakeFile({ name: 'guided.json', text: async () => danglingJson });
+    const imported = await importPresetFile(file);
+    expect(imported.preset.layers?.[2].source).toEqual({ clipId: 'clip_breathe_es' });
+    expect(imported.filename).toBe('guided.json');
+    // Import does NOT save (the dangling reference is left for the UI/clip-library to resolve).
+    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
+  });
+
+  it('edge (D12, §C3): a v3 (pre-layers) preset JSON migrates to v5 through the delegated path; loadPreset self-heals', () => {
+    // A v3 body has no `layers`; session-model.parse up-migrates it to v5 and reports
+    // migratedFrom. This is the SAME delegated migrate path layered presets use — no new branch.
+    const v3 = {
+      schemaVersion: 3,
+      name: 'Legacy Mix',
+      durationSec: 300,
+      masterGain: 0.7,
+      nodes: [{ t: 0, carrier: { value: 200 }, beat: { value: 8 }, volume: { value: 1 } }],
+    };
+
+    const res = parsePresetJson(JSON.stringify(v3));
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.migratedFrom).toBe(3);
+      expect(res.preset.schemaVersion).toBe(5);
+    }
+
+    // Store the v3 body raw, then loadPreset self-heals it: migrates to v5 AND writes back.
+    setEnvelope({
+      storeVersion: 1,
+      seeded: true,
+      records: [{ id: 'legacy', createdAt: 11, updatedAt: 22, preset: v3 }],
+    });
+    const loaded = loadPreset('legacy');
+    expect(loaded?.preset.schemaVersion).toBe(5);
+    expect(loaded?.createdAt).toBe(11); // migration preserves timestamps (system action)
+    expect(loaded?.updatedAt).toBe(22);
+
+    // The upgraded v5 body was written back in place (read again — now no migration needed).
+    const after = rawEnvelope() as { records: Array<{ preset: { schemaVersion: number } }> };
+    expect(after.records[0].preset.schemaVersion).toBe(5);
+  });
+
+  it('edge: MAX_IMPORT_BYTES still guards the v4 JSON (a layered preset is a few KB)', async () => {
+    const json = presetToJson(layeredFixture());
+    // A real clip-bearing preset is comfortably under the 1 MiB cap.
+    expect(json.length).toBeLessThan(MAX_IMPORT_BYTES);
+
+    // The size guard fires before reading bytes, layered preset or not.
+    const text = vi.fn(async () => json);
+    const oversize = fakeFile({ size: MAX_IMPORT_BYTES + 1, name: 'big.json', text });
+    await expect(importPresetFile(oversize)).rejects.toMatchObject({ code: 'IMPORT_TOO_LARGE' });
+    expect(text).not.toHaveBeenCalled();
+  });
+
+  it('behavior: the round-trip uses ONLY the existing public surface (no new export, no changed signature)', () => {
+    // savePreset/loadPreset/presetToJson/parsePresetJson/importPresetFile are the SAME
+    // Phase-1 functions; a v4 layered preset is just a larger object to them (design §13.1).
+    expect(typeof savePreset).toBe('function');
+    expect(typeof loadPreset).toBe('function');
+    expect(typeof presetToJson).toBe('function');
+    expect(typeof parsePresetJson).toBe('function');
+    expect(typeof importPresetFile).toBe('function');
+
+    // The whole layered fixture survives every path identically — proof the unchanged
+    // serializer delivers the round-trip.
+    const saved = savePreset(layeredFixture());
+    expect(loadPreset(saved.id)?.preset).toEqual(normalizedLayeredPreset());
+    const reparsed = parsePresetJson(presetToJson(layeredFixture()));
+    expect(reparsed.ok && reparsed.preset).toEqual(normalizedLayeredPreset());
   });
 });

@@ -1,10 +1,20 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createTransport } from './transport';
 import { TransportError } from './transport-types';
-import type { BackgroundAudioMode, SessionScheduler, TransportNotice } from './transport-types';
+import type {
+  BackgroundAudioMode,
+  LayerSchedule,
+  LayerSchedulerFactory,
+  Mixer,
+  SessionScheduler,
+  TransportNotice,
+} from './transport-types';
 import type { ShepardHandle, ShepardOptions } from './shepard';
+import { createVoice } from './audio-engine';
+import type { Voice } from './audio-engine';
 import { createDefaultPreset } from './session-model';
-import type { Preset } from './session-model';
+import { scheduleLayers } from './layer-scheduler';
+import type { Layer, Preset } from './session-model';
 import { MockAudioContext, MockAudioNode, MockAudioParam, MockGainNode } from '../test/webaudio-mock';
 
 // =====================================================================================
@@ -63,6 +73,12 @@ class FakeAudioContext {
   }
   createWaveShaper() {
     return this.inner.createWaveShaper();
+  }
+  createStereoPanner() {
+    return this.inner.createStereoPanner();
+  }
+  createBufferSource() {
+    return this.inner.createBufferSource();
   }
 
   addEventListener(type: string, cb: () => void): void {
@@ -198,6 +214,125 @@ function makeShepardSpies(fakeCtx: FakeAudioContext) {
   return { register, create, handles };
 }
 
+/** A Mixer test double backed by mock gain nodes so wiring is assertable. `connect`
+ *  moves master's SINGLE output edge (drop the prior, connect the new) exactly like the
+ *  real mixer's single-input-master invariant, so routing assertions read mixer.master's
+ *  one connection. scheduleDuck/cancelDuck/dispose are spies; transport must NEVER call
+ *  scheduleDuck (the layer-scheduler owns the duck — D-019 / K8). */
+interface FakeMixer {
+  readonly bedInput: MockGainNode;
+  readonly cueInput: MockGainNode;
+  readonly liftInput: MockGainNode;
+  readonly master: MockGainNode;
+  readonly masterParam: MockAudioParam;
+  readonly duckParam: MockAudioParam;
+  readonly scheduleDuckSpy: ReturnType<typeof vi.fn>;
+  readonly disposeSpy: ReturnType<typeof vi.fn>;
+  /** The Mixer-typed view handed to transport (cast at the DI boundary, the same
+   *  pattern the rest of this suite uses to bridge mock ↔ real Web Audio types). */
+  readonly asMixer: Mixer;
+}
+function makeFakeMixer(fakeCtx: FakeAudioContext): FakeMixer {
+  const bedInput = fakeCtx.createGain();
+  const cueInput = fakeCtx.createGain();
+  const liftInput = fakeCtx.createGain();
+  const busSum = fakeCtx.createGain();
+  const master = fakeCtx.createGain();
+  busSum.connect(master); // master's single upstream (mirrors the real graph)
+  let currentTarget: MockAudioNode | null = null;
+  const scheduleDuckSpy = vi.fn();
+  const disposeSpy = vi.fn();
+  const asMixer = {
+    bedInput: bedInput as unknown as AudioNode,
+    cueInput: cueInput as unknown as AudioNode,
+    liftInput: liftInput as unknown as AudioNode,
+    master: master as unknown as GainNode,
+    masterParam: master.gain as unknown as AudioParam,
+    duckParam: busSum.gain as unknown as AudioParam,
+    scheduleDuck: scheduleDuckSpy as unknown as Mixer['scheduleDuck'],
+    cancelDuck: vi.fn() as unknown as Mixer['cancelDuck'],
+    connect(target: AudioNode): void {
+      const t = target as unknown as MockAudioNode;
+      if (currentTarget) master.disconnect(currentTarget);
+      master.connect(t);
+      currentTarget = t;
+    },
+    disconnect(): void {
+      if (currentTarget) {
+        master.disconnect(currentTarget);
+        currentTarget = null;
+      }
+    },
+    dispose: disposeSpy as unknown as Mixer['dispose'],
+  } satisfies Mixer;
+  return {
+    bedInput,
+    cueInput,
+    liftInput,
+    master,
+    masterParam: master.gain,
+    duckParam: busSum.gain,
+    scheduleDuckSpy,
+    disposeSpy,
+    asMixer,
+  };
+}
+
+/** A LayerSchedule test double: retarget/cancel/dispose are spies. */
+interface FakeLayerSchedule extends LayerSchedule {
+  readonly retargetSpy: ReturnType<typeof vi.fn>;
+  readonly cancelSpy: ReturnType<typeof vi.fn>;
+  readonly disposeSpy: ReturnType<typeof vi.fn>;
+}
+/** A LayerSchedulerFactory test double recording every call (mixer/nodes/layers/opts)
+ *  and the LayerSchedule it returned, so the layer-driving contract is assertable. */
+interface FakeLayerScheduler {
+  factory: LayerSchedulerFactory;
+  calls: Array<{
+    mixer: Mixer;
+    nodes: ReadonlyArray<{ id: string; kind: string }>;
+    layers: readonly Layer[];
+    opts: { t0: number; startOffsetSec: number };
+  }>;
+  schedules: FakeLayerSchedule[];
+}
+function makeFakeLayerScheduler(): FakeLayerScheduler {
+  const calls: FakeLayerScheduler['calls'] = [];
+  const schedules: FakeLayerSchedule[] = [];
+  const factory: LayerSchedulerFactory = (mixer, nodes, layers, opts) => {
+    const retargetSpy = vi.fn();
+    const cancelSpy = vi.fn();
+    const disposeSpy = vi.fn();
+    const schedule: FakeLayerSchedule = {
+      retarget: retargetSpy,
+      cancel: cancelSpy,
+      dispose: disposeSpy,
+      retargetSpy,
+      cancelSpy,
+      disposeSpy,
+    };
+    calls.push({
+      mixer,
+      nodes: nodes.map((n) => ({ id: n.id, kind: n.kind })),
+      layers,
+      opts: { t0: opts.t0, startOffsetSec: opts.startOffsetSec },
+    });
+    schedules.push(schedule);
+    return schedule;
+  };
+  return { factory, calls, schedules };
+}
+
+/** A tone Layer (synth) — built synchronously by layer-engine, no clip decode. */
+function toneLayer(id: string, kind: 'tone' | 'ambiance' | 'voice' = 'tone', t = 0): Layer {
+  return {
+    id,
+    kind,
+    source: { synth: { shape: 'sine', freqHz: 440, attackSec: 0.1, releaseSec: 0.1 } },
+    t,
+  };
+}
+
 function makePreset(over: Partial<Preset> = {}): Preset {
   return { ...createDefaultPreset(), ...over };
 }
@@ -245,13 +380,23 @@ interface SetupOpts {
   duration?: number;
   masterGain?: number;
   autoload?: boolean;
+  /** PHASE-2: inject a FakeMixer (so bus internals — bedInput/cueInput/liftInput/master —
+   *  are referenceable). When omitted, the REAL createMixer is used (the existing fade /
+   *  routing tests rely on master being the last gain created). */
+  fakeMixer?: boolean;
+  /** PHASE-2: inject a FakeLayerScheduler so layer driving is assertable. */
+  layers?: boolean;
+  /** PHASE-2: inject a CONCRETE LayerSchedulerFactory (e.g. the real engine
+   *  `scheduleLayers`) instead of the fake — exercises the real start/range seam. */
+  layerSchedulerFactory?: LayerSchedulerFactory;
+  preset?: Preset;
 }
 
 function setup(opts: SetupOpts = {}) {
   const fakeCtx = new FakeAudioContext(opts.fakeOpts);
   const scheduler = opts.scheduler ?? makeScheduler();
   const factory = vi.fn(() => fakeCtx as unknown as AudioContext);
-  const preset = makePreset({
+  const preset = opts.preset ?? makePreset({
     durationSec: opts.duration ?? 100,
     masterGain: opts.masterGain ?? 0.8,
   });
@@ -259,6 +404,16 @@ function setup(opts: SetupOpts = {}) {
   // Lift (shepard) spies — wired into every transport; only exercised by tests that call
   // setLift, so non-lift tests are unaffected (create/register stay un-called).
   const shepard = makeShepardSpies(fakeCtx);
+  // PHASE-2: a fake mixer is composed per session (held here so tests reference its
+  // bedInput/cueInput/liftInput/master). Created lazily by the factory at startFresh.
+  let mixer: FakeMixer | undefined;
+  const createMixer = opts.fakeMixer
+    ? (): Mixer => {
+        mixer = makeFakeMixer(fakeCtx);
+        return mixer.asMixer;
+      }
+    : undefined;
+  const layerScheduler = opts.layers ? makeFakeLayerScheduler() : undefined;
   const transport = createTransport({
     scheduler: scheduler as unknown as SessionScheduler,
     audioContextFactory: opts.noFactory ? undefined : (factory as unknown as () => AudioContext),
@@ -267,11 +422,23 @@ function setup(opts: SetupOpts = {}) {
     silentFileUrl: opts.silentFileUrl,
     registerShepard: shepard.register,
     createShepard: shepard.create,
+    createMixer,
+    layerScheduler: opts.layerSchedulerFactory ?? layerScheduler?.factory,
   });
   transport.on('error', (n) => notices.error.push(n));
   transport.on('warning', (n) => notices.warning.push(n));
   if (opts.autoload !== false) transport.load(preset);
-  return { transport, fakeCtx, scheduler, factory, preset, notices, shepard };
+  return {
+    transport,
+    fakeCtx,
+    scheduler,
+    factory,
+    preset,
+    notices,
+    shepard,
+    layerScheduler,
+    getMixer: (): FakeMixer | undefined => mixer,
+  };
 }
 
 function lastMasterGain(fakeCtx: FakeAudioContext): MockAudioParam {
@@ -941,13 +1108,14 @@ describe('setLift() — the parallel Shepard "lift" aux path', () => {
     return node.connections[0].destination as unknown as MockGainNode;
   }
 
-  it('attaches a parallel aux path (shepard → aux gain → output target), fading in click-free', async () => {
-    const { transport, fakeCtx, shepard } = setup({ backgroundAudioMode: 'none' });
+  it('K4: attaches the aux lift to mixer.liftInput (post-duck overlay), fading in click-free', async () => {
+    const { transport, fakeCtx, shepard, getMixer } = setup({ backgroundAudioMode: 'none', fakeMixer: true });
     await transport.play();
-    // Voice output = the last gain created during play (masterGain); capture its routing.
-    const voiceMaster = fakeCtx.created.gains[fakeCtx.created.gains.length - 1];
-    const voiceConnsBefore = voiceMaster.connections.length;
-    expect(voiceMaster.isConnectedTo(fakeCtx.destination)).toBe(true);
+    const mixer = getMixer();
+    if (!mixer) throw new Error('mixer not composed');
+    // mixer.master is the single audible edge; the voice has no direct destination edge.
+    expect(mixer.master.isConnectedTo(fakeCtx.destination)).toBe(true);
+    const masterConnsBefore = mixer.master.connections.length;
 
     transport.setLift({ speed: 0.3, gain: 0.4 });
     await microflush();
@@ -957,16 +1125,18 @@ describe('setLift() — the parallel Shepard "lift" aux path', () => {
     const node = shepard.handles[0].node;
     const aux = liftFadeGain(node);
     expect(node.isConnectedTo(aux)).toBe(true); // shepard → aux gain
-    expect(aux.isConnectedTo(fakeCtx.destination)).toBe(true); // aux → same target as the voice
+    // K4: the aux lift joins the bus at mixer.liftInput (post-duck), NOT the destination.
+    expect(aux.isConnectedTo(mixer.liftInput)).toBe(true);
+    expect(aux.isConnectedTo(fakeCtx.destination)).toBe(false);
 
     // Click-free 10 ms fade-in: anchored at 0, ramps to 1.
     expect(lastRampTarget(aux.gain, 'linearRampToValueAtTime')).toBeCloseTo(1);
     const anchor = aux.gain.events.find((e) => e.method === 'setValueAtTime');
     expect(anchor?.value).toBeCloseTo(0);
 
-    // The voice/bridge routing is untouched (a strictly parallel path).
-    expect(voiceMaster.connections.length).toBe(voiceConnsBefore);
-    expect(voiceMaster.isConnectedTo(fakeCtx.destination)).toBe(true);
+    // The voice/bridge routing (mixer.master) is untouched (a strictly parallel path).
+    expect(mixer.master.connections.length).toBe(masterConnsBefore);
+    expect(mixer.master.isConnectedTo(fakeCtx.destination)).toBe(true);
   });
 
   it('updates speed/gain live on the running node without rebuilding it', async () => {
@@ -1032,5 +1202,311 @@ describe('setLift() — the parallel Shepard "lift" aux path', () => {
     await transport.play(); // a fresh session
     await microflush();
     expect(shepard.create).toHaveBeenCalledTimes(1); // intent was cleared on stop → not re-created
+  });
+});
+
+// =====================================================================================
+// Phase 2 — the unified mixer bus + layers (D-036; arch §1/§2.2/§4/§6, design §19, K1–K8)
+// =====================================================================================
+
+describe('Phase-2 bus composition (K1/K2/K3/K5 — §19.2/§19.3)', () => {
+  it('K1: builds the voice with { master: "bus" } so its internal masterGain is unity passthrough', async () => {
+    const createVoiceSpy = vi.fn(createVoice);
+    const fakeCtx = new FakeAudioContext({ mediaStream: false });
+    const transport = createTransport({
+      scheduler: makeScheduler() as unknown as SessionScheduler,
+      audioContextFactory: (() => fakeCtx) as unknown as () => AudioContext,
+      registerWorklet: () => Promise.resolve(),
+      backgroundAudioMode: 'none',
+      createVoice: createVoiceSpy as unknown as (ctx: BaseAudioContext) => Voice,
+    });
+    transport.load(makePreset());
+    await transport.play();
+
+    // The DI seam observed { master: 'bus' }.
+    expect(createVoiceSpy).toHaveBeenCalledTimes(1);
+    expect(createVoiceSpy.mock.calls[0][1]).toEqual({ master: 'bus' });
+
+    // Double-attenuation guard: the voice's own masterGain is unity (1) and setMasterGain
+    // is a no-op (non-finite still throws — contract parity).
+    const voice = createVoiceSpy.mock.results[0].value as Voice;
+    expect((voice.masterGainParam as unknown as MockAudioParam).valueAtTime(0)).toBeCloseTo(1);
+    const before = (voice.masterGainParam as unknown as MockAudioParam).events.length;
+    voice.setMasterGain(0.3); // bus mode → guarded no-op
+    expect((voice.masterGainParam as unknown as MockAudioParam).events.length).toBe(before);
+    expect(() => voice.setMasterGain(Number.NaN)).toThrow();
+  });
+
+  it('K3: the voice feeds mixer.bedInput and mixer.master is the single audible edge (no direct destination edge)', async () => {
+    const { transport, fakeCtx, getMixer } = setup({ fakeMixer: true, backgroundAudioMode: 'none' });
+    await transport.play();
+    const mixer = getMixer();
+    if (!mixer) throw new Error('mixer not composed');
+    // The voice joins the BED sub-bus; it has NO direct destination edge.
+    expect(mixer.bedInput.inputs.length).toBeGreaterThan(0); // the voice.output connected here
+    const voiceMaster = mixer.bedInput.inputs[0] as unknown as MockGainNode;
+    expect(voiceMaster.isConnectedTo(fakeCtx.destination as unknown as MockAudioNode)).toBe(false);
+    // Single-input master: master has exactly one downstream edge (the destination).
+    expect(mixer.master.connections).toHaveLength(1);
+    expect(mixer.master.connections[0].destination).toBe(fakeCtx.destination);
+  });
+
+  it('K2: mediastream resolve moves ONLY mixer.master between destination and msDest', async () => {
+    const { transport, fakeCtx, getMixer } = setup({ fakeMixer: true, backgroundAudioMode: 'mediastream' });
+    await transport.play();
+    await microflush();
+    const mixer = getMixer();
+    if (!mixer) throw new Error('mixer not composed');
+    const msDest = fakeCtx.msDests[0];
+    expect(mixer.master.isConnectedTo(msDest)).toBe(true);
+    expect(mixer.master.isConnectedTo(fakeCtx.destination)).toBe(false); // moved, not doubled
+    expect(mixer.master.connections).toHaveLength(1); // exactly one audible edge
+  });
+
+  it('K2: iOS playBridgeElement fallback moves ONLY mixer.master back to the destination', async () => {
+    audioPlayBehavior = 'reject';
+    const { transport, fakeCtx, getMixer, notices } = setup({ fakeMixer: true, backgroundAudioMode: 'mediastream' });
+    await transport.play();
+    await microflush();
+    const mixer = getMixer();
+    if (!mixer) throw new Error('mixer not composed');
+    const msDest = fakeCtx.msDests[0];
+    expect(mixer.master.isConnectedTo(fakeCtx.destination)).toBe(true); // direct fallback
+    expect(mixer.master.isConnectedTo(msDest)).toBe(false);
+    expect(mixer.master.connections).toHaveLength(1);
+    expect(notices.warning.some((n) => n.code === 'BACKGROUND_AUDIO_UNAVAILABLE')).toBe(true);
+  });
+
+  it('K5: a preset with no layers still composes the mixer and routes voice→bedInput→master', async () => {
+    const { transport, fakeCtx, getMixer, layerScheduler } = setup({
+      fakeMixer: true,
+      layers: true,
+      backgroundAudioMode: 'none',
+      preset: makePreset({ layers: undefined }),
+    });
+    await transport.play();
+    await microflush();
+    const mixer = getMixer();
+    if (!mixer) throw new Error('mixer composed even with no layers');
+    expect(mixer.bedInput.inputs.length).toBeGreaterThan(0); // voice → bedInput
+    expect(mixer.master.isConnectedTo(fakeCtx.destination)).toBe(true);
+    expect(layerScheduler?.calls).toHaveLength(0); // no layers → no scheduleLayers
+  });
+
+  it('K8: transport never writes the duck param (mixer.scheduleDuck is the layer scheduler\'s job)', async () => {
+    const { transport, getMixer } = setup({
+      fakeMixer: true,
+      layers: true,
+      backgroundAudioMode: 'none',
+      preset: makePreset({ layers: [toneLayer('v1', 'voice')] }),
+    });
+    await transport.play();
+    await microflush();
+    const mixer = getMixer();
+    expect(mixer?.scheduleDuckSpy).not.toHaveBeenCalled(); // single-writer (D-019): transport never ducks
+  });
+});
+
+describe('Phase-2 layer driving (K5/K6/K8 — §19.5)', () => {
+  it('builds a LayerNode per layer, connects tone/ambiance→bedInput and voice→cueInput, drives scheduleLayers after apply', async () => {
+    const layers: Layer[] = [
+      toneLayer('tone1', 'tone', 0),
+      toneLayer('amb1', 'ambiance', 0),
+      toneLayer('cue1', 'voice', 5),
+    ];
+    const { transport, getMixer, layerScheduler, scheduler } = setup({
+      fakeMixer: true,
+      layers: true,
+      backgroundAudioMode: 'none',
+      preset: makePreset({ layers }),
+    });
+    await transport.play();
+    await microflush();
+    const mixer = getMixer();
+    if (!mixer || !layerScheduler) throw new Error('mixer + layerScheduler composed');
+
+    // scheduleLayers driven exactly once, right after scheduler.apply, with t0/offset.
+    expect(scheduler.apply).toHaveBeenCalledTimes(1);
+    expect(layerScheduler.calls).toHaveLength(1);
+    const call = layerScheduler.calls[0];
+    expect(call.mixer).toBe(mixer.asMixer);
+    expect(call.opts.startOffsetSec).toBe(0);
+    expect(call.opts.t0).toBeCloseTo(0.02); // currentTime(0) + startLeadSec
+
+    // One node per layer, routed by kind.
+    expect(call.nodes.map((n) => n.id)).toEqual(['tone1', 'amb1', 'cue1']);
+    expect(call.nodes.map((n) => n.kind)).toEqual(['tone', 'ambiance', 'voice']);
+    // tone + ambiance → bedInput (2 inputs besides the voice); voice → cueInput (1).
+    expect(mixer.cueInput.inputs.length).toBe(1);
+    // bedInput receives the voice + the two non-voice layers.
+    expect(mixer.bedInput.inputs.length).toBe(3);
+  });
+
+  it('K6: a seek while playing disposes + rebuilds the layer nodes and re-schedules from the new offset', async () => {
+    const layers: Layer[] = [toneLayer('amb1', 'ambiance', 0)];
+    const { transport, layerScheduler } = setup({
+      fakeMixer: true,
+      layers: true,
+      duration: 100,
+      backgroundAudioMode: 'none',
+      preset: makePreset({ durationSec: 100, layers }),
+    });
+    await transport.play();
+    await microflush();
+    expect(layerScheduler?.calls).toHaveLength(1);
+    const firstSchedule = layerScheduler?.schedules[0];
+
+    const seekPromise = transport.seek(60);
+    await vi.advanceTimersByTimeAsync(20); // seekFadeSec
+    await seekPromise;
+    await microflush();
+
+    // The prior schedule was disposed; a fresh scheduleLayers ran from startOffsetSec=60.
+    expect(firstSchedule?.disposeSpy).toHaveBeenCalledTimes(1);
+    expect(layerScheduler?.calls).toHaveLength(2);
+    expect(layerScheduler?.calls[1].opts.startOffsetSec).toBe(60);
+    // The second call got FRESH node instances (rebuild, not reuse).
+    expect(layerScheduler?.schedules[1]).not.toBe(firstSchedule);
+  });
+
+  it('reapply retargets the LayerSchedule and does NOT dispose/rebuild the nodes (running-node continuity)', async () => {
+    const layers: Layer[] = [toneLayer('amb1', 'ambiance', 0)];
+    const presetObj = makePreset({ layers });
+    const { transport, layerScheduler } = setup({
+      fakeMixer: true,
+      layers: true,
+      backgroundAudioMode: 'none',
+      preset: presetObj,
+    });
+    await transport.play();
+    await microflush();
+    const schedule = layerScheduler?.schedules[0];
+
+    transport.reapply();
+
+    expect(schedule?.retargetSpy).toHaveBeenCalledTimes(1);
+    expect(schedule?.retargetSpy.mock.calls[0][0]).toBe(presetObj.layers); // retargeted with the edited layers
+    expect(schedule?.disposeSpy).not.toHaveBeenCalled(); // NOT rebuilt
+    expect(layerScheduler?.calls).toHaveLength(1); // no second scheduleLayers (no rebuild)
+  });
+
+  it('A10: rapid seeks only complete the latest rebuild', async () => {
+    const layers: Layer[] = [toneLayer('amb1', 'ambiance', 0)];
+    const { transport, layerScheduler } = setup({
+      fakeMixer: true,
+      layers: true,
+      duration: 100,
+      backgroundAudioMode: 'none',
+      preset: makePreset({ durationSec: 100, layers }),
+    });
+    await transport.play();
+    await microflush();
+    expect(layerScheduler?.calls).toHaveLength(1);
+
+    void transport.seek(10);
+    void transport.seek(20);
+    void transport.seek(30);
+    await vi.advanceTimersByTimeAsync(20);
+    await microflush();
+
+    // Only the latest seek (30) reached the rebuild → exactly one new scheduleLayers.
+    expect(layerScheduler?.calls).toHaveLength(2);
+    expect(layerScheduler?.calls[1].opts.startOffsetSec).toBe(30);
+  });
+
+  it('K7: teardown disposes the LayerSchedule + nodes + mixer after one bus master fade, and reuses the context', async () => {
+    const layers: Layer[] = [toneLayer('amb1', 'ambiance', 0)];
+    const { transport, fakeCtx, getMixer, layerScheduler } = setup({
+      fakeMixer: true,
+      layers: true,
+      duration: 100,
+      backgroundAudioMode: 'none',
+      preset: makePreset({ durationSec: 100, layers }),
+    });
+    await transport.play();
+    await microflush();
+    const mixer = getMixer();
+    const schedule = layerScheduler?.schedules[0];
+
+    await transport.stop(); // teardown(true)
+    await vi.advanceTimersByTimeAsync(600); // flush the fade-out → deferred disposal
+
+    expect(schedule?.disposeSpy).toHaveBeenCalledTimes(1);
+    expect(mixer?.disposeSpy).toHaveBeenCalledTimes(1);
+    expect(fakeCtx.closeCalls).toBe(0); // the AudioContext stays OPEN for reuse (J1)
+
+    // J1: a fresh play composes a NEW mixer on the SAME context.
+    await transport.play();
+    await microflush();
+    expect(getMixer()).not.toBe(mixer);
+  });
+
+  it('K5: no layerScheduler injected builds no layer nodes but still composes the mixer', async () => {
+    const layers: Layer[] = [toneLayer('amb1', 'ambiance', 0)];
+    // fakeMixer but NO layers:true → layerScheduler omitted (a Phase-1 host).
+    const { transport, fakeCtx, getMixer } = setup({
+      fakeMixer: true,
+      backgroundAudioMode: 'none',
+      preset: makePreset({ layers }),
+    });
+    await transport.play();
+    await microflush();
+    const mixer = getMixer();
+    if (!mixer) throw new Error('mixer composed even without a layerScheduler');
+    expect(mixer.bedInput.inputs.length).toBe(1); // only the voice (no layer nodes built)
+    expect(mixer.master.isConnectedTo(fakeCtx.destination)).toBe(true);
+  });
+
+  it('integration: the REAL scheduleLayers owns source-starting — transport never double-starts or replays one-shots', async () => {
+    // Regression guard for the removed node-start loop (behavioral audit 2026-06-16): with
+    // the engine `scheduleLayers` injected verbatim (the production seam via createLayerScheduler),
+    // the scheduler starts each in-range source ITSELF. Transport must NOT also start them — the
+    // old loop called node.start() a second time (→ ALREADY_STARTED) and replayed out-of-range
+    // one-shots on seek. The fake scheduler in the K-tests never starts sources, so it masks this.
+    // We wrap each REAL LayerNode's start() to count calls per scheduler invocation, then delegate.
+    const cue1 = toneLayer('cue1', 'tone', 0); // one-shot: in range at offset 0, OUT past its 0.2s ADSR
+    const cue2 = toneLayer('cue2', 'tone', 70); // in range at offset 0 AND 60 (placed at t=70)
+    const calls: Array<{ offset: number; started: string[] }> = [];
+    const factory: LayerSchedulerFactory = (mixer, nodes, layers, opts) => {
+      const started: string[] = [];
+      for (const node of nodes) {
+        const orig = node.start.bind(node);
+        (node as { start: (at: number) => void }).start = (at: number): void => {
+          started.push(node.id);
+          orig(at);
+        };
+      }
+      calls.push({ offset: opts.startOffsetSec, started });
+      return scheduleLayers(mixer, nodes, layers, opts);
+    };
+    const { transport, notices } = setup({
+      fakeMixer: true,
+      layerSchedulerFactory: factory,
+      duration: 100,
+      backgroundAudioMode: 'none',
+      preset: makePreset({ durationSec: 100, layers: [cue1, cue2] }),
+    });
+
+    await transport.play();
+    await microflush();
+
+    // Fresh start (offset 0): both tones in range, each started EXACTLY once — no double-start.
+    expect(calls).toHaveLength(1);
+    expect(calls[0].offset).toBe(0);
+    expect(calls[0].started).toEqual(['cue1', 'cue2']);
+    expect(new Set(calls[0].started).size).toBe(calls[0].started.length); // no id started twice
+    expect(notices.error).toHaveLength(0); // no ALREADY_STARTED rejection surfaced
+
+    // Seek past cue1's ADSR (offset 60): rebuild from 60. scheduleLayers gates the out-of-range
+    // one-shot (cue1) and starts only the still-in-range cue2 — no erroneous replay of cue1.
+    const seekPromise = transport.seek(60);
+    await vi.advanceTimersByTimeAsync(20); // seekFadeSec
+    await seekPromise;
+    await microflush();
+
+    expect(calls).toHaveLength(2);
+    expect(calls[1].offset).toBe(60);
+    expect(calls[1].started).toEqual(['cue2']); // cue1 NOT replayed; only the in-range cue2 starts
+    expect(notices.error).toHaveLength(0);
   });
 });

@@ -420,7 +420,7 @@ export function clearLibrary(): void {
 export function buildDefaultLibraryPresets(): Preset[] {
   return [
     {
-      schemaVersion: 3,
+      schemaVersion: 5,
       name: 'Relax — Alpha 10 Hz',
       durationSec: 600,
       masterGain: 0.8,
@@ -432,7 +432,7 @@ export function buildDefaultLibraryPresets(): Preset[] {
       ],
     },
     {
-      schemaVersion: 3,
+      schemaVersion: 5,
       name: 'Meditate — Theta 6 Hz',
       durationSec: 1200,
       masterGain: 0.8,
@@ -450,7 +450,7 @@ export function buildDefaultLibraryPresets(): Preset[] {
       ],
     },
     {
-      schemaVersion: 3,
+      schemaVersion: 5,
       name: 'Sleep Descent — Delta',
       durationSec: 1800,
       masterGain: 0.8,
@@ -468,7 +468,7 @@ export function buildDefaultLibraryPresets(): Preset[] {
       ],
     },
     {
-      schemaVersion: 3,
+      schemaVersion: 5,
       name: 'Isochronic Focus — 10 Hz pulse',
       durationSec: 600,
       masterGain: 0.8,
@@ -580,6 +580,24 @@ export function restoreDefaultPresets(): PresetSummary[] {
 // ---------------------------------------------------------------------------
 // 8. Export (Preset → downloadable file)
 // ---------------------------------------------------------------------------
+
+// REFERENCE-ONLY v4 export contract (design §13, D-037/D-025):
+// A v4 preset may carry `layers`, and a layer's `source` may be `{ clipId }` — a
+// reference to an audio clip stored in IndexedDB by `clip-library`. Export/import here
+// serialize the preset body INCLUDING every `layers` entry and its `clipId`, but NEVER
+// the referenced clip AUDIO — the bytes live in IndexedDB, owned solely by `clip-library`
+// (D-025), and out of this module's scope. This needs no new (de)serializer code: a v4
+// preset is just a larger object that `JSON.stringify` round-trips byte-stably like v2/v3
+// (§3.2); all schema knowledge stays delegated to `session-model`.
+//
+// Consequence: a layered preset exported on device A and imported on device B is a
+// structurally valid v4 preset whose `clipId`s resolve to no local clip — a DANGLING
+// reference. That is fine and intentional: persistence neither detects nor repairs it
+// (doing so would require reading the clip store, which this module must not do). The
+// missing-clip runtime case is owned by `clip-library` / `layer-engine` (substitute
+// silence + notice), NOT here. The audio-bearing share path is render-to-file (D-030,
+// the `renderer` module), and a self-contained package/zip export is deferred (D-037):
+// neither is a change to this JSON serializer, and no `zip`/`idb` dependency is taken on.
 
 export function presetToJson(preset: Preset): string {
   // serialize validates first and throws SessionModelError if invalid; rewrap it so

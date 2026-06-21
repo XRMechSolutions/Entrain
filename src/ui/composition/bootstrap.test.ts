@@ -67,10 +67,21 @@ beforeEach(() => {
 afterEach(() => resetBootstrapForTests());
 
 describe('bootstrap — composition root', () => {
-  it('returns the wired AppContext with all seven singletons', () => {
+  it('returns the wired AppContext with all ten singletons (incl. Phase-2 stores)', () => {
     const { overrides } = makeOverrides();
     const ctx = bootstrap(document.createElement('div'), overrides);
-    for (const key of ['transport', 'session', 'playback', 'library', 'notices', 'install', 'ui'] as const) {
+    for (const key of [
+      'transport',
+      'session',
+      'playback',
+      'library',
+      'notices',
+      'install',
+      'ui',
+      'clips',
+      'render',
+      'voiceScript',
+    ] as const) {
       expect(ctx[key]).toBeDefined();
     }
   });
@@ -85,6 +96,24 @@ describe('bootstrap — composition root', () => {
     expect(Array.isArray(opts.artwork)).toBe(true);
     expect(opts.artwork && opts.artwork.length).toBeGreaterThan(0); // APP_ICONS injected
     expect(typeof opts.silentFileUrl).toBe('string'); // SILENT_LOOP_URL injected
+  });
+
+  it('injects the layerScheduler factory into transport (same IoC shape as scheduler, arch §2.2)', () => {
+    const { createTransport, overrides } = makeOverrides();
+    bootstrap(document.createElement('div'), overrides);
+    const opts = createTransport.mock.calls[0][0] as TransportOptions;
+    // The factory matches the LayerSchedulerFactory shape (a function transport calls).
+    expect(typeof opts.layerScheduler).toBe('function');
+  });
+
+  it('constructs the three Phase-2 stores with their declared shapes (clips/render/voiceScript)', () => {
+    const { overrides } = makeOverrides();
+    const ctx = bootstrap(document.createElement('div'), overrides);
+    expect(typeof ctx.clips.refresh).toBe('function');
+    expect(typeof ctx.clips.importFile).toBe('function');
+    expect(typeof ctx.render.render).toBe('function');
+    expect(typeof ctx.render.download).toBe('function');
+    expect(typeof ctx.voiceScript.importAndCompile).toBe('function');
   });
 
   it('engages the mediastream background bridge on coarse-pointer (touch) devices', () => {

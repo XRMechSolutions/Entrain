@@ -65,6 +65,19 @@ describe('vite.config.ts — service worker / Workbox (prompt update model)', ()
     expect(viteConfig).toMatch(/clientsClaim:\s*true/);
   });
 
+  it('admits the large TTS model/runtime assets into precache (onnx/bin/wasm glob + raised size limit — tts-local D-017 / D-039)', () => {
+    // The Workbox default maximumFileSizeToCacheInBytes (~2 MB) silently excludes the
+    // tens-of-MB Kokoro q8 model and the onnxruntime-web wasm — the offline-break bug
+    // (tts-local dependencies.md @ D-017). The tts-local [config] task adds the glob + the
+    // raised limit so neither the same-origin ort wasm nor an optional self-hosted model
+    // is dropped from the precache manifest.
+    const glob = viteConfig.match(/globPatterns:\s*\[([^\]]*)\]/)?.[1] ?? '';
+    expect(glob).toContain('onnx');
+    expect(glob).toContain('bin');
+    expect(glob).toContain('wasm');
+    expect(viteConfig).toMatch(/maximumFileSizeToCacheInBytes:\s*\d/);
+  });
+
   it('includeAssets covers the favicon svg, apple-touch icon and the silent loop', () => {
     expect(viteConfig).toContain('ICON_FILES.faviconSvg');
     expect(viteConfig).toContain('ICON_FILES.appleTouch180');

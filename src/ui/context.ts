@@ -7,8 +7,9 @@
 import { getContext } from 'svelte';
 import type { Transport } from '../engine/transport';
 import type { PlaybackStore, SessionStore } from './stores/session.svelte';
-import type { InstallStore, LibraryStore } from './stores/library.svelte';
+import type { ClipStore, InstallStore, LibraryStore } from './stores/library.svelte';
 import type { NoticeStore, UiStore } from './stores/notices.svelte';
+import type { RenderStore, VoiceScriptStore } from './stores/authoring.svelte';
 
 /** The wired singletons bootstrap() assembles and provides to App via context. */
 export interface AppContext {
@@ -19,6 +20,10 @@ export interface AppContext {
   readonly notices: NoticeStore;
   readonly install: InstallStore;
   readonly ui: UiStore;
+  // Phase-2 authoring stores (design §16.2, interfaces §1/§16).
+  readonly clips: ClipStore;
+  readonly render: RenderStore;
+  readonly voiceScript: VoiceScriptStore;
 }
 
 /** Context key for the AppContext (a unique symbol so it never collides). */

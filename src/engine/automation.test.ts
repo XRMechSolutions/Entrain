@@ -41,7 +41,7 @@ const asCtx = (ctx: MockAudioContext): BaseAudioContext => ctx as unknown as Bas
 const mp = (p: AudioParam): MockAudioParam => p as unknown as MockAudioParam;
 
 function preset(durationSec: number, nodes: TimeNode[]): Preset {
-  return { schemaVersion: 3, name: 'test', durationSec, masterGain: 0.8, nodes };
+  return { schemaVersion: 5, name: 'test', durationSec, masterGain: 0.8, nodes };
 }
 function pp(value: number, transition?: ParamPoint['transition'], mod?: ModPoint | null): ParamPoint {
   const out: ParamPoint = { value };
@@ -173,8 +173,8 @@ describe('baseValueAt (Task 1)', () => {
 // =====================================================================================
 
 describe('modulatorAt (Task 2)', () => {
-  // sine warble, period 1s → f = 1 Hz; depth 5 Hz; lasts the whole timeline.
-  const sineMod: ModPoint = { shape: 'sine', periodSec: 1, depth: 5 };
+  // sine warble, period 1s → f = 1 Hz; depth 0.025 fraction of base 200 = 5 Hz; lasts the whole timeline.
+  const sineMod: ModPoint = { shape: 'sine', periodSec: 1, depth: 0.025 };
 
   it('should carry an absent mod through a later keyframe (B1)', () => {
     const p = preset(10, [
@@ -203,8 +203,8 @@ describe('modulatorAt (Task 2)', () => {
 
   it('should split the span and reset phase on a shape change (B4)', () => {
     const p = preset(10, [
-      { t: 0, carrier: pp(200, 'linear', { shape: 'sine', periodSec: 1, depth: 5 }) },
-      { t: 4, carrier: pp(200, 'linear', { shape: 'pulse', periodSec: 1, depth: 5, pulseWidth: 0.5 }) },
+      { t: 0, carrier: pp(200, 'linear', { shape: 'sine', periodSec: 1, depth: 0.025 }) },
+      { t: 4, carrier: pp(200, 'linear', { shape: 'pulse', periodSec: 1, depth: 0.025, pulseWidth: 0.5 }) },
     ]);
     // At t=4 the pulse span starts fresh: phase 0 → gate(0) = 1 → mod = depth.
     expect(modulatorAt(p, 'carrier', 4)).toBeCloseTo(5, 9);
@@ -214,7 +214,7 @@ describe('modulatorAt (Task 2)', () => {
     const noDepth = preset(10, [{ t: 0, carrier: pp(200, 'linear', { shape: 'sine', periodSec: 1 }) }]);
     expect(modulatorAt(noDepth, 'carrier', 0.25)).toBe(0); // depth defaults to 0
 
-    const noPeriod = preset(10, [{ t: 0, carrier: pp(200, 'linear', { shape: 'sine', depth: 5 }) }]);
+    const noPeriod = preset(10, [{ t: 0, carrier: pp(200, 'linear', { shape: 'sine', depth: 0.025 }) }]);
     expect(modulatorAt(noPeriod, 'carrier', 3)).toBe(0); // inactive (no rate)
   });
 
@@ -228,8 +228,8 @@ describe('modulatorAt (Task 2)', () => {
   it('should interpolate frequency = 1/periodSec linearly and integrate phase analytically (B7, C)', () => {
     // key0 @ t0: period 1 → f0 = 1; key1 @ t2: period 0.5 → f1 = 2. depth 1.
     const p = preset(10, [
-      { t: 0, carrier: pp(200, 'linear', { shape: 'sine', periodSec: 1, depth: 1 }) },
-      { t: 2, carrier: pp(200, 'linear', { shape: 'sine', periodSec: 0.5, depth: 1 }) },
+      { t: 0, carrier: pp(200, 'linear', { shape: 'sine', periodSec: 1, depth: 0.005 }) },
+      { t: 2, carrier: pp(200, 'linear', { shape: 'sine', periodSec: 0.5, depth: 0.005 }) },
     ]);
     // Analytic phase at t=1: f0·Δt + 0.5·slope·Δt² = 1·1 + 0.5·0.5·1 = 1.25 cycles.
     const expected = Math.sin(2 * Math.PI * (1.25 - Math.floor(1.25)));
@@ -249,7 +249,7 @@ describe('modulatorAt (Task 2)', () => {
 
   it('should fall back to glide for jump WITHOUT steps (§6)', () => {
     const p = preset(10, [
-      { t: 0, carrier: pp(200, 'linear', { shape: 'sine', periodSec: 1, depth: 4, transition: 'jump' }) },
+      { t: 0, carrier: pp(200, 'linear', { shape: 'sine', periodSec: 1, depth: 0.02, transition: 'jump' }) },
     ]);
     expect(modulatorAt(p, 'carrier', 0.25)).toBeCloseTo(4, 9); // continuous sine, not stepped
   });
@@ -261,7 +261,7 @@ describe('modulatorAt (Task 2)', () => {
 
 describe('valueAt (Task 3)', () => {
   it('should add the modulator for carrier/beat and multiply it for volume (§4)', () => {
-    const car = preset(10, [{ t: 0, carrier: pp(200, 'linear', { shape: 'sine', periodSec: 1, depth: 5 }) }]);
+    const car = preset(10, [{ t: 0, carrier: pp(200, 'linear', { shape: 'sine', periodSec: 1, depth: 0.025 }) }]);
     expect(valueAt(car, 'carrier', 0.25)).toBeCloseTo(205, 9); // 200 + 5·sin(π/2)
 
     const vol = preset(10, [{ t: 0, volume: pp(0.5, 'linear', { shape: 'sine', periodSec: 1, depth: 0.4 }) }]);
@@ -269,8 +269,8 @@ describe('valueAt (Task 3)', () => {
   });
 
   it('should clamp freq-depth so the instantaneous frequency stays ≥ FREQ_FLOOR (G1)', () => {
-    // base 25, depth 100 sine → effective depth = base − 1 = 24.
-    const p = preset(10, [{ t: 0, carrier: pp(25, 'linear', { shape: 'sine', periodSec: 1, depth: 100 }) }]);
+    // base 25, depth fraction min(1, 100/25)=1 → 25 Hz swing → effective depth = base − 1 = 24.
+    const p = preset(10, [{ t: 0, carrier: pp(25, 'linear', { shape: 'sine', periodSec: 1, depth: 1 }) }]);
     // phase .75 → sin = −1 → value = 25 − 24 = 1 (floored, never below 1).
     expect(valueAt(p, 'carrier', 0.75)).toBeCloseTo(1, 6);
     // phase .25 → sin = +1 → value = 25 + 24 = 49.
@@ -427,7 +427,7 @@ describe('schedule base curve (Task 4)', () => {
   });
 
   it('should propagate VOICE_STOPPED from a modulator helper on a stopped voice (H4)', () => {
-    const p = preset(10, [{ t: 0, carrier: pp(200, 'linear', { shape: 'sine', periodSec: 1, depth: 5 }) }]);
+    const p = preset(10, [{ t: 0, carrier: pp(200, 'linear', { shape: 'sine', periodSec: 1, depth: 0.025 }) }]);
     const { voice } = makeVoice();
     voice.start();
     voice.stop();
@@ -452,8 +452,8 @@ describe('schedule modulator wiring (Task 5)', () => {
 
   it('should start ONE warble osc per span and ramp frequency + depth (C1)', () => {
     const p = preset(10, [
-      { t: 0, carrier: pp(200, 'linear', { shape: 'sine', periodSec: 1, depth: 5 }) },
-      { t: 5, carrier: pp(200, 'linear', { shape: 'sine', periodSec: 0.5, depth: 8 }) },
+      { t: 0, carrier: pp(200, 'linear', { shape: 'sine', periodSec: 1, depth: 0.025 }) },
+      { t: 5, carrier: pp(200, 'linear', { shape: 'sine', periodSec: 0.5, depth: 0.04 }) },
     ]);
     const { ctx, voice } = makeVoice();
     schedule(p, 'carrier', voice, { startTime: 0 });
@@ -469,7 +469,7 @@ describe('schedule modulator wiring (Task 5)', () => {
   });
 
   it('should clamp the warble depth so the instantaneous frequency stays ≥ FREQ_FLOOR (G1)', () => {
-    const p = preset(10, [{ t: 0, carrier: pp(25, 'linear', { shape: 'sine', periodSec: 1, depth: 100 }) }]);
+    const p = preset(10, [{ t: 0, carrier: pp(25, 'linear', { shape: 'sine', periodSec: 1, depth: 1 }) }]);
     const { ctx, voice } = makeVoice();
     schedule(p, 'carrier', voice, { startTime: 0 });
     const depthGain = ctx.created.gains[ctx.created.gains.length - 1];
@@ -491,7 +491,7 @@ describe('schedule modulator wiring (Task 5)', () => {
 
     it('should wire a carrier pulse as depth=1 gate → GainNode(depth) → carrierParam', async () => {
       const p = preset(10, [
-        { t: 0, carrier: pp(200, 'linear', { shape: 'pulse', periodSec: 1, depth: 6, pulseWidth: 0.5 }) },
+        { t: 0, carrier: pp(200, 'linear', { shape: 'pulse', periodSec: 1, depth: 0.03, pulseWidth: 0.5 }) },
       ]);
       const { ctx, voice } = await voiceWithWorklet();
       schedule(p, 'carrier', voice, { startTime: 0 });
@@ -517,7 +517,7 @@ describe('schedule modulator wiring (Task 5)', () => {
 
     it('should catch WORKLET_NOT_REGISTERED, keep the base curve, and set pulseUnavailable (F1)', () => {
       const p = preset(10, [
-        { t: 0, carrier: pp(200, 'linear', { shape: 'pulse', periodSec: 1, depth: 6 }) },
+        { t: 0, carrier: pp(200, 'linear', { shape: 'pulse', periodSec: 1, depth: 0.03 }) },
       ]);
       const { voice } = makeVoice(); // worklet NOT registered
       const lane = schedule(p, 'carrier', voice, { startTime: 0 });
@@ -532,7 +532,7 @@ describe('schedule modulator wiring (Task 5)', () => {
         /* registration failed → createPulseNode will throw WORKLET_NOT_REGISTERED */
       });
       const p = preset(10, [
-        { t: 0, carrier: pp(200, 'linear', { shape: 'pulse', periodSec: 1, depth: 6 }) },
+        { t: 0, carrier: pp(200, 'linear', { shape: 'pulse', periodSec: 1, depth: 0.03 }) },
       ]);
       const lane = schedule(p, 'carrier', voice, { startTime: 0 });
       expect(lane.pulseUnavailable).toBe(true);
@@ -616,8 +616,8 @@ describe('retarget (Task 6)', () => {
   });
 
   it('should KEEP the warble node when modulator identity is unchanged (C3)', () => {
-    const p0 = preset(20, [{ t: 0, carrier: pp(200, 'linear', { shape: 'sine', periodSec: 1, depth: 5 }) }]);
-    const p1 = preset(20, [{ t: 0, carrier: pp(200, 'linear', { shape: 'sine', periodSec: 0.5, depth: 9 }) }]);
+    const p0 = preset(20, [{ t: 0, carrier: pp(200, 'linear', { shape: 'sine', periodSec: 1, depth: 0.025 }) }]);
+    const p1 = preset(20, [{ t: 0, carrier: pp(200, 'linear', { shape: 'sine', periodSec: 0.5, depth: 0.045 }) }]);
     const { ctx, voice } = makeVoice();
     ctx.currentTime = 0;
     const lane = schedule(p0, 'carrier', voice, { startTime: 0 });
@@ -633,9 +633,9 @@ describe('retarget (Task 6)', () => {
   it('should REBUILD the modulator when the shape changes (E4)', async () => {
     const uninstall = installAudioWorkletNode();
     try {
-      const p0 = preset(20, [{ t: 0, carrier: pp(200, 'linear', { shape: 'sine', periodSec: 1, depth: 5 }) }]);
+      const p0 = preset(20, [{ t: 0, carrier: pp(200, 'linear', { shape: 'sine', periodSec: 1, depth: 0.025 }) }]);
       const p1 = preset(20, [
-        { t: 0, carrier: pp(200, 'linear', { shape: 'pulse', periodSec: 1, depth: 5, pulseWidth: 0.5 }) },
+        { t: 0, carrier: pp(200, 'linear', { shape: 'pulse', periodSec: 1, depth: 0.025, pulseWidth: 0.5 }) },
       ]);
       const { ctx, voice } = makeVoice();
       await registerPulseWorklet(asCtx(ctx));
@@ -701,8 +701,8 @@ describe('preview == playback parity (Task 7)', () => {
   it('should produce no amplitude discontinuity when the period ramps (C1)', () => {
     // period 2 s (0.5 Hz) → 0.25 s (4 Hz) across the span; sine depth 6.
     const p = preset(10, [
-      { t: 0, carrier: pp(200, 'linear', { shape: 'sine', periodSec: 2, depth: 6 }) },
-      { t: 8, carrier: pp(200, 'linear', { shape: 'sine', periodSec: 0.25, depth: 6 }) },
+      { t: 0, carrier: pp(200, 'linear', { shape: 'sine', periodSec: 2, depth: 0.03 }) },
+      { t: 8, carrier: pp(200, 'linear', { shape: 'sine', periodSec: 0.25, depth: 0.03 }) },
     ]);
     let prev = modulatorAt(p, 'carrier', 0);
     let maxJump = 0;
@@ -716,8 +716,8 @@ describe('preview == playback parity (Task 7)', () => {
   });
 
   it('should keep phase continuous and preview == playback across a retarget (C3)', () => {
-    const p0 = preset(40, [{ t: 0, carrier: pp(200, 'linear', { shape: 'sine', periodSec: 1, depth: 5 }) }]);
-    const p1 = preset(40, [{ t: 0, carrier: pp(260, 'linear', { shape: 'sine', periodSec: 1, depth: 5 }) }]);
+    const p0 = preset(40, [{ t: 0, carrier: pp(200, 'linear', { shape: 'sine', periodSec: 1, depth: 0.025 }) }]);
+    const p1 = preset(40, [{ t: 0, carrier: pp(260, 'linear', { shape: 'sine', periodSec: 1, depth: 0.01923 }) }]);
     const { ctx, voice } = makeVoice({ supportsCancelAndHold: true });
     ctx.currentTime = 0;
     const lane = schedule(p0, 'carrier', voice, { startTime: 0 });
@@ -736,8 +736,8 @@ describe('preview == playback parity (Task 7)', () => {
 // =====================================================================================
 
 describe('box shape — pure trajectory (modulatorAt / valueAt)', () => {
-  // period 4 s (0.25 Hz) → one breath every 4 s; depth 10 Hz on the carrier offset.
-  const boxMod = (pulseWidth: number, depth = 10) => ({ shape: 'box' as const, periodSec: 4, depth, pulseWidth });
+  // period 4 s (0.25 Hz) → one breath every 4 s; depth fraction 0.05 of base 200 = 10 Hz on the carrier offset.
+  const boxMod = (pulseWidth: number, depth = 0.05) => ({ shape: 'box' as const, periodSec: 4, depth, pulseWidth });
 
   it('h=0.5 traces the even 4-4-4-4 box: trough, peak, both holds (additive depth·u)', () => {
     const p = preset(20, [{ t: 0, carrier: pp(200, 'linear', boxMod(0.5)) }]);
@@ -762,7 +762,7 @@ describe('box shape — pure trajectory (modulatorAt / valueAt)', () => {
   });
 
   it('defaults the hold ratio to 0.5 when pulseWidth is omitted', () => {
-    const noPw = preset(20, [{ t: 0, carrier: pp(200, 'linear', { shape: 'box', periodSec: 4, depth: 10 }) }]);
+    const noPw = preset(20, [{ t: 0, carrier: pp(200, 'linear', { shape: 'box', periodSec: 4, depth: 0.05 }) }]);
     const half = preset(20, [{ t: 0, carrier: pp(200, 'linear', boxMod(0.5)) }]);
     for (const t of [0, 0.5, 1, 1.5, 2.5, 3]) {
       expect(modulatorAt(noPw, 'carrier', t)).toBeCloseTo(modulatorAt(half, 'carrier', t), 9);
@@ -772,8 +772,8 @@ describe('box shape — pure trajectory (modulatorAt / valueAt)', () => {
   it('integrates phase analytically across a ramped period (continuous phase)', () => {
     // period 4 s (f0=0.25) → period 2 s (f1=0.5) across [0,2]; depth 8, h=0.5.
     const p = preset(20, [
-      { t: 0, carrier: pp(200, 'linear', { shape: 'box', periodSec: 4, depth: 8, pulseWidth: 0.5 }) },
-      { t: 2, carrier: pp(200, 'linear', { shape: 'box', periodSec: 2, depth: 8, pulseWidth: 0.5 }) },
+      { t: 0, carrier: pp(200, 'linear', { shape: 'box', periodSec: 4, depth: 0.04, pulseWidth: 0.5 }) },
+      { t: 2, carrier: pp(200, 'linear', { shape: 'box', periodSec: 2, depth: 0.04, pulseWidth: 0.5 }) },
     ]);
     // phase(0.5) = f0·Δt + 0.5·slope·Δt² = 0.25·0.5 + 0.5·0.125·0.5² = 0.140625 cycles (mid-inhale).
     // boxUnit(0.140625, 0.5) = −1 + 2·(0.140625/0.25) = 0.125 → ×8 = 1.0.
@@ -784,8 +784,8 @@ describe('box shape — pure trajectory (modulatorAt / valueAt)', () => {
 
   it('stays continuous (no jump) even as the period ramps', () => {
     const p = preset(12, [
-      { t: 0, carrier: pp(200, 'linear', { shape: 'box', periodSec: 4, depth: 10, pulseWidth: 0.5 }) },
-      { t: 8, carrier: pp(200, 'linear', { shape: 'box', periodSec: 1, depth: 10, pulseWidth: 0.5 }) },
+      { t: 0, carrier: pp(200, 'linear', { shape: 'box', periodSec: 4, depth: 0.05, pulseWidth: 0.5 }) },
+      { t: 8, carrier: pp(200, 'linear', { shape: 'box', periodSec: 1, depth: 0.05, pulseWidth: 0.5 }) },
     ]);
     let prev = modulatorAt(p, 'carrier', 0);
     let maxJump = 0;
@@ -818,7 +818,7 @@ describe('box shape — pure trajectory (modulatorAt / valueAt)', () => {
 
   it('ignores steps for box (drives the trapezoid, not a sample-and-hold list)', () => {
     const p = preset(20, [
-      { t: 0, carrier: pp(200, 'linear', { shape: 'box', periodSec: 4, depth: 10, pulseWidth: 0.5, transition: 'jump', steps: [99, -99] }) },
+      { t: 0, carrier: pp(200, 'linear', { shape: 'box', periodSec: 4, depth: 0.05, pulseWidth: 0.5, transition: 'jump', steps: [99, -99] }) },
     ]);
     // If steps were honoured this would be 99/−99; box ignores them → smooth trapezoid.
     expect(modulatorAt(p, 'carrier', 1)).toBeCloseTo(10, 9);
@@ -833,7 +833,7 @@ describe('box shape — scheduled output == preview parity (mock render)', () =>
   }
 
   it('schedules an additive carrier box: a started ConstantSource summed onto carrierParam', () => {
-    const p = preset(20, [{ t: 0, carrier: pp(200, 'linear', { shape: 'box', periodSec: 4, depth: 10, pulseWidth: 0.5 }) }]);
+    const p = preset(20, [{ t: 0, carrier: pp(200, 'linear', { shape: 'box', periodSec: 4, depth: 0.05, pulseWidth: 0.5 }) }]);
     const { ctx, voice } = makeVoice();
     ctx.currentTime = 0;
     schedule(p, 'carrier', voice, { startTime: 0 });
@@ -846,7 +846,7 @@ describe('box shape — scheduled output == preview parity (mock render)', () =>
   });
 
   it('the rendered carrier (base + box offset) matches valueAt at ramp, hold and trough samples', () => {
-    const p = preset(20, [{ t: 0, carrier: pp(200, 'linear', { shape: 'box', periodSec: 4, depth: 10, pulseWidth: 0.5 }) }]);
+    const p = preset(20, [{ t: 0, carrier: pp(200, 'linear', { shape: 'box', periodSec: 4, depth: 0.05, pulseWidth: 0.5 }) }]);
     const { ctx, voice } = makeVoice();
     ctx.currentTime = 0;
     schedule(p, 'carrier', voice, { startTime: 0 });
@@ -870,7 +870,7 @@ describe('box shape — scheduled output == preview parity (mock render)', () =>
   });
 
   it('reproduces the h=0 triangle sweep when rendered', () => {
-    const p = preset(20, [{ t: 0, carrier: pp(200, 'linear', { shape: 'box', periodSec: 4, depth: 10, pulseWidth: 0 }) }]);
+    const p = preset(20, [{ t: 0, carrier: pp(200, 'linear', { shape: 'box', periodSec: 4, depth: 0.05, pulseWidth: 0 }) }]);
     const { ctx, voice } = makeVoice();
     ctx.currentTime = 0;
     schedule(p, 'carrier', voice, { startTime: 0 });
@@ -881,8 +881,8 @@ describe('box shape — scheduled output == preview parity (mock render)', () =>
   });
 
   it('rebuilds the box source on retarget (re-anchored, no stale wiring)', () => {
-    const p0 = preset(40, [{ t: 0, carrier: pp(200, 'linear', { shape: 'box', periodSec: 4, depth: 10, pulseWidth: 0.5 }) }]);
-    const p1 = preset(40, [{ t: 0, carrier: pp(200, 'linear', { shape: 'box', periodSec: 4, depth: 6, pulseWidth: 0.5 }) }]);
+    const p0 = preset(40, [{ t: 0, carrier: pp(200, 'linear', { shape: 'box', periodSec: 4, depth: 0.05, pulseWidth: 0.5 }) }]);
+    const p1 = preset(40, [{ t: 0, carrier: pp(200, 'linear', { shape: 'box', periodSec: 4, depth: 0.03, pulseWidth: 0.5 }) }]);
     const { ctx, voice } = makeVoice({ supportsCancelAndHold: true });
     ctx.currentTime = 0;
     const lane = schedule(p0, 'carrier', voice, { startTime: 0 });

@@ -26,6 +26,12 @@ export interface VoiceOptions {
   beatHz?: number; // default 4, clamped 0..35
   volume?: number; // default 1, clamped 0..1 (base volume on volumeGain)
   masterTrim?: number; // default 0.8, clamped 0..1 (ceiling; masterGain.gain still starts at 0)
+  // Master placement (D-036, design §13). 'internal' (default) = unchanged Phase-1
+  // (masterGain.gain starts at 0; setMasterGain ramps + records trim). 'bus' = unity
+  // passthrough (masterGain.gain = 1) and setMasterGain is a guarded no-op (still throws
+  // on non-finite); the mixer owns the master fade/trim. An omitted or unrecognized value
+  // is treated as 'internal' and never throws (A8).
+  master?: 'internal' | 'bus'; // default 'internal'
 }
 
 /** Glide-warble (sine/triangle LFO) wiring options. */
@@ -139,6 +145,7 @@ const DEFAULT_VOLUME = 1;
 const DEFAULT_ENV = 1;
 const DEFAULT_EAR_GAIN = 1;
 const DEFAULT_MASTER = 0; // silent start so transport fades in click-free
+const BUS_MASTER = 1; // unity passthrough in 'bus' mode; the mixer owns the fade (D-036)
 const DEFAULT_TRIM = 0.8;
 
 const CARRIER_MIN = 20;
@@ -150,7 +157,8 @@ const GAIN_MAX = 1;
 const PAN_MIN = -1;
 const PAN_MAX = 1;
 const DEFAULT_SPATIAL = 0; // centered (no pan) at construction
-const SPATIAL_FAR_EAR_FLOOR = 0.25; // far-ear floor (≈ −12 dB) at full pan (D-021 §2.7)
+const SPATIAL_FAR_EAR_FLOOR = 0.12; // far-ear floor (≈ −18 dB) at full pan (D-021 §2.7); deeper than the original −12 dB so the L↔R swing is clearly trackable on low carriers, while the far ear stays audible enough to keep the beat alive
+const SPATIAL_NEAR_EAR_BOOST = 0.05; // near-ear "origin accent": the near ear lifts up to +5% (≈ +0.42 dB) at full pan, ∝ |s|, so a hard pan (and box-breath holds) accentuate the sound's side (D-021 §2.7)
 // Half-wave rectifier y = max(0, x): a 3-point curve linearly interpolated by a
 // WaveShaper is exactly max(0, x) over the input domain [−1, 1] (design §2.7).
 const HALF_WAVE_CURVE = new Float32Array([0, 0, 1]);
@@ -222,6 +230,11 @@ export function createVoice(ctx: BaseAudioContext, options?: VoiceOptions): Voic
   const volume = resolveOption(options?.volume, DEFAULT_VOLUME, GAIN_MIN, GAIN_MAX, 'volume');
   let masterTrim = resolveOption(options?.masterTrim, DEFAULT_TRIM, GAIN_MIN, GAIN_MAX, 'masterTrim');
 
+  // Master placement (D-036, §13). Only the explicit 'bus' string selects bus mode;
+  // an omitted or unrecognized value falls through to the 'internal' default (A8) —
+  // master picks a wiring mode, not a numeric param, so there is nothing to poison.
+  const busMode = options?.master === 'bus';
+
   // Sources: two oscillators driven entirely by summed ConstantSources (§2.3).
   const oscL = ctx.createOscillator();
   const oscR = ctx.createOscillator();
@@ -243,6 +256,8 @@ export function createVoice(ctx: BaseAudioContext, options?: VoiceOptions): Voic
   const negR = ctx.createGain(); // negates s so shaperR receives max(0, −s)
   const spatialAttenL = ctx.createGain();
   const spatialAttenR = ctx.createGain();
+  const boostNearL = ctx.createGain(); // +SPATIAL_NEAR_EAR_BOOST·max(0,−s): lifts L when panned left
+  const boostNearR = ctx.createGain(); // +SPATIAL_NEAR_EAR_BOOST·max(0, s): lifts R when panned right
   const merger = ctx.createChannelMerger(2);
   const envGain = ctx.createGain(); // multiplicative modulator (modVolumeParam)
   const volumeGain = ctx.createGain(); // automated base volume (volumeParam)
@@ -266,11 +281,17 @@ export function createVoice(ctx: BaseAudioContext, options?: VoiceOptions): Voic
   shaperL.curve = HALF_WAVE_CURVE;
   shaperR.curve = HALF_WAVE_CURVE;
   negR.gain.value = -1;
-  spatialAttenL.gain.value = -(1 - SPATIAL_FAR_EAR_FLOOR); // −0.75: far-ear attenuation
+  spatialAttenL.gain.value = -(1 - SPATIAL_FAR_EAR_FLOOR); // −0.88: far-ear attenuation
   spatialAttenR.gain.value = -(1 - SPATIAL_FAR_EAR_FLOOR);
+  boostNearL.gain.value = SPATIAL_NEAR_EAR_BOOST; // +0.05: near-ear origin accent
+  boostNearR.gain.value = SPATIAL_NEAR_EAR_BOOST;
   envGain.gain.value = DEFAULT_ENV;
   volumeGain.gain.value = volume;
-  masterGain.gain.value = DEFAULT_MASTER;
+  // 'internal': silent start (0) so transport fades in click-free (§2.4). 'bus': unity
+  // passthrough (1) — the construction-time =0 write is skipped because the downstream
+  // mixer.master owns the 0→trim fade and trim ceiling (D-036, §13); a 0 here would never
+  // let the voice reach the bus and a second trim would double-attenuate.
+  masterGain.gain.value = busMode ? BUS_MASTER : DEFAULT_MASTER;
 
   // Wire the frequency summing: carrier (+1) into both ears; beat through the
   // ∓0.5 split gains into each ear (§2.3). These are construction-time writes while
@@ -291,18 +312,27 @@ export function createVoice(ctx: BaseAudioContext, options?: VoiceOptions): Voic
   panGainL.connect(merger, 0, 0);
   panGainR.connect(merger, 0, 1);
 
-  // Spatial ILD law (§2.7): panGainL = 1 − (1−F)·max(0, s), panGainR = 1 − (1−F)·max(0, −s),
-  // with s = spatialSource.offset ∈ [−1, 1]. Half-wave shapers + a −(1−F) atten gain
-  // summed into each pan gain's intrinsic 1.0 hold the near ear at unity and floor the
-  // far ear, so loudness stays ~constant across the sweep and both ears stay audible
-  // (the binaural beat survives the full pan). This is the authorized D-010 exception.
+  // Spatial ILD law (§2.7) with the near-ear origin accent (B = SPATIAL_NEAR_EAR_BOOST):
+  //   panGainL = 1 − (1−F)·max(0, s)  + B·max(0, −s)
+  //   panGainR = 1 − (1−F)·max(0, −s) + B·max(0,  s)
+  // with s = spatialSource.offset ∈ [−1, 1]. Half-wave shapers feed each pan gain's
+  // intrinsic 1.0: the FAR side is floored to F via the −(1−F) atten gain, and the NEAR
+  // side is lifted up to +B at full pan via the boost gain (∝ |s|). So a hard pan — and the
+  // box-breath holds, which dwell at s = ±1 — slightly accentuate the sound's origin, while
+  // the far ear stays audible so the binaural beat survives the sweep (D-010/D-021 exception).
+  // shaperL = max(0, s) (right-near); shaperR = max(0, −s) (left-near) — each fans out to its
+  // far-ear atten AND the OTHER ear's near-boost.
   spatialSource.connect(shaperL);
   shaperL.connect(spatialAttenL);
   spatialAttenL.connect(panGainL.gain);
+  shaperL.connect(boostNearR); // max(0, s) → +B into the right (near) pan gain
+  boostNearR.connect(panGainR.gain);
   spatialSource.connect(negR);
   negR.connect(shaperR);
   shaperR.connect(spatialAttenR);
   spatialAttenR.connect(panGainR.gain);
+  shaperR.connect(boostNearL); // max(0, −s) → +B into the left (near) pan gain
+  boostNearL.connect(panGainL.gain);
 
   // Post-merge: envGain → volumeGain → masterGain → destination (§2.4).
   merger.connect(envGain);
@@ -321,7 +351,7 @@ export function createVoice(ctx: BaseAudioContext, options?: VoiceOptions): Voic
   let trackedCarrier = carrierHz;
   let trackedBeat = beatHz;
   let trackedVolume = volume;
-  let trackedMaster = DEFAULT_MASTER;
+  let trackedMaster = busMode ? BUS_MASTER : DEFAULT_MASTER;
   let trackedGainL = DEFAULT_EAR_GAIN;
   let trackedGainR = DEFAULT_EAR_GAIN;
   let trackedSpatial = DEFAULT_SPATIAL;
@@ -387,7 +417,12 @@ export function createVoice(ctx: BaseAudioContext, options?: VoiceOptions): Voic
 
     setMasterGain(v: number, atTime?: number): void {
       assertLive();
+      // Non-finite check runs in BOTH modes so the INVALID_PARAMETER contract is
+      // identical (A1/A9). In bus mode the call is a guarded no-op past this point:
+      // the mixer owns the master timeline, so the voice never writes it (no ramp, no
+      // trim record) — a finite value is silently ignored (D-036, §13).
       const target = clamp(ensureFinite(v, 'masterGain'), GAIN_MIN, GAIN_MAX);
+      if (busMode) return;
       rampTo(masterGain.gain, trackedMaster, target, atTime);
       trackedMaster = target;
       masterTrim = target; // record the trim ceiling (§2.4)
@@ -556,6 +591,8 @@ export function createVoice(ctx: BaseAudioContext, options?: VoiceOptions): Voic
         negR,
         spatialAttenL,
         spatialAttenR,
+        boostNearL,
+        boostNearR,
         merger,
         envGain,
         volumeGain,

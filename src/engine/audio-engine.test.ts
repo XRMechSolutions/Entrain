@@ -42,6 +42,8 @@ interface Graph {
   negR: MockGainNode;
   spatialAttenL: MockGainNode;
   spatialAttenR: MockGainNode;
+  boostNearL: MockGainNode;
+  boostNearR: MockGainNode;
   shaperL: MockWaveShaperNode;
   shaperR: MockWaveShaperNode;
   envGain: MockGainNode;
@@ -54,13 +56,13 @@ interface Graph {
 function graphOf(ctx: MockAudioContext): Graph {
   const [oscL, oscR] = ctx.created.oscillators;
   const [carrierSource, beatSource, spatialSource] = ctx.created.constantSources;
-  const [splitL, splitR, gainL, gainR, panGainL, panGainR, negR, spatialAttenL, spatialAttenR, envGain, volumeGain, masterGain] =
+  const [splitL, splitR, gainL, gainR, panGainL, panGainR, negR, spatialAttenL, spatialAttenR, boostNearL, boostNearR, envGain, volumeGain, masterGain] =
     ctx.created.gains;
   const [shaperL, shaperR] = ctx.created.waveShapers;
   const [merger] = ctx.created.mergers;
   return {
     oscL, oscR, carrierSource, beatSource, spatialSource, splitL, splitR, gainL, gainR,
-    panGainL, panGainR, negR, spatialAttenL, spatialAttenR, shaperL, shaperR,
+    panGainL, panGainR, negR, spatialAttenL, spatialAttenR, boostNearL, boostNearR, shaperL, shaperR,
     envGain, volumeGain, masterGain, merger,
   };
 }
@@ -353,6 +355,63 @@ describe('imperative setters (Task 2)', () => {
 });
 
 // =====================================================================================
+// Master flag (D-036) — bus mode: unity passthrough + guarded-no-op setMasterGain
+// =====================================================================================
+
+describe('master flag — bus mode (D-036)', () => {
+  it('should construct masterGain.gain at unity (1) instead of the silent 0 (§13)', () => {
+    const { ctx, voice } = makeVoice({ master: 'bus' });
+    const g = graphOf(ctx);
+    expect(mp(voice.masterGainParam).value).toBe(1);
+    // No ramp scheduled at construction — the unity value is a bare construction-time write.
+    expect(g.masterGain.gain.methodLog).not.toContain('linearRampToValueAtTime');
+    // masterGainParam stays exposed, identically bound to masterGain.gain in both modes.
+    expect(voice.masterGainParam).toBe(g.masterGain.gain);
+    // The destination connect at :311 stays unconditional in bus mode.
+    expect(g.masterGain.isConnectedTo(ctx.destination)).toBe(true);
+  });
+
+  it('should make setMasterGain(finite) a no-op — no ramp recorded, value stays unity', () => {
+    const { ctx, voice } = makeVoice({ master: 'bus' });
+    const g = graphOf(ctx);
+    const before = g.masterGain.gain.events.length;
+    voice.setMasterGain(0.5);
+    expect(g.masterGain.gain.events.length).toBe(before); // nothing scheduled
+    expect(mp(voice.masterGainParam).value).toBe(1); // trim ceiling unchanged at unity
+  });
+
+  it('should still throw INVALID_PARAMETER on non-finite setMasterGain in bus mode (A9)', () => {
+    const { voice } = makeVoice({ master: 'bus' });
+    expectAudioError(() => voice.setMasterGain(NaN), 'INVALID_PARAMETER');
+    expectAudioError(() => voice.setMasterGain(Infinity), 'INVALID_PARAMETER');
+    expectAudioError(() => voice.setMasterGain(-Infinity), 'INVALID_PARAMETER');
+  });
+
+  it('should default an omitted master to internal (silent start 0) — A8', () => {
+    const { voice } = makeVoice();
+    expect(mp(voice.masterGainParam).value).toBe(0);
+  });
+
+  it("should treat 'internal' as Phase-1: 0 at construction, setMasterGain ramps + records trim", () => {
+    const { ctx, voice } = makeVoice({ master: 'internal' });
+    const g = graphOf(ctx);
+    expect(mp(voice.masterGainParam).value).toBe(0);
+    voice.setMasterGain(0.7);
+    expect(g.masterGain.gain.methodLog).toContain('linearRampToValueAtTime');
+    expect(mp(voice.masterGainParam).value).toBe(0.7);
+  });
+
+  it('should treat an unrecognized master string as internal, not throw (A8)', () => {
+    const ctx = new MockAudioContext();
+    expect(() =>
+      createVoice(asCtx(ctx), { master: 'weird' as unknown as 'internal' }),
+    ).not.toThrow();
+    const g = graphOf(ctx);
+    expect(g.masterGain.gain.value).toBe(0); // fell through to the internal default
+  });
+});
+
+// =====================================================================================
 // Task 3 — lifecycle state machine
 // =====================================================================================
 
@@ -456,23 +515,23 @@ describe('spatial pan (D-021)', () => {
     expect(computeParamValue(g.panGainR.gain)).toBeCloseTo(1, 9);
   });
 
-  it('keeps the near ear at unity and floors the far ear at full pan (constant-loudness law)', () => {
+  it('accents the near ear (+5%) and floors the far ear at full pan (origin-accent ILD law)', () => {
     const { ctx, voice } = makeVoice();
     const g = graphOf(ctx);
     voice.setSpatial(1); // full right
-    expect(computeParamValue(g.panGainR.gain)).toBeCloseTo(1, 9); // near ear unity
-    expect(computeParamValue(g.panGainL.gain)).toBeCloseTo(0.25, 9); // far ear floored (−12 dB)
+    expect(computeParamValue(g.panGainR.gain)).toBeCloseTo(1.05, 9); // near ear +5% (origin accent)
+    expect(computeParamValue(g.panGainL.gain)).toBeCloseTo(0.12, 9); // far ear floored (≈ −18 dB)
     voice.setSpatial(-1); // full left
-    expect(computeParamValue(g.panGainL.gain)).toBeCloseTo(1, 9);
-    expect(computeParamValue(g.panGainR.gain)).toBeCloseTo(0.25, 9);
+    expect(computeParamValue(g.panGainL.gain)).toBeCloseTo(1.05, 9);
+    expect(computeParamValue(g.panGainR.gain)).toBeCloseTo(0.12, 9);
   });
 
-  it('keeps both ears above the floor at a partial pan (the binaural beat survives)', () => {
+  it('scales the near-ear accent with pan magnitude and keeps both ears above the floor at a partial pan', () => {
     const { ctx, voice } = makeVoice();
     const g = graphOf(ctx);
     voice.setSpatial(0.5);
-    expect(computeParamValue(g.panGainL.gain)).toBeCloseTo(0.625, 9); // 1 − 0.75·0.5
-    expect(computeParamValue(g.panGainR.gain)).toBeCloseTo(1, 9);
+    expect(computeParamValue(g.panGainL.gain)).toBeCloseTo(0.56, 9); // far: 1 − 0.88·0.5
+    expect(computeParamValue(g.panGainR.gain)).toBeCloseTo(1.025, 9); // near: 1 + 0.05·0.5
     expect(computeParamValue(g.panGainL.gain)).toBeGreaterThan(0);
     expect(computeParamValue(g.panGainR.gain)).toBeGreaterThan(0);
   });
@@ -509,8 +568,8 @@ describe('spatial pan (D-021)', () => {
     expect(g.gainL.gain.value).toBe(1); // pan −0.5: near (L) stays 1
     expect(g.gainR.gain.value).toBe(0.5); // far (R) trimmed to 0.5
     // spatial did not touch gainL/gainR; the pan lives on the separate pair.
-    expect(computeParamValue(g.panGainL.gain)).toBeCloseTo(0.25, 9);
-    expect(computeParamValue(g.panGainR.gain)).toBeCloseTo(1, 9);
+    expect(computeParamValue(g.panGainL.gain)).toBeCloseTo(0.12, 9); // far ear floored
+    expect(computeParamValue(g.panGainR.gain)).toBeCloseTo(1.05, 9); // near ear +5% origin accent
   });
 });
 

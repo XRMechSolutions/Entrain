@@ -18,10 +18,14 @@ import type {
   ModShape,
   ModTransition,
   ParamTransition,
+  LanePoint,
 } from './session-model';
 import { DEFAULTS } from './session-model';
 import type { Voice, WarbleHandle, PulseHandle } from './audio-engine';
 import { AudioEngineError } from './audio-engine';
+
+// Re-exports for mixer and other consumers (design §8.7 scheduleLane seam).
+export type { LanePoint } from './session-model';
 
 // ---------------------------------------------------------------------------
 // 1. Constants (single source of truth, design §11)
@@ -229,14 +233,23 @@ interface ModSpan {
 }
 
 /** Realise one object `ModPoint` at eval time. `periodSec` is required for a rate; a
- *  point without it is inactive (design §5.2 / edge-case B5) → `null`. */
-function resolveModPoint(t: number, mod: ModPoint): ResolvedModKey | null {
+ *  point without it is inactive (design §5.2 / edge-case B5) → `null`. `base` is the lane's
+ *  base value at this keyframe's time, used to turn a carrier/beat percentage depth into an
+ *  absolute Hz swing (see the `depth` note below). */
+function resolveModPoint(t: number, mod: ModPoint, param: AutomatableParam, base: number): ResolvedModKey | null {
   if (mod.periodSec === undefined) return null;
+  // carrier/beat `depth` is stored as a FRACTION of the base frequency (percentage warble,
+  // v5). Convert it to an absolute Hz swing at THIS keyframe's base (anchor-at-keyframe), so
+  // everything downstream — interpolation, the §8.5 clamp, scheduling, and the pure preview —
+  // treats it as Hz exactly as before. volume (multiplier) and spatial (position) depths are
+  // already in their own units and pass through unchanged.
+  const rawDepth = mod.depth ?? 0;
+  const depth = param === 'carrier' || param === 'beat' ? rawDepth * base : rawDepth;
   return {
     t,
     shape: mod.shape ?? DEFAULTS.modShape,
     frequency: 1 / mod.periodSec,
-    depth: mod.depth ?? 0,
+    depth,
     pulseWidth: mod.pulseWidth ?? 0.5,
     edgeSec: (mod.edgeMs ?? 0) / 1000,
     transition: mod.transition ?? DEFAULTS.modTransition,
@@ -268,7 +281,7 @@ function resolveSpans(preset: Preset, param: AutomatableParam): ModSpan[] {
       close(k.t); // explicit clear
       continue;
     }
-    const r = resolveModPoint(k.t, mod);
+    const r = resolveModPoint(k.t, mod, param, baseCore(preset, param, k.t));
     if (r === null) {
       close(k.t); // inactive (no period) — behaves like a clear
       continue;
@@ -571,6 +584,122 @@ interface ModRuntime {
 }
 
 // ---------------------------------------------------------------------------
+// 8b. scheduleLane — the shared no-click base-curve writer (D-036, design §8.7)
+// ---------------------------------------------------------------------------
+
+/** Per-caller scheduling policy + the two JS-tracked anchor sources (interfaces §5b).
+ *  `anchorValue` AND `valueAt` are both load-bearing: `anchorValue` is the lane-start
+ *  seek anchor written at `floorT(startTime)`; `valueAt(t)` supplies the mid-segment
+ *  start value when a seek lands inside a segment (`segStartPt !== ti`). Neither is ever
+ *  `param.value` (stale on Firefox — the caller supplies JS-tracked values, §E2). */
+export interface ScheduleLaneOpts {
+  /** ctx time mapped to point t=0. */
+  startTime: number;
+  /** begin scheduling at this point-time (seek). */
+  startOffsetSec: number;
+  /** no event scheduled before this ctx time. */
+  floorTime: number;
+  /** JS-tracked seek anchor written at floorT(startTime); NEVER param.value. */
+  anchorValue: number;
+  /** pure value-at-t over THESE points; mid-segment startVal when segStartPt !== ti. */
+  valueAt: (t: number) => number;
+  policy: {
+    /** > 0 ⇒ 10 ms anti-click micro-ramp on a step (volume); === 0 ⇒ bare click-free step. */
+    stepRampSec: number;
+    /** true ⇒ an `exp` segment with non-finite/zero/sign-change endpoints falls back to linear. */
+    expFallback: boolean;
+  };
+}
+
+/** The shared no-click base-curve writer (D-036). Anchors the param at
+ *  `opts.anchorValue` then schedules each segment's native primitive
+ *  (`setValueAtTime` + linear/exp ramp; the `smooth` polyline) per its `transition`.
+ *  Stateless, returns void, throws nothing of its own (caller-validated inputs); uses
+ *  only `setValueAtTime` / `linearRampToValueAtTime` / `exponentialRampToValueAtTime`,
+ *  never `setValueCurveAtTime` (Firefox bug 1752775). The SMOOTH_* constants are read
+ *  from module scope, not `opts`. Shared by the binaural in-closure adapter, the layer
+ *  lanes (`layer-scheduler`), and the duck (`mixer.scheduleDuck`). */
+export function scheduleLane(
+  param: AudioParam,
+  points: readonly LanePoint[],
+  opts: ScheduleLaneOpts,
+): void {
+  const { startTime, startOffsetSec, floorTime, anchorValue, valueAt, policy } = opts;
+  const ctxTimeOf = (pt: number): number => startTime + (pt - startOffsetSec);
+  const floorT = (time: number): number => Math.max(time, floorTime);
+
+  param.setValueAtTime(anchorValue, floorT(startTime));
+
+  for (let i = 0; i + 1 < points.length; i++) {
+    const ti = points[i].t;
+    const tj = points[i + 1].t;
+    if (tj <= startOffsetSec) continue; // wholly before the offset
+    const a = points[i].value;
+    const b = points[i + 1].value;
+    const transition = points[i].transition ?? DEFAULTS.paramTransition;
+    const segStartPt = Math.max(ti, startOffsetSec);
+    const segEndCtx = floorT(ctxTimeOf(tj));
+    const startVal = segStartPt === ti ? a : valueAt(segStartPt);
+    if (ti > startOffsetSec) {
+      // A full segment start (not the straddling one already covered by the lane anchor).
+      param.setValueAtTime(startVal, floorT(ctxTimeOf(ti)));
+    }
+    switch (transition) {
+      case 'linear':
+        param.linearRampToValueAtTime(b, segEndCtx);
+        break;
+      case 'exp':
+        if (policy.expFallback ? expValid(a, b) : true) {
+          param.exponentialRampToValueAtTime(b, segEndCtx);
+        } else {
+          param.linearRampToValueAtTime(b, segEndCtx);
+        }
+        break;
+      case 'smooth':
+        scheduleSmoothSegmentInto(param, a, b, ti, tj, segStartPt, ctxTimeOf, floorT);
+        break;
+      case 'hold':
+        if (policy.stepRampSec > 0) {
+          // Gain step clicks → anti-click micro-ramp (design §3.3 / D4).
+          param.setValueAtTime(startVal, segEndCtx);
+          param.linearRampToValueAtTime(b, floorT(ctxTimeOf(tj) + policy.stepRampSec));
+        } else {
+          // Frequency/position step is click-free (only the phase-advance rate changes, D3).
+          param.setValueAtTime(b, segEndCtx);
+        }
+        break;
+    }
+  }
+}
+
+/** The `smooth` piecewise-linear polyline (design §3.2) for `scheduleLane`: ~4
+ *  segments/sec landing exactly on the smoothstep, clamped to [MIN, MAX] segments.
+ *  Reads the SMOOTH_* constants from module scope (not opts). */
+function scheduleSmoothSegmentInto(
+  param: AudioParam,
+  a: number,
+  b: number,
+  ti: number,
+  tj: number,
+  segStartPt: number,
+  ctxTimeOf: (pt: number) => number,
+  floorT: (time: number) => number,
+): void {
+  const n = clampRange(
+    Math.round((tj - ti) / SMOOTH_SEGMENT_SEC),
+    SMOOTH_MIN_SEGMENTS,
+    SMOOTH_MAX_SEGMENTS,
+  );
+  for (let j = 1; j <= n; j++) {
+    const frac = j / n;
+    const subPt = ti + (tj - ti) * frac;
+    if (subPt <= segStartPt) continue; // skip sub-steps before the seek/offset
+    const val = a + (b - a) * smoothstep(frac);
+    param.linearRampToValueAtTime(val, floorT(ctxTimeOf(subPt)));
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 9. schedule — one lane onto a live Voice (design §8)
 // ---------------------------------------------------------------------------
 
@@ -600,6 +729,10 @@ export function schedule(
   let disposed = false;
 
   // --- base-curve scheduling (design §8.2) ---
+  // Thin in-closure adapter (design §8.7): bind the lane's data + policy, then delegate
+  // every AudioParam write to the shared `scheduleLane` primitive. The adapter is the
+  // only binaural-specific code left; the op-sequence it produces is byte-identical to
+  // the pre-extraction in-closure writer (`automation.test.ts` is the guardrail).
   function scheduleBaseCurve(
     p: Preset,
     startTime: number,
@@ -608,73 +741,22 @@ export function schedule(
     anchorOverride?: number,
   ): void {
     const dur = p.durationSec;
-    const ctxTimeOf = (pt: number): number => startTime + (pt - startOffsetSec);
-    const floorT = (time: number): number => Math.max(time, floorTime);
-
-    const anchorVal = anchorOverride ?? baseCore(p, param, clampTime(startOffsetSec, dur));
-    baseParam.setValueAtTime(anchorVal, floorT(startTime));
-
-    const kf = laneKeyframes(p, param);
-    for (let i = 0; i + 1 < kf.length; i++) {
-      const ti = kf[i].t;
-      const tj = kf[i + 1].t;
-      if (tj <= startOffsetSec) continue; // wholly before the offset
-      const a = kf[i].point.value;
-      const b = kf[i + 1].point.value;
-      const transition = kf[i].point.transition ?? DEFAULTS.paramTransition;
-      const segStartPt = Math.max(ti, startOffsetSec);
-      const segEndCtx = floorT(ctxTimeOf(tj));
-      const startVal = segStartPt === ti ? a : baseCore(p, param, segStartPt);
-      if (ti > startOffsetSec) {
-        // A full segment start (not the straddling one already covered by the lane anchor).
-        baseParam.setValueAtTime(startVal, floorT(ctxTimeOf(ti)));
-      }
-      switch (transition) {
-        case 'linear':
-          baseParam.linearRampToValueAtTime(b, segEndCtx);
-          break;
-        case 'exp':
-          if (expValid(a, b)) baseParam.exponentialRampToValueAtTime(b, segEndCtx);
-          else baseParam.linearRampToValueAtTime(b, segEndCtx);
-          break;
-        case 'smooth':
-          scheduleSmoothSegment(a, b, ti, tj, segStartPt, ctxTimeOf, floorT);
-          break;
-        case 'hold':
-          if (param === 'volume') {
-            // Gain step clicks → 10 ms anti-click micro-ramp (design §3.3 / D4).
-            baseParam.setValueAtTime(startVal, segEndCtx);
-            baseParam.linearRampToValueAtTime(b, floorT(ctxTimeOf(tj) + VOLUME_MICRORAMP_SEC));
-          } else {
-            // Frequency step is click-free (only the phase-advance rate changes, D3).
-            baseParam.setValueAtTime(b, segEndCtx);
-          }
-          break;
-      }
-    }
-  }
-
-  function scheduleSmoothSegment(
-    a: number,
-    b: number,
-    ti: number,
-    tj: number,
-    segStartPt: number,
-    ctxTimeOf: (pt: number) => number,
-    floorT: (time: number) => number,
-  ): void {
-    const n = clampRange(
-      Math.round((tj - ti) / SMOOTH_SEGMENT_SEC),
-      SMOOTH_MIN_SEGMENTS,
-      SMOOTH_MAX_SEGMENTS,
-    );
-    for (let j = 1; j <= n; j++) {
-      const frac = j / n;
-      const subPt = ti + (tj - ti) * frac;
-      if (subPt <= segStartPt) continue; // skip sub-steps before the seek/offset
-      const val = a + (b - a) * smoothstep(frac);
-      baseParam.linearRampToValueAtTime(val, floorT(ctxTimeOf(subPt)));
-    }
+    const points: LanePoint[] = laneKeyframes(p, param).map((k) => ({
+      t: k.t,
+      value: k.point.value,
+      transition: k.point.transition,
+    }));
+    scheduleLane(baseParam, points, {
+      startTime,
+      startOffsetSec,
+      floorTime,
+      anchorValue: anchorOverride ?? baseCore(p, param, clampTime(startOffsetSec, dur)),
+      valueAt: (t) => baseCore(p, param, t),
+      policy: {
+        stepRampSec: param === 'volume' ? VOLUME_MICRORAMP_SEC : 0,
+        expFallback: true,
+      },
+    });
   }
 
   // --- modulator scheduling (design §8.3–8.6) ---
@@ -1254,8 +1336,9 @@ function warbleTargetFor(voice: Voice, param: AutomatableParam): AudioParam {
 }
 
 function resolveModDepth(param: AutomatableParam, depth: number, base: number): number {
-  // volume + spatial are bounded [0,1] depths; carrier/beat are Hz depths bounded by
-  // the frequency floor/ceil against the lane's base value.
+  // volume + spatial are bounded [0,1] depths; carrier/beat depths arrive here already in Hz
+  // (resolveModPoint converted the stored percentage to a Hz swing at the keyframe base), so
+  // here we only apply the §8.5 safety clamp against the instantaneous base.
   if (param === 'volume' || param === 'spatial') return clampRange(depth, 0, 1);
   return clampFreqDepth(depth, base);
 }

@@ -9,7 +9,7 @@
   import PresetList from '../components/PresetList.svelte';
   import InstallPrompt from '../components/InstallPrompt.svelte';
 
-  const { session, library, install } = getAppContext();
+  const { session, library, install, ui } = getAppContext();
 
   onMount(() => {
     library.refresh();
@@ -45,7 +45,13 @@
   <PresetList
     items={library.items}
     selectedId={session.selectedId}
-    onopen={(id) => library.open(id)}
+    onopen={(id) => {
+      // Open a preset, then jump to the Advanced editor so the user lands ready to shape it.
+      // Navigate only on a SUCCESSFUL open (open() aborts on a dirty-discard cancel / a
+      // since-deleted row — both leave selectedId !== id), mirroring the onexport guard below.
+      library.open(id);
+      if (session.selectedId === id) ui.setTab('editor');
+    }}
     onexport={(id) => {
       // Export a saved row: adopt it as the working preset (honours dirty-confirm), then
       // export synchronously in the same gesture. Skip the export if the open was cancelled.

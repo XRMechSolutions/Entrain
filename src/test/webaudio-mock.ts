@@ -33,6 +33,8 @@ export type NodeKind =
   | 'merger'
   | 'waveshaper'
   | 'worklet'
+  | 'stereoPanner'
+  | 'bufferSource'
   | 'destination'
   | 'generic';
 
@@ -305,6 +307,66 @@ export class MockGainNode extends MockAudioNode {
   }
 }
 
+/** Minimal AudioBuffer shape the layer-engine reads (length / channels / sampleRate).
+ *  A zero-length buffer (length === 0) and mono / >2-channel buffers are valid here —
+ *  the engine tolerates them (layer-engine edge-cases §2). */
+export interface AudioBufferLike {
+  length: number;
+  numberOfChannels: number;
+  sampleRate: number;
+  duration: number;
+}
+
+/** Make a fake AudioBuffer for buffer-source tests. Defaults to a 1 s stereo 48k buffer;
+ *  pass `{ length: 0 }` for the zero-length edge, or `numberOfChannels: 1` / `3` for the
+ *  channel-count edges. */
+export function makeAudioBuffer(opts: Partial<AudioBufferLike> = {}): AudioBufferLike {
+  const sampleRate = opts.sampleRate ?? 48000;
+  const length = opts.length ?? sampleRate;
+  return {
+    length,
+    numberOfChannels: opts.numberOfChannels ?? 2,
+    sampleRate,
+    duration: length / sampleRate,
+  };
+}
+
+export class MockStereoPannerNode extends MockAudioNode {
+  /** Pan position, native range [-1, 1], default 0 (center). */
+  readonly pan: MockAudioParam;
+
+  constructor(context: MockAudioContext) {
+    super(context, 'stereoPanner');
+    this.pan = context.makeParam(0, { min: -1, max: 1 });
+  }
+}
+
+export class MockAudioBufferSourceNode extends MockScheduledSource {
+  /** The decoded buffer (or null until assigned). Mono / >2-channel / zero-length accepted. */
+  buffer: AudioBufferLike | null = null;
+  loop = false;
+  loopStart = 0;
+  loopEnd = 0;
+  readonly playbackRate: MockAudioParam;
+  readonly detune: MockAudioParam;
+
+  /** Counts start() calls so the engine's one-shot ALREADY_STARTED guard is testable
+   *  even though the mock itself does not throw on a second start. */
+  startCalls = 0;
+
+  constructor(context: MockAudioContext) {
+    super(context, 'bufferSource');
+    this.numberOfInputs = 0;
+    this.playbackRate = context.makeParam(1);
+    this.detune = context.makeParam(0);
+  }
+
+  override start(when = 0): void {
+    this.startCalls++;
+    super.start(when);
+  }
+}
+
 export class MockChannelMergerNode extends MockAudioNode {
   constructor(context: MockAudioContext, numberOfInputs: number) {
     super(context, 'merger');
@@ -401,6 +463,8 @@ export class MockAudioContext {
     mergers: [] as MockChannelMergerNode[],
     waveShapers: [] as MockWaveShaperNode[],
     worklets: [] as MockAudioWorkletNode[],
+    stereoPanners: [] as MockStereoPannerNode[],
+    bufferSources: [] as MockAudioBufferSourceNode[],
   };
 
   constructor(opts: MockAudioContextOptions = {}) {
@@ -444,6 +508,18 @@ export class MockAudioContext {
   createWaveShaper(): MockWaveShaperNode {
     const node = new MockWaveShaperNode(this);
     this.created.waveShapers.push(node);
+    return node;
+  }
+
+  createStereoPanner(): MockStereoPannerNode {
+    const node = new MockStereoPannerNode(this);
+    this.created.stereoPanners.push(node);
+    return node;
+  }
+
+  createBufferSource(): MockAudioBufferSourceNode {
+    const node = new MockAudioBufferSourceNode(this);
+    this.created.bufferSources.push(node);
     return node;
   }
 }
