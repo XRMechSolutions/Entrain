@@ -26,6 +26,7 @@
   import NodeInspector from '../editor/NodeInspector.svelte';
   import LayerList from '../editor/LayerList.svelte';
   import LayerInspector from '../editor/LayerInspector.svelte';
+  import NarrationEditor from '../editor/NarrationEditor.svelte';
   import DurationControl from '../components/DurationControl.svelte';
   import WaveformPicker from '../components/WaveformPicker.svelte';
   import ClipPanel from '../components/ClipPanel.svelte';
@@ -40,7 +41,7 @@
   }
 
   // ----- Phase-2: which Editor sub-view is active + which layer is selected -----
-  type SubTab = 'nodes' | 'layers' | 'clips' | 'export';
+  type SubTab = 'nodes' | 'layers' | 'clips' | 'narration' | 'export';
   let subTab = $state<SubTab>('nodes');
   let selectedLayerId = $state<string | null>(null);
 
@@ -154,7 +155,7 @@
     <!-- Phase-2 Editor sub-tabs + header actions (design §16.3). Render/Import are
          capability-gated inside their own components, never width-hidden. -->
     <nav class="subtabs" aria-label="Editor sections">
-      {#each [['nodes', 'Nodes'], ['layers', 'Layers'], ['clips', 'Clips'], ['export', 'Export']] as const as [id, label] (id)}
+      {#each [['nodes', 'Nodes'], ['layers', 'Layers'], ['clips', 'Clips'], ['narration', 'Narration'], ['export', 'Export']] as const as [id, label] (id)}
         <button
           type="button"
           class="subtab"
@@ -172,6 +173,8 @@
       <LayerList {layers} selectedId={inspectedLayerId} onadd={addLayer} onedit={editLayer} onremove={removeLayer} />
     {:else if subTab === 'clips'}
       <ClipPanel mode={clips.mode} onpick={(id) => clips.pick(id)} />
+    {:else if subTab === 'narration'}
+      <NarrationEditor />
     {:else if subTab === 'export'}
       <div class="export-actions">
         <RenderSheet />

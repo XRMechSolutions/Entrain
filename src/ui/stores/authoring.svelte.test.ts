@@ -358,3 +358,38 @@ describe('VoiceScriptStore — ensureNarrationForPlayback (auto-synth-on-play, D
     expect(compileVoiceScript).toHaveBeenCalledTimes(1); // guarded by preset identity
   });
 });
+
+describe('VoiceScriptStore — edit re-arms + replaces cues (D-043 full editing)', () => {
+  it('a script edit (new identity) re-synthesizes and REPLACES the cue, never duplicates it', async () => {
+    const { session, notices } = makeSession();
+    session.reset({ ...createDefaultPreset(), voiceScript: { version: 1, blocks: [{ lines: [{ say: 'one' }] }] } });
+    // compiler returns a cue whose clipId tracks the spoken text, so a replacement is observable
+    const compile = vi.fn(async (script: unknown) => {
+      const say = (script as { blocks: { lines: { say: string }[] }[] }).blocks[0].lines[0].say;
+      return {
+        ok: true,
+        compiled: { layers: [{ id: 'vs_0_0_0', kind: 'voice', source: { clipId: `clip_${say}` }, t: 5 }], clips: [], totalSec: 6 },
+        issues: [],
+      };
+    });
+    const store = createVoiceScriptStore({
+      session,
+      notices,
+      tts: fakeTts,
+      clipLib: { importVia: vi.fn() as never },
+      compileVoiceScript: compile as never,
+    });
+
+    await store.ensureNarrationForPlayback();
+    expect(session.preset.layers).toHaveLength(1);
+    expect((session.preset.layers![0].source as { clipId: string }).clipId).toBe('clip_one');
+
+    // Edit the prompt → setVoiceScript assigns a new identity → the next play re-arms.
+    session.setVoiceScript({ version: 1, blocks: [{ lines: [{ say: 'two' }] }] });
+    await store.ensureNarrationForPlayback();
+
+    expect(compile).toHaveBeenCalledTimes(2); // re-armed by the edit
+    expect(session.preset.layers).toHaveLength(1); // REPLACED, not stacked
+    expect((session.preset.layers![0].source as { clipId: string }).clipId).toBe('clip_two');
+  });
+});

@@ -24,6 +24,7 @@ import {
   sortNodes,
   voiceView as voiceViewModel,
   type AutomatableParam,
+  type EmbeddedVoiceScript,
   type Layer,
   type LayerKind,
   type LayerSource,
@@ -261,6 +262,17 @@ export interface SessionStore {
    *  "stream in" mid-playback (auto-synth-on-play, D-043) — passes straight through to
    *  transport.refreshLayers(). No-op unless playing. */
   refreshLayers(): Promise<void>;
+
+  /** The working preset's embedded narration script (D-043), or undefined. Read by the
+   *  narration editor; the play coordinator compiles it on play. */
+  readonly voiceScript: EmbeddedVoiceScript | undefined;
+  /** Replace the embedded narration script. Deep-cloned and given a NEW identity so the next
+   *  play recompiles + re-synthesizes the changed lines (incremental). `undefined` removes it. */
+  setVoiceScript(script: EmbeddedVoiceScript | undefined): void;
+  /** Swap the script-generated voice cues (ids `vs_*`) for a freshly compiled set, leaving
+   *  manually-added layers (`layer_*`) untouched — so an edited prompt REPLACES its cue rather
+   *  than duplicating it. Used by the play coordinator after a recompile. */
+  replaceNarrationLayers(layers: readonly Layer[]): void;
 
   // --- state transitions used by the library store's save/import flows (these change
   //     selectedId/dirty WITHOUT reloading transport, which reset() would do) ---
@@ -756,6 +768,31 @@ export function createSessionStore(deps: { transport: Transport; playback: Playb
       // reapply() only retargets existing lanes; newly-injected cues need their nodes BUILT (and
       // their now-present clip buffers decoded), which only this does.
       return transport.refreshLayers();
+    },
+
+    get voiceScript() {
+      return preset.voiceScript;
+    },
+
+    setVoiceScript(script: EmbeddedVoiceScript | undefined) {
+      // Assign a fresh deep clone (new object identity) so the play-coordinator's reference guard
+      // re-arms and the next play recompiles — feature C then re-synthesizes only the lines whose
+      // words/voice/rate actually changed. undefined removes the embedded narration entirely.
+      if (script === undefined) delete preset.voiceScript;
+      else preset.voiceScript = structuredClone(script);
+      commit();
+    },
+
+    replaceNarrationLayers(newLayers: readonly Layer[]) {
+      // Drop the previous script-generated cues (ids `vs_*`) and append the freshly compiled set;
+      // manual layers (`layer_*`) are preserved. So a reworded prompt replaces its cue (its
+      // positional id is stable but its clipId changed) instead of stacking a duplicate.
+      const arr = layers();
+      const kept = arr.filter((l) => !l.id.startsWith('vs_'));
+      arr.length = 0;
+      for (const l of kept) arr.push(l);
+      for (const l of newLayers) arr.push(l);
+      commit();
     },
 
     markSaved(id: string) {

@@ -402,3 +402,39 @@ describe('SessionStore — multi-voice (v6)', () => {
     expect(session.preset.nodes[0].beat?.value).toBe(4);
   });
 });
+
+describe('SessionStore — voiceScript editing (D-043)', () => {
+  const SCRIPT = { version: 1, purpose: 'meditation', blocks: [{ lines: [{ say: 'hi' }] }] };
+
+  it('voiceScript getter reflects the preset; setVoiceScript deep-clones (new identity) + marks dirty', () => {
+    const { session } = setup();
+    expect(session.voiceScript).toBeUndefined();
+    session.setVoiceScript(SCRIPT);
+    expect(session.voiceScript).toEqual(SCRIPT);
+    expect(session.voiceScript).not.toBe(SCRIPT); // deep-cloned, not aliased (re-arms the play guard)
+    expect(session.dirty).toBe(true);
+  });
+
+  it('setVoiceScript(undefined) removes the embedded narration', () => {
+    const { session } = setup();
+    session.setVoiceScript(SCRIPT);
+    session.setVoiceScript(undefined);
+    expect(session.voiceScript).toBeUndefined();
+  });
+
+  it('replaceNarrationLayers swaps vs_* cues but preserves manual layer_* layers', () => {
+    const { session } = setup();
+    session.injectLayers([
+      { id: 'layer_1', kind: 'ambiance', source: { clipId: 'amb' }, t: 0 } as never,
+      { id: 'vs_0_0_0', kind: 'voice', source: { clipId: 'old' }, t: 5 } as never,
+    ]);
+    session.replaceNarrationLayers([
+      { id: 'vs_0_0_0', kind: 'voice', source: { clipId: 'new' }, t: 7 } as never,
+      { id: 'vs_0_1_0', kind: 'voice', source: { clipId: 'new2' }, t: 12 } as never,
+    ]);
+    const layers = session.preset.layers ?? [];
+    expect(layers.map((l) => l.id)).toEqual(['layer_1', 'vs_0_0_0', 'vs_0_1_0']); // manual kept, vs_ replaced
+    const cue = layers.find((l) => l.id === 'vs_0_0_0');
+    expect((cue!.source as { clipId: string }).clipId).toBe('new'); // points at the re-synthesized clip
+  });
+});

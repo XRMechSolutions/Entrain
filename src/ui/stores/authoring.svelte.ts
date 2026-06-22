@@ -303,18 +303,20 @@ export function createVoiceScriptStore(deps: {
       });
   }
 
-  // Tracks the preset object we've already auto-synthesized for, so entering 'playing' again
-  // (pause/resume, re-press play) doesn't recompile. A new preset load (new object identity)
-  // re-arms it; a transient failure clears it so the next play retries.
-  let ensuredFor: object | null = null;
+  // Tracks the exact voiceScript object we've already auto-synthesized for, so entering 'playing'
+  // again (pause/resume, re-press play) doesn't recompile. Keyed on the SCRIPT reference, not the
+  // preset: editing the narration assigns a new script identity (session.setVoiceScript), which
+  // re-arms this so the next play recompiles + re-synthesizes only the changed lines. A new preset
+  // load also brings a new script identity; a transient failure clears it so the next play retries.
+  let ensuredScript: unknown = null;
 
   async function ensureNarrationForPlayback(): Promise<void> {
     if (!canCompile || !tts) return; // no studio TTS (e.g. mobile) → beats play, narration silent
     const preset = session.preset;
-    const script = (preset as { voiceScript?: unknown }).voiceScript;
+    const script = preset.voiceScript;
     if (!script || typeof script !== 'object') return; // preset carries no embedded narration
-    if (ensuredFor === preset) return; // already prepared this working preset
-    ensuredFor = preset;
+    if (ensuredScript === script) return; // this exact script already prepared
+    ensuredScript = script;
     try {
       const res = await compileVoiceScript(script as never, {
         tts,
@@ -325,14 +327,13 @@ export function createVoiceScriptStore(deps: {
         notices.push({ severity: 'error', message: `Couldn't prepare narration — ${issuesList(res.issues)}` });
         return;
       }
-      // Inject only cues not already in the preset (idempotent across replays), then rebuild the
-      // LIVE layer subsystem so the freshly-synthesized clips stream in for the rest of the run.
-      const have = new Set((preset.layers ?? []).map((l) => l.id));
-      const fresh = res.compiled.layers.filter((l) => !have.has(l.id));
-      if (fresh.length > 0) session.injectLayers(fresh);
+      // REPLACE the script's cues (an edited line keeps its positional id but points at a new
+      // clip), then rebuild the LIVE layer subsystem so the freshly-synthesized clips stream in
+      // for the rest of the run. Manual (non-`vs_`) layers are left untouched.
+      session.replaceNarrationLayers(res.compiled.layers);
       await session.refreshLayers();
     } catch (e) {
-      ensuredFor = null; // transient failure (e.g. model load) → let the next play retry
+      ensuredScript = null; // transient failure (e.g. model load) → let the next play retry
       const message = e instanceof Error ? e.message : String(e);
       notices.push({ severity: 'error', message: `Couldn't prepare narration: ${message}` });
     }
