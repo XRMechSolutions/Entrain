@@ -26,7 +26,16 @@
     <h1 class="title">Library</h1>
     <div class="header-actions">
       <button type="button" class="hbtn" onclick={newSession}>New</button>
-      <button type="button" class="hbtn" onclick={() => library.importFromFile()}>Import</button>
+      <button
+        type="button"
+        class="hbtn"
+        onclick={() => {
+          // importFromFile() opens the picker IN this click (gesture, edge E11), auto-saves the
+          // file, then resolves true — jump to the Advanced editor so the user lands ready to shape it.
+          void library.importFromFile().then((ok) => {
+            if (ok) ui.setTab('editor');
+          });
+        }}>Import</button>
       <button type="button" class="hbtn" onclick={() => library.restoreDefaults()}>Restore defaults</button>
       <InstallPrompt
         canInstall={install.canInstall}

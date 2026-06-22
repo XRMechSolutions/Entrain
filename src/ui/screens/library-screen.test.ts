@@ -70,16 +70,23 @@ describe('LibraryScreen (design §7)', () => {
     expect(ctx.session.dirty).toBe(false);
   });
 
-  it('Import runs importPresetFromFile directly in the click (gesture, edge E11)', async () => {
+  it('Import opens the picker in the click (gesture, edge E11), auto-saves, and jumps to the editor', async () => {
+    const importedPreset = createDefaultPreset();
     vi.mocked(importPresetFromFile).mockResolvedValue({
-      preset: createDefaultPreset(),
+      preset: importedPreset,
       migratedFrom: null,
       warnings: [],
       filename: 'x.json',
     });
-    const { getByRole } = renderLibrary();
+    vi.mocked(savePreset).mockReturnValue({ id: 'imp-1', createdAt: 0, updatedAt: 1, preset: importedPreset, warnings: [] });
+    const { getByRole, ctx } = renderLibrary();
+    expect(ctx.ui.tab).toBe('player'); // default screen
     await fireEvent.click(getByRole('button', { name: 'Import' }));
-    expect(importPresetFromFile).toHaveBeenCalledTimes(1);
+    expect(importPresetFromFile).toHaveBeenCalledTimes(1); // picker opened in the gesture
+    await new Promise((r) => setTimeout(r)); // let the import promise resolve
+    expect(savePreset).toHaveBeenCalledWith(importedPreset); // auto-saved, no manual Save
+    expect(ctx.session.selectedId).toBe('imp-1'); // adopted as the selected working preset
+    expect(ctx.ui.tab).toBe('editor'); // …and navigated to Advanced
   });
 
   it('Export current runs exportPreset directly in the click and toasts the filename', async () => {

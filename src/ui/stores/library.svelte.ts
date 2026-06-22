@@ -50,7 +50,10 @@ export interface LibraryStore {
   saveAsNew(): void;
   remove(id: string): void;
   exportCurrent(): void;
-  importFromFile(): void;
+  /** Import a preset file: auto-save it into the library and adopt it as the selected,
+   *  clean working preset (no separate Save). Resolves true when a preset was imported and
+   *  saved (the caller navigates to the editor on true), false on cancel/error. */
+  importFromFile(): Promise<boolean>;
 }
 
 function confirmDiscard(): boolean {
@@ -192,23 +195,32 @@ export function createLibraryStore(deps: { session: SessionStore; notices: Notic
     }
   }
 
-  function importFromFile(): void {
+  function importFromFile(): Promise<boolean> {
     // importPresetFromFile() opens the picker synchronously (gesture-safe) and resolves
-    // after the user chooses a file. Import does NOT auto-save — the user reviews, then
-    // Saves (E9, persistence contract), so the working preset is marked dirty/unsaved.
+    // after the user chooses a file. On success we save it straight into the library and
+    // adopt it as the selected, clean working preset — so the user lands in the editor
+    // ready to shape it, with no separate Save step. We save BEFORE reset(), so a failed
+    // save (e.g. QUOTA_EXCEEDED) leaves the current working preset untouched. Resolves true
+    // only when an import was saved (the caller navigates on true), false on cancel/error.
     loading = true;
-    importPresetFromFile()
+    return importPresetFromFile()
       .then((imported) => {
-        session.reset(imported.preset, null);
-        session.markUnsaved();
+        const savedRec = savePreset(imported.preset);
+        session.reset(imported.preset, savedRec.id);
+        refresh();
+        notices.push({ severity: 'info', message: `Added "${imported.preset.name}" to your library.` });
         if (imported.migratedFrom !== null) {
           notices.push({ severity: 'info', message: `Upgraded from schema v${imported.migratedFrom}` });
         }
         if (imported.warnings.length > 0) {
           notices.push({ severity: 'info', message: `Imported with notes — ${issuesList(imported.warnings)}` });
         }
+        return true;
       })
-      .catch(handleError)
+      .catch((e) => {
+        handleError(e);
+        return false;
+      })
       .finally(() => {
         loading = false;
       });

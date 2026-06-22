@@ -18,6 +18,7 @@
 import type { Preset } from './session-model';
 
 import sleep8h from '../../presets/8h-sleep-cycles.json';
+import sleep8hV2 from '../../presets/8h-sleep-cycles-v2.json';
 import nap20 from '../../presets/power-nap-20.json';
 import nap40 from '../../presets/power-nap-40.json';
 import nap60 from '../../presets/power-nap-60.json';
@@ -42,6 +43,7 @@ const localFocusSessions = Object.keys(localFocusModules)
 // guaranteed at runtime by the seed-time validate(), not by this cast.
 export const DEFAULT_SESSIONS: Preset[] = [
   sleep8h,
+  sleep8hV2,
   nap20,
   nap40,
   nap60,

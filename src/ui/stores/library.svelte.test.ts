@@ -176,7 +176,7 @@ describe('LibraryStore — happy paths', () => {
     expect(notices.items.at(-1)?.message).toMatch(/full/i);
   });
 
-  it('importFromFile() reviews into the session as UNSAVED and toasts a migration', async () => {
+  it('importFromFile() auto-saves the import, selects it clean, and toasts a migration', async () => {
     const { library, session, notices } = setup();
     const imported: ImportedPreset = {
       preset: createDefaultPreset(),
@@ -185,11 +185,32 @@ describe('LibraryStore — happy paths', () => {
       filename: 'old.json',
     };
     vi.mocked(importPresetFromFile).mockResolvedValue(imported);
-    library.importFromFile();
-    await flush();
-    expect(session.reset).toHaveBeenCalledWith(imported.preset, null);
-    expect(session.markUnsaved).toHaveBeenCalled();
+    vi.mocked(savePreset).mockReturnValue(saved('imp-1'));
+    vi.mocked(listPresets).mockReturnValue([summary('imp-1', 5)]);
+    const ok = await library.importFromFile();
+    expect(ok).toBe(true);
+    expect(savePreset).toHaveBeenCalledWith(imported.preset); // saved with no id → new library entry
+    expect(session.reset).toHaveBeenCalledWith(imported.preset, 'imp-1'); // selected + clean, no markUnsaved
+    expect(session.markUnsaved).not.toHaveBeenCalled();
+    expect(library.items).toHaveLength(1); // refreshed
     expect(notices.items.some((n) => /schema v1/.test(n.message))).toBe(true);
+  });
+
+  it('importFromFile() resolves false and does not select when the save fails', async () => {
+    const { library, session, notices } = setup();
+    vi.mocked(importPresetFromFile).mockResolvedValue({
+      preset: createDefaultPreset(),
+      migratedFrom: null,
+      warnings: [],
+      filename: 'x.json',
+    });
+    vi.mocked(savePreset).mockImplementation(() => {
+      throw new PersistenceError('QUOTA_EXCEEDED', 'full');
+    });
+    const ok = await library.importFromFile();
+    expect(ok).toBe(false);
+    expect(session.reset).not.toHaveBeenCalled(); // working preset left untouched
+    expect(notices.items.at(-1)?.message).toMatch(/full/i);
   });
 });
 
