@@ -10,6 +10,9 @@
   import { formatHz, formatPan, formatPercent } from '../lib/format';
   import type { AutomatableParam } from '../../engine/session-model';
 
+  interface Props { voiceId?: string | undefined }
+  const { voiceId = undefined }: Props = $props();
+
   const { session, playback } = getAppContext();
 
   function rev<T>(read: () => T): T {
@@ -23,7 +26,7 @@
 
   function live(param: AutomatableParam): number {
     void session.revision; // recompute if the preset changes (load); tNow covers the playhead
-    return valueAt(session.preset, param, tNow);
+    return valueAt(session.voiceView(voiceId), param, tNow);
   }
   const carrier = $derived(live('carrier'));
   const beat = $derived(live('beat'));

@@ -18,9 +18,11 @@ import {
 } from '../../engine/automation';
 import {
   createDefaultPreset,
+  DEFAULTS,
   LIMITS,
   RANGES,
   sortNodes,
+  voiceView as voiceViewModel,
   type AutomatableParam,
   type Layer,
   type LayerKind,
@@ -32,6 +34,7 @@ import {
   type Preset,
   type TimeNode,
   type ToneSpec,
+  type Voice,
   type Waveform,
 } from '../../engine/session-model';
 import { DEFAULT_TONE_SPEC } from '../lib/constants';
@@ -182,11 +185,18 @@ export interface SessionStore {
   readonly revision: number;
   readonly dirty: boolean;
   readonly selectedId: string | null;
+  /** The extra voices (voice 0 is the top-level `preset.nodes`, never in this array).
+   *  Empty when the preset is single-voice (absent `voices`). */
+  readonly voices: readonly Voice[];
 
   reset(next: Preset, selectedId?: string | null): void;
 
-  setNodeParam(param: AutomatableParam, value: number): void;
-  setWaveform(w: Waveform): void;
+  // ----- Node mutators. Each takes a TRAILING optional `voiceId?`: `undefined` (and any
+  //       unknown/stale id) ⇒ the primary voice 0 (`preset.nodes`); a known id ⇒ that voice's
+  //       nodes. Routed through `targetNodes(voiceId)`, which never throws on a missing id. With
+  //       no voiceId the behavior is byte-identical to single-voice authoring. -----
+  setNodeParam(param: AutomatableParam, value: number, voiceId?: string): void;
+  setWaveform(w: Waveform, voiceId?: string): void;
   setName(name: string): void;
   setMasterGain(v: number): void;
   /** Set the working preset's total duration (seconds), clamped to (0, LIMITS max].
@@ -194,12 +204,31 @@ export interface SessionStore {
    *  on the next play() (never a mid-session duration change). */
   setDuration(sec: number): void;
 
-  addNode(t: number, param: AutomatableParam): string;
-  moveNode(index: number, t: number): void;
-  setNodeValue(index: number, param: AutomatableParam, value: number): void;
-  setNodeTransition(index: number, param: AutomatableParam, tr: ParamTransition): void;
-  setNodeMod(index: number, param: AutomatableParam, mod: Partial<ModPatch> | null | undefined): void;
-  removeNode(index: number): void;
+  addNode(t: number, param: AutomatableParam, voiceId?: string): string;
+  moveNode(index: number, t: number, voiceId?: string): void;
+  setNodeValue(index: number, param: AutomatableParam, value: number, voiceId?: string): void;
+  setNodeTransition(index: number, param: AutomatableParam, tr: ParamTransition, voiceId?: string): void;
+  setNodeMod(index: number, param: AutomatableParam, mod: Partial<ModPatch> | null | undefined, voiceId?: string): void;
+  removeNode(index: number, voiceId?: string): void;
+
+  // ----- Multi-voice authoring (v6, D-040/D-042; multi-voice-architecture §5). `voiceView`
+  //       projects a single voice's nodes onto a Preset-shaped view (shared session-model helper
+  //       §1.5) so render == playback == preview. `setVoiceGain` is BOTH an edit-time write and a
+  //       live trim ramp (mirrors setMasterGain). `addVoice`/`removeVoice` are STRUCTURAL count
+  //       changes: mutate + `transport.load` rebuild — NOT a live reapply, and NOT `reset()`. -----
+  /** A Preset-shaped projection of one voice's nodes (shares the nodes BY REFERENCE).
+   *  `undefined`/unknown id ⇒ the primary voice 0. Never throws on a missing id. */
+  voiceView(voiceId?: string): Preset;
+  /** Append a new default extra voice; returns its generated id, or `null` if at the cap
+   *  (`1 + voices.length >= LIMITS.maxVoices`). Structural ⇒ `transport.load` rebuild. */
+  addVoice(): string | null;
+  /** Remove the extra voice with `voiceId` (no-op on an unknown id). Structural rebuild.
+   *  Does NOT touch the caller's active-voice selection (that is the EditorScreen's job). */
+  removeVoice(voiceId: string): void;
+  setVoiceName(voiceId: string, name: string): void;
+  /** Clamp to RANGES.voiceGain [0,1], write `preset.voices[k].gain` (edit-time, survives a
+   *  save) AND ramp the live trim via transport.setVoiceTrim (D-042) — no reschedule. */
+  setVoiceGain(voiceId: string, value: number): void;
 
   applyLiveEdit(): void;
 
@@ -227,6 +256,11 @@ export interface SessionStore {
   /** Append compiled VoiceScript layers into preset.layers (their absolute t already
    *  computed by the compiler — design §20). Bumps revision, dirty, applyLiveEdit(). */
   injectLayers(layers: readonly Layer[]): void;
+
+  /** Rebuild the running layer subsystem at the current position so freshly-synthesized clips
+   *  "stream in" mid-playback (auto-synth-on-play, D-043) — passes straight through to
+   *  transport.refreshLayers(). No-op unless playing. */
+  refreshLayers(): Promise<void>;
 
   // --- state transitions used by the library store's save/import flows (these change
   //     selectedId/dirty WITHOUT reloading transport, which reset() would do) ---
@@ -362,6 +396,33 @@ export function createSessionStore(deps: { transport: Transport; playback: Playb
     return kind === 'tone' ? { synth: { ...DEFAULT_TONE_SPEC } } : { clipId: '' };
   }
 
+  // ----- Multi-voice helpers (v6) --------------------------------------------------------
+
+  /** Resolve the node-bearing container an edit targets. SENTINEL: `undefined` — and any
+   *  unknown/stale id — falls back to the primary voice 0 (the Preset itself, whose `.nodes`
+   *  is voice 0). NEVER throws on a missing id (D-040). Returns the container (not the array)
+   *  so reassigning callers (addNode/moveNode/sortNodes) can write `.nodes` back uniformly —
+   *  both `Preset` and `Voice` expose `nodes: TimeNode[]`. */
+  function targetNodes(voiceId?: string): { nodes: TimeNode[] } {
+    if (voiceId === undefined) return preset;
+    return preset.voices?.find((v) => v.id === voiceId) ?? preset;
+  }
+
+  /** A collision-free unique voice id (the primary voice has none; these are extra voices). */
+  function freshVoiceId(): string {
+    const existing = new Set((preset.voices ?? []).map((v) => v.id));
+    let n = existing.size + 1;
+    let id = `voice_${n}`;
+    while (existing.has(id)) id = `voice_${++n}`;
+    return id;
+  }
+
+  /** A valid default extra voice: a single binaural carrier at t=0, separated ~ratio 1.25
+   *  from the primary's 200 Hz default so the two voices don't mask/cross-beat (§6). */
+  function defaultVoiceNodes(): TimeNode[] {
+    return [{ t: 0, carrier: { value: 250 }, beat: { value: 8 }, volume: { value: 1 } }];
+  }
+
   const store: SessionStore = {
     get preset() {
       return preset;
@@ -375,6 +436,9 @@ export function createSessionStore(deps: { transport: Transport; playback: Playb
     get selectedId() {
       return selectedId;
     },
+    get voices() {
+      return preset.voices ?? [];
+    },
 
     reset(next: Preset, id: string | null = null) {
       preset = next; // adopt BY REFERENCE as the new source of truth
@@ -384,15 +448,15 @@ export function createSessionStore(deps: { transport: Transport; playback: Playb
       bump();
     },
 
-    setNodeParam(param: AutomatableParam, value: number) {
+    setNodeParam(param: AutomatableParam, value: number, voiceId?: string) {
       const clamped = clampParam(param, value);
       if (clamped === null) return;
-      paramPoint(preset.nodes[0], param).value = clamped;
+      paramPoint(targetNodes(voiceId).nodes[0], param).value = clamped;
       commit();
     },
 
-    setWaveform(w: Waveform) {
-      preset.nodes[0].waveform = w;
+    setWaveform(w: Waveform, voiceId?: string) {
+      targetNodes(voiceId).nodes[0].waveform = w;
       commit();
     },
 
@@ -432,27 +496,32 @@ export function createSessionStore(deps: { transport: Transport; playback: Playb
       bump();
     },
 
-    addNode(t: number, param: AutomatableParam): string {
+    addNode(t: number, param: AutomatableParam, voiceId?: string): string {
+      const target = targetNodes(voiceId);
       const clampedT = Math.min(preset.durationSec, Math.max(0, t));
       // Carry-forward value so adding a node does not change the sound until it is moved (J4).
-      const carry = clampParam(param, baseValueAt(preset, param, clampedT)) ?? RANGES[param].min;
+      // baseValueAt reads the TARGET voice's nodes via its voiceView (not always voice 0).
+      const carry =
+        clampParam(param, baseValueAt(voiceViewModel(preset, target.nodes), param, clampedT)) ??
+        RANGES[param].min;
       const node: TimeNode = { t: clampedT, [param]: { value: carry } };
-      preset.nodes = sortNodes([...preset.nodes, node]);
+      target.nodes = sortNodes([...target.nodes, node]);
       commit();
-      return String(preset.nodes.indexOf(node));
+      return String(target.nodes.indexOf(node));
     },
 
-    moveNode(index: number, t: number) {
+    moveNode(index: number, t: number, voiceId?: string) {
       if (index === 0) return; // nodes[0] is pinned at t=0 (J2)
-      const node = preset.nodes[index];
+      const target = targetNodes(voiceId);
+      const node = target.nodes[index];
       if (!node) return;
       node.t = Math.min(preset.durationSec, Math.max(0, t));
-      preset.nodes = sortNodes(preset.nodes);
+      target.nodes = sortNodes(target.nodes);
       commit();
     },
 
-    setNodeValue(index: number, param: AutomatableParam, value: number) {
-      const node = preset.nodes[index];
+    setNodeValue(index: number, param: AutomatableParam, value: number, voiceId?: string) {
+      const node = targetNodes(voiceId).nodes[index];
       if (!node) return;
       const clamped = clampParam(param, value);
       if (clamped === null) return;
@@ -460,15 +529,15 @@ export function createSessionStore(deps: { transport: Transport; playback: Playb
       commit();
     },
 
-    setNodeTransition(index: number, param: AutomatableParam, tr: ParamTransition) {
-      const node = preset.nodes[index];
+    setNodeTransition(index: number, param: AutomatableParam, tr: ParamTransition, voiceId?: string) {
+      const node = targetNodes(voiceId).nodes[index];
       if (!node) return;
       paramPoint(node, param).transition = tr;
       commit();
     },
 
-    setNodeMod(index: number, param: AutomatableParam, mod: Partial<ModPatch> | null | undefined) {
-      const node = preset.nodes[index];
+    setNodeMod(index: number, param: AutomatableParam, mod: Partial<ModPatch> | null | undefined, voiceId?: string) {
+      const node = targetNodes(voiceId).nodes[index];
       if (!node) return;
       const pp = paramPoint(node, param);
       if (mod === undefined) delete pp.mod; // carry
@@ -477,14 +546,74 @@ export function createSessionStore(deps: { transport: Transport; playback: Playb
       commit();
     },
 
-    removeNode(index: number) {
+    removeNode(index: number, voiceId?: string) {
       if (index === 0) return; // refuse to remove the start node (carrier required, J2)
-      if (index < 0 || index >= preset.nodes.length) return;
-      preset.nodes.splice(index, 1);
+      const target = targetNodes(voiceId);
+      if (index < 0 || index >= target.nodes.length) return;
+      target.nodes.splice(index, 1);
       commit();
     },
 
     applyLiveEdit,
+
+    // ----- Multi-voice authoring (v6) -----
+
+    voiceView(voiceId?: string): Preset {
+      // DELEGATE to the shared session-model helper, sharing the voice's nodes BY REFERENCE
+      // (never a hand-rolled literal) so render == playback == preview stay byte-identical (§1.5).
+      return voiceViewModel(preset, targetNodes(voiceId).nodes);
+    },
+
+    addVoice(): string | null {
+      // Cap is the `1 + voices.length` formula (counts the primary) — mirrors LIMITS.maxVoices.
+      const total = 1 + (preset.voices?.length ?? 0);
+      if (total >= LIMITS.maxVoices) return null;
+      if (!preset.voices) preset.voices = [];
+      const id = freshVoiceId();
+      preset.voices.push({ id, gain: DEFAULTS.voiceGain, nodes: defaultVoiceNodes() });
+      // STRUCTURAL count change: mutate + rebuild via transport.load (like a duration change),
+      // NOT a live reapply. Deliberately NOT session.reset() — that would clear dirty +
+      // selectedId, losing the unsaved-changes guard and detaching the loaded library record.
+      dirty = true;
+      bump();
+      transport.load(preset);
+      return id;
+    },
+
+    removeVoice(voiceId: string) {
+      const arr = preset.voices;
+      if (!arr) return;
+      const idx = arr.findIndex((v) => v.id === voiceId);
+      if (idx === -1) return; // unknown id: no-op
+      arr.splice(idx, 1);
+      if (arr.length === 0) delete preset.voices; // sparseness: absent voices = single-voice
+      // STRUCTURAL rebuild (see addVoice). Active-voice reselection to Primary is the caller's
+      // (EditorScreen's) concern — this store holds no activeVoiceId.
+      dirty = true;
+      bump();
+      transport.load(preset);
+    },
+
+    setVoiceName(voiceId: string, name: string) {
+      const voice = preset.voices?.find((v) => v.id === voiceId);
+      if (!voice) return;
+      // Name is not audible — dirty + revision only, no reschedule (mirrors setName).
+      voice.name = name;
+      dirty = true;
+      bump();
+    },
+
+    setVoiceGain(voiceId: string, value: number) {
+      if (!Number.isFinite(value)) return;
+      const voice = preset.voices?.find((v) => v.id === voiceId);
+      if (!voice) return;
+      const r = RANGES.voiceGain;
+      const clamped = Math.min(r.max, Math.max(r.min, value));
+      voice.gain = clamped; // edit-time channel: written into the preset, survives a save
+      transport.setVoiceTrim(voiceId, clamped); // live channel (D-042): cheap ramp, NO reschedule
+      dirty = true;
+      bump();
+    },
 
     // ----- Phase-2 layer authoring -----
 
@@ -620,6 +749,13 @@ export function createSessionStore(deps: { transport: Transport; playback: Playb
       const arr = layers();
       for (const l of incoming) arr.push(l);
       commit();
+    },
+
+    refreshLayers() {
+      // Authoritative rebuild of the layer subsystem at the live position (D-043). injectLayers'
+      // reapply() only retargets existing lanes; newly-injected cues need their nodes BUILT (and
+      // their now-present clip buffers decoded), which only this does.
+      return transport.refreshLayers();
     },
 
     markSaved(id: string) {

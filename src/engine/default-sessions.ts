@@ -9,7 +9,9 @@
 // binaural work sessions — beta focus and alpha/alpha->theta creative (all with beat warble
 // + spatial drift) — plus three isochronic focus pulses (beta 15/18 + gamma 40): physically-
 // present amplitude gating with beat:0, not a binaural beat, so they need no headphones and
-// reach gamma 40, which the binaural beat lane (capped at 35 Hz) cannot.
+// reach gamma 40, which the binaural beat lane (capped at 35 Hz) cannot. Plus one multi-voice
+// (v6) meditation: two simultaneous binaural beats on well-separated carriers (alpha on 200 Hz +
+// theta on 256 Hz) — the seed example for the dual-beat + narration authoring flow.
 import type { Preset } from './session-model';
 
 import sleep8h from '../../presets/8h-sleep-cycles.json';
@@ -23,8 +25,9 @@ import createAlphaTheta from '../../presets/create-alpha-theta-warble-drift.json
 import focusGamma40 from '../../presets/focus-gamma-40-isochronic-drift.json';
 import focusBeta15Iso from '../../presets/focus-beta-15-isochronic-drift.json';
 import deepWorkBeta18Iso from '../../presets/deep-work-beta-18-isochronic-drift.json';
+import dualBeatMeditation from '../../presets/dual-beat-meditation.json';
 
-// JSON infers schemaVersion as `number`, not the literal `5`; cast once. Validity is
+// JSON infers schemaVersion as `number`, not the literal `6`; cast once. Validity is
 // guaranteed at runtime by the seed-time validate(), not by this cast.
 export const DEFAULT_SESSIONS: Preset[] = [
   sleep8h,
@@ -38,4 +41,5 @@ export const DEFAULT_SESSIONS: Preset[] = [
   focusGamma40,
   focusBeta15Iso,
   deepWorkBeta18Iso,
+  dualBeatMeditation,
 ] as unknown as Preset[];

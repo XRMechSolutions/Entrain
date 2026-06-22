@@ -94,6 +94,30 @@ It is a stateless store consumed by `ui` (Layer 2); nothing in Layer 0/1 depends
   - For each public export in interfaces.md (§1-§6): trace input -> implementation -> observable output, confirm the single `PersistenceError` family, and confirm `ui` (the consumer) reads correct field names/shapes.
   - Confirm every edge case in edge-cases.md §A-§I has evidence of handling; confirm no path silently wipes/overwrites user data (non-destructive invariant); write findings and PASS/FAIL to the report file.
 
+## Feature: Multi-Voice (v6)
+
+> Like the v4-layers delta, multi-voice needs ZERO production-serializer change — persistence
+> stores/re-stringifies the whole normalized `Preset` and delegates all schema work to
+> session-model (multi-voice-architecture.md §0/§7). This section adds the `voiceCount` summary
+> channel (D-042) + the round-trip/self-heal tests. The 4 inline built-ins' + 16 `presets/*.json`
+> `schemaVersion 5→6` bump is part of the **session-model Layer-A atomic literal sweep**, NOT
+> re-owned here — but these tests are Layer A (they validate that bundle).
+
+- [x] [data] Add `PresetSummary.voiceCount = 1 + (Array.isArray(preset.voices) ? preset.voices.length : 0)` in `summaryOf` (guarded like the adjacent `nodeCount`, so a tampered non-array `voices` can't mis-count the badge) so the library picker can show a multi-voice badge (resolves the half-open UI channel) | file: src/engine/persistence.ts | model: T2
+  - Ref: .dev/planning/multi-voice-architecture.md @ §5 (UI badge); D-042
+  - Creates: `voiceCount` on `PresetSummary` (optional, computed); `summaryOf` reads `voices.length` only when `Array.isArray(preset.voices)`; `nodeCount` stays voice-0 only
+  - Tests: a multi-voice record → `voiceCount === 1 + voices.length`; a single-voice record → `voiceCount === 1`; a tampered record whose `voices` is absent OR a non-array → `voiceCount === 1`
+
+- [x] [test] Add a 'v6 multi-voice — round-trip + self-heal' describe block: `savePreset→loadPreset` deep-equal; `presetToJson→parsePresetJson` identical voices; byte-stable `save→load→save`; a v5 stored preset self-heals to v6 on load (`migratedFrom:5` write-back); an invalid voice → `INVALID_PRESET` (assert generically on the code, not exact VOICE_* names) | file: src/engine/persistence.test.ts | model: T1
+  - Ref: .dev/planning/multi-voice-architecture.md @ §1.4 (round-trip linchpin); §0 (atomic bundle)
+  - Ref: .dev/planning/decisions-log.md @ D-040
+  - Note: depends on the Layer-A literal sweep having bumped the existing `persistence.test.ts` `schemaVersion:5` literals (mkPreset/layeredFixture/C2/v3-migration/every-built-in) to 6 AND having moved the C4 `SCHEMA_TOO_NEW` "future" sentinel (`:385`) from `6`→`7` (after the bump a v6 body is valid, so the too-new gate must use v7 or C4 goes red); this task APPENDS the new block
+  - Tests: the round-trip block green; full `npm test` + `npm run check` green
+  - Ripple: none (test-only)
+
+- [x] [data] Add an additive §14 note to persistence design.md: v6 `voices` round-trips via the UNCHANGED (de)serializer, the built-ins stay single-voice, and a multi-voice default preset is DEFERRED until transport+UI can play/author voices (keeps `buildDefaultLibraryPresets` at 15 — no count-tripwire churn) | file: .dev/planning/modules/persistence/design.md | model: T2
+  - Ref: .dev/planning/multi-voice-architecture.md @ §7 build-order step 6; persistence design §13 (the v4-layers precedent)
+
 ## Completion Criteria
 - [ ] All tasks above marked [x] — none left [ ] (Pending) or [!] (Needs-Attention)
 - [ ] Zero active stubs for this module EXCEPT the registered `STORE_MIGRATIONS` seam (design.md §12) — an intentional, accepted deferral until `STORE_VERSION` is bumped past 1 (mirrors `session-model`'s empty `MIGRATIONS`)

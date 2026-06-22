@@ -161,6 +161,17 @@ not touched by this feature, and must remain unchanged/green.
   - Guardrails: confirm audio-engine.test.ts Phase-1 cases are byte-identical and green, the single bus-mode block exists and passes, and automation.test.ts + transport-master-gain.test.ts remain unchanged and green
   - Write findings to .dev/.task-state/audio-engine/behavioral-audit-master-flag.md; PASS required before the feature is considered complete
 
+## Feature: Multi-Voice (v6)
+
+> Multi-voice needs ZERO audio-engine source change — `createVoice({master:'bus'})` (D-036) is
+> already a pure factory reusable N times, and `mixer.bedInput` fans in natively. This section
+> adds ONE proof test (multi-voice-architecture.md §2/§7). Layer B (after the v6 schema gate).
+
+- [x] [test] Add an audio-engine.test.ts case proving four bus-mode voices built on one ctx are fully independent (distinct node graphs; each `masterGainParam.value === 1`; `setMasterGain` a guarded no-op) and each `voice.output` can be disconnected from `ctx.destination` and reconnected to a shared external GainNode | file: src/engine/audio-engine.test.ts | model: T2
+  - Ref: .dev/planning/multi-voice-architecture.md @ §2 (N-way reuse); §7 (audio-engine UNCHANGED)
+  - Ref: .dev/planning/decisions-log.md @ D-036 (the master:'bus' flag), D-040
+  - Tests: 4 independent bus voices; each output rewired to one shared gain without cross-talk; documents that the engine imposes NO intrinsic voice limit (the cap is session-model policy, `LIMITS.maxVoices`)
+
 ## Completion Criteria
 - [ ] All tasks marked [x] — zero tasks left [ ] (Pending) or [!] (Needs-Attention)
 - [ ] Zero active stubs for this module in .dev/.task-state/stub-registry.md

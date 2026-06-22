@@ -11,7 +11,7 @@
 // 1. Schema-version constants
 // ---------------------------------------------------------------------------
 
-export const CURRENT_SCHEMA_VERSION = 5;
+export const CURRENT_SCHEMA_VERSION = 6;
 export const MIN_SUPPORTED_SCHEMA_VERSION = 2;
 
 // ---------------------------------------------------------------------------
@@ -60,12 +60,35 @@ export interface TimeNode {
 }
 
 export interface Preset {
-  schemaVersion: 5;
+  schemaVersion: 6;
   name: string;
   durationSec: number;
   masterGain: number;
-  nodes: TimeNode[];
+  nodes: TimeNode[]; // the PRIMARY voice ("voice 0")
   layers?: Layer[]; // NEW (v4): stacked audio layers; absent = pure-binaural
+  voices?: Voice[]; // NEW (v6): additional independent generators summed at the master bus; absent = single-voice
+  voiceScript?: EmbeddedVoiceScript; // NEW (v6, D-043): embedded narration script; absent = no narration
+}
+
+/**
+ * An embedded authoring-time narration script (a voice-script `VoiceScript`), carried WITH the
+ * preset so playback can synthesize + inject its voice layers on demand (auto-synth-on-play,
+ * D-043). session-model treats it as OPAQUE persisted JSON: it is shape-checked here only as a
+ * plain object and deep-cloned on normalize; the full structural validation + compilation live in
+ * `voice-script` (importing its `VoiceScript` type here would be a session-model→voice-script
+ * layering cycle). The UI casts this to `VoiceScript` when it compiles on play.
+ */
+export type EmbeddedVoiceScript = Record<string, unknown>;
+
+// A multi-voice voice (v6, D-040): an additional independent generator stacked on the
+// session. Its `nodes` are the SAME shape + validation as the Preset's top-level `nodes`.
+// A voice is binaural when its `beat > 0`, isochronic when `beat = 0` + a `volume` pulse
+// mod — no binaural/isochronic kind field; the mechanism is a property of its own nodes.
+export interface Voice {
+  id: string; // non-empty; unique within voices[] (the primary voice has no id)
+  name?: string; // optional display label, ≤ 80 chars (reuses the name rule)
+  gain?: number; // [0,1] per-voice mix trim; default 1 (eval-time carry, never baked)
+  nodes: TimeNode[]; // carrier@t=0, sorted, unique t ≤ durationSec (the shared session length)
 }
 
 // ---------------------------------------------------------------------------
@@ -154,9 +177,17 @@ export type ValidationCode =
   | 'DUCK_TO_GAIN_NOT_FINITE' | 'DUCK_TO_GAIN_OUT_OF_RANGE'
   | 'DUCK_ATTACK_NOT_FINITE' | 'DUCK_ATTACK_NEGATIVE'
   | 'DUCK_RELEASE_NOT_FINITE' | 'DUCK_RELEASE_NEGATIVE'
+  // ---- v6 voice errors (set ok:false); per-voice node checks reuse NODE_*/PARAM_*/MOD_* at voices[k].nodes[…] ----
+  | 'VOICES_NOT_ARRAY' | 'VOICES_TOO_MANY' | 'VOICES_TOO_MANY_PULSES'
+  | 'VOICE_NOT_OBJECT'
+  | 'VOICE_ID_NOT_STRING' | 'VOICE_ID_EMPTY' | 'VOICE_ID_DUPLICATE'
+  | 'VOICE_GAIN_NOT_FINITE' | 'VOICE_GAIN_OUT_OF_RANGE'
+  | 'VOICE_NODES_NOT_ARRAY' | 'VOICE_NODES_EMPTY'
+  | 'VOICE_SCRIPT_NOT_OBJECT' // v6 (D-043): embedded narration script present but not a plain object
   // ---- warnings (ok stays true) ----
   | 'UNKNOWN_FIELD' | 'IGNORED_FIELD_FOR_SHAPE'
-  | 'MOD_EDGE_EXCEEDS_HALF_PERIOD' | 'STEPS_OVERRIDE_DEPTH' | 'STEPS_REQUIRE_JUMP';
+  | 'MOD_EDGE_EXCEEDS_HALF_PERIOD' | 'STEPS_OVERRIDE_DEPTH' | 'STEPS_REQUIRE_JUMP'
+  | 'VOICES_CARRIER_TOO_CLOSE';
 
 export interface ValidationIssue {
   code: ValidationCode;
@@ -207,11 +238,14 @@ export const RANGES = {
   spatial: { min: -1, max: 1 },
   depthSpatial: { min: 0, max: 1 },
   toneFreq: { min: 20, max: 20000 }, // bell/tone pitch (wider than carrier; bells ring high) (v4)
+  voiceGain: { min: 0, max: 1 }, // per-voice mix trim (v6)
 } as const;
 
 export const LIMITS = {
   nameMaxCodePoints: 80,
   durationMaxSec: 86400,
+  maxVoices: 4, // TOTAL voices = 1 (primary) + voices.length; the cap formula used EVERYWHERE (v6)
+  maxPulseWorklets: 8, // defensive bound on pulse-shaped mods across all voices (v6)
 } as const;
 
 export const DEFAULTS = {
@@ -222,13 +256,14 @@ export const DEFAULTS = {
   paramTransition: 'linear',
   modShape: 'sine',
   modTransition: 'glide',
+  voiceGain: 1, // per-voice mix trim default (eval-time carry, never baked) (v6)
 } as const;
 
 // ---------------------------------------------------------------------------
 // Internal: canonical key sets, enum membership, small helpers
 // ---------------------------------------------------------------------------
 
-const PRESET_KEYS = ['schemaVersion', 'name', 'durationSec', 'masterGain', 'nodes', 'layers'] as const;
+const PRESET_KEYS = ['schemaVersion', 'name', 'durationSec', 'masterGain', 'nodes', 'layers', 'voices', 'voiceScript'] as const;
 const NODE_KEYS = ['t', 'carrier', 'beat', 'volume', 'waveform', 'spatial'] as const;
 const PARAM_POINT_KEYS = ['value', 'transition', 'mod'] as const;
 const MOD_POINT_KEYS = ['shape', 'periodSec', 'depth', 'transition', 'pulseWidth', 'edgeMs', 'steps'] as const;
@@ -238,6 +273,7 @@ const LANE_POINT_KEYS = ['t', 'value', 'transition'] as const;
 const TONE_SPEC_KEYS = ['shape', 'freqHz', 'attackSec', 'releaseSec'] as const;
 const DUCK_KEYS = ['toGain', 'attackSec', 'releaseSec'] as const;
 const LANE_NAMES = ['gain', 'spatial'] as const;
+const VOICE_KEYS = ['id', 'name', 'gain', 'nodes'] as const;
 
 const WAVEFORMS = ['sine', 'triangle', 'square', 'sawtooth'] as const;
 const PARAM_TRANSITIONS = ['linear', 'exp', 'hold', 'smooth'] as const;
@@ -351,6 +387,9 @@ export function validate(value: unknown): ValidationResult {
   validateNodes(root, issues, duration);
   // Phase 12: layers subtree (independent of node errors).
   validateLayers(root, issues, duration);
+  validateVoiceScript(root, issues);
+  // Phase 13: voices subtree (v6, D-040; independent of node/layer errors).
+  validateVoices(root, issues, duration);
   // Forward-compat: unknown root keys dropped + warned.
   checkUnknownKeys(root, PRESET_KEYS, '', issues);
 
@@ -430,18 +469,31 @@ function validateNodes(root: Record<string, unknown>, issues: ValidationIssue[],
     err(issues, 'NODES_EMPTY', 'nodes', '"nodes" must contain at least one node');
     return;
   }
+  // Phases 7–11 over the validated array. The default 'nodes' prefix keeps top-level paths
+  // byte-identical; validateVoices reuses this core with a 'voices[k].nodes' prefix (D-040 §1.2).
+  validateNodeList(nodes, issues, duration, 'nodes');
+}
 
+// Phases 7–11 over a non-empty node array. `pathPrefix` makes every emitted path
+// (`${pathPrefix}[i]…`) reusable for both the primary voice ('nodes') and each extra voice
+// ('voices[k].nodes'), so the full per-node contract is validated identically per voice.
+function validateNodeList(
+  nodes: unknown[],
+  issues: ValidationIssue[],
+  duration: number | undefined,
+  pathPrefix: string,
+): void {
   // Phase 7: per-node field checks.
-  const infos = nodes.map((n, i) => validateNode(n, i, issues));
+  const infos = nodes.map((n, i) => validateNode(n, i, issues, pathPrefix));
 
   // Phase 8: ordering (sorted / unique / first-at-zero) over finite-t nodes only.
-  validateOrdering(infos, issues);
+  validateOrdering(infos, issues, pathPrefix);
 
   // Phase 9: t <= durationSec (needs a valid duration).
   if (duration !== undefined) {
     for (const info of infos) {
       if (info.t !== undefined && info.t > duration) {
-        err(issues, 'NODE_T_EXCEEDS_DURATION', `nodes[${info.index}].t`,
+        err(issues, 'NODE_T_EXCEEDS_DURATION', `${pathPrefix}[${info.index}].t`,
           `Node "t" ${info.t} exceeds durationSec ${duration}`);
       }
     }
@@ -450,16 +502,16 @@ function validateNodes(root: Record<string, unknown>, issues: ValidationIssue[],
   // Phase 10: carrier required at the start node.
   const first = infos[0];
   if (first.isObject && first.params.carrier === undefined) {
-    err(issues, 'CARRIER_NOT_AT_START', 'nodes[0]', 'The first node (t=0) must set "carrier"');
+    err(issues, 'CARRIER_NOT_AT_START', `${pathPrefix}[0]`, 'The first node (t=0) must set "carrier"');
   }
 
   // Phase 11: exponential ramp cannot reach or cross zero, per param.
-  validateExpThroughZero(infos, issues);
+  validateExpThroughZero(infos, issues, pathPrefix);
 }
 
-function validateNode(node: unknown, i: number, issues: ValidationIssue[]): NodeInfo {
+function validateNode(node: unknown, i: number, issues: ValidationIssue[], pathPrefix: string): NodeInfo {
   const info: NodeInfo = { index: i, isObject: false, t: undefined, params: {} };
-  const base = `nodes[${i}]`;
+  const base = `${pathPrefix}[${i}]`;
 
   if (!isPlainObject(node)) {
     err(issues, 'NODE_NOT_OBJECT', base, 'Node must be an object');
@@ -678,7 +730,7 @@ function validateModPoint(
   checkUnknownKeys(mod, MOD_POINT_KEYS, path, issues);
 }
 
-function validateOrdering(infos: NodeInfo[], issues: ValidationIssue[]): void {
+function validateOrdering(infos: NodeInfo[], issues: ValidationIssue[], pathPrefix: string): void {
   const valid: { index: number; t: number }[] = [];
   for (const info of infos) {
     if (info.t !== undefined) valid.push({ index: info.index, t: info.t });
@@ -686,20 +738,20 @@ function validateOrdering(infos: NodeInfo[], issues: ValidationIssue[]): void {
   if (valid.length === 0) return;
 
   if (valid[0].t !== 0) {
-    err(issues, 'NODES_FIRST_T_NONZERO', `nodes[${valid[0].index}].t`, `The first node must be at t=0, got ${valid[0].t}`);
+    err(issues, 'NODES_FIRST_T_NONZERO', `${pathPrefix}[${valid[0].index}].t`, `The first node must be at t=0, got ${valid[0].t}`);
   }
   for (let k = 1; k < valid.length; k++) {
     const prev = valid[k - 1].t;
     const cur = valid[k].t;
     if (cur < prev) {
-      err(issues, 'NODES_NOT_SORTED', `nodes[${valid[k].index}].t`, 'Nodes must be sorted ascending by "t"');
+      err(issues, 'NODES_NOT_SORTED', `${pathPrefix}[${valid[k].index}].t`, 'Nodes must be sorted ascending by "t"');
     } else if (cur === prev) {
-      err(issues, 'NODES_DUPLICATE_T', `nodes[${valid[k].index}].t`, `Two nodes share t=${cur}; node times must be unique`);
+      err(issues, 'NODES_DUPLICATE_T', `${pathPrefix}[${valid[k].index}].t`, `Two nodes share t=${cur}; node times must be unique`);
     }
   }
 }
 
-function validateExpThroughZero(infos: NodeInfo[], issues: ValidationIssue[]): void {
+function validateExpThroughZero(infos: NodeInfo[], issues: ValidationIssue[], pathPrefix: string): void {
   for (const p of PARAM_NAMES) {
     // Ordered sublist of nodes that set p with an in-range value and a finite t.
     const sub: { index: number; value: number; isExp: boolean }[] = [];
@@ -716,7 +768,7 @@ function validateExpThroughZero(infos: NodeInfo[], issues: ValidationIssue[]): v
       const v0 = n0.value;
       const v1 = sub[k + 1].value;
       if (v0 === 0 || v1 === 0 || Math.sign(v0) !== Math.sign(v1)) {
-        err(issues, 'EXP_RAMP_THROUGH_ZERO', `nodes[${n0.index}].${p}.transition`,
+        err(issues, 'EXP_RAMP_THROUGH_ZERO', `${pathPrefix}[${n0.index}].${p}.transition`,
           `"exp" transition cannot ramp to or across zero (${v0} → ${v1}); use linear/smooth or keep both endpoints the same nonzero sign`);
       }
     }
@@ -740,6 +792,18 @@ function validateLayers(root: Record<string, unknown>, issues: ValidationIssue[]
   const seenIds = new Set<string>();
   for (let i = 0; i < layers.length; i++) {
     validateLayer(layers[i], i, issues, duration, seenIds);
+  }
+}
+
+// Trust-boundary shape check only (D-043): an embedded narration script must be a plain object
+// (or absent). The full structural validation — version/blocks/lines/discriminators — is
+// voice-script's job when it compiles on play; session-model just guards against a non-object
+// blob smuggling through normalizePreset's allowlist copy.
+function validateVoiceScript(root: Record<string, unknown>, issues: ValidationIssue[]): void {
+  if (!('voiceScript' in root) || root.voiceScript === undefined) return; // absent = no narration.
+  const vs = root.voiceScript;
+  if (typeof vs !== 'object' || vs === null || Array.isArray(vs)) {
+    err(issues, 'VOICE_SCRIPT_NOT_OBJECT', 'voiceScript', '"voiceScript" must be an object');
   }
 }
 
@@ -989,12 +1053,184 @@ function validateDuck(duck: unknown, base: string, issues: ValidationIssue[]): v
   checkUnknownKeys(duck, DUCK_KEYS, path, issues);
 }
 
+// ---------------------------------------------------------------------------
+// Phase 13: voices subtree (v6, D-040). Additional INDEPENDENT generators summed at the
+// master bus. Each voice reuses the full per-node contract (validateNodeList) at a
+// `voices[k].nodes[…]` path — mirroring how `spatial` reuses PARAM_* — and this phase adds
+// the container/identity/gain/name checks plus the session-wide voice-count cap, the
+// pulse-worklet cap, and the carrier-separation advisory. Independent of node/layer errors:
+// an invalid primary voice does not suppress voice diagnostics (like the layers phase).
+// ---------------------------------------------------------------------------
+
+function validateVoices(root: Record<string, unknown>, issues: ValidationIssue[], duration: number | undefined): void {
+  if (!('voices' in root)) return; // absent = single-voice (today's behavior); no checks.
+  const voices = root.voices;
+  if (!Array.isArray(voices)) {
+    err(issues, 'VOICES_NOT_ARRAY', 'voices', '"voices" must be an array');
+    return; // stop voice checks; siblings already ran.
+  }
+
+  // Count cap: TOTAL voices = 1 (primary) + voices.length — the `1 + voices.length` formula
+  // used everywhere (§1.3). Reported once; per-voice checks still run.
+  const total = 1 + voices.length;
+  if (total > LIMITS.maxVoices) {
+    err(issues, 'VOICES_TOO_MANY', 'voices',
+      `A session may have at most ${LIMITS.maxVoices} voices (1 primary + ${LIMITS.maxVoices - 1} additional), got ${total}`);
+  }
+
+  // Per-voice structure + the shared per-node contract. Track ids for the uniqueness scan.
+  const seenIds = new Set<string>();
+  for (let k = 0; k < voices.length; k++) {
+    validateVoice(voices[k], k, issues, duration, seenIds);
+  }
+
+  // Pulse-worklet cap (§6): one persistent AudioWorklet per (voice, param-lane) whose mod shape
+  // is `pulse`/`square`, summed across the PRIMARY nodes AND every voice (counts voice 0, matching
+  // the cap formula). box/steps/sine/triangle drive ConstantSource/native osc, not a worklet.
+  let workletLanes = countWorkletLanes(root.nodes);
+  for (const voice of voices) {
+    workletLanes += countWorkletLanes(isPlainObject(voice) ? voice.nodes : undefined);
+  }
+  if (workletLanes > LIMITS.maxPulseWorklets) {
+    err(issues, 'VOICES_TOO_MANY_PULSES', 'voices',
+      `Too many pulse-shaped modulators across all voices: ${workletLanes} exceeds the limit of ${LIMITS.maxPulseWorklets}`);
+  }
+
+  // Carrier-separation advisory (§2): pairwise-compare every voice's t=0 carrier base, the
+  // PRIMARY included. Within ratio 1.1 OR 30 Hz → warn (ok stays true); recommended ≥ ratio 1.25.
+  checkCarrierSeparation(root.nodes, voices, issues);
+}
+
+function validateVoice(
+  voice: unknown,
+  k: number,
+  issues: ValidationIssue[],
+  duration: number | undefined,
+  seenIds: Set<string>,
+): void {
+  const base = `voices[${k}]`;
+  if (!isPlainObject(voice)) {
+    err(issues, 'VOICE_NOT_OBJECT', base, 'Voice must be an object');
+    return; // skip inner checks; excluded from the id-uniqueness scan.
+  }
+
+  // id — non-empty string, unique across voices (the primary voice has no id).
+  const id = voice.id;
+  if (typeof id !== 'string') {
+    err(issues, 'VOICE_ID_NOT_STRING', `${base}.id`, 'Voice "id" must be a string');
+  } else if (id.trim().length < 1) {
+    err(issues, 'VOICE_ID_EMPTY', `${base}.id`, 'Voice "id" must not be empty');
+  } else if (seenIds.has(id)) {
+    err(issues, 'VOICE_ID_DUPLICATE', `${base}.id`, `Duplicate voice id ${display(id)}; voice ids must be unique`);
+  } else {
+    seenIds.add(id);
+  }
+
+  // name — optional display label; when PRESENT, reuse the top-level name rule (string, ≤ 80
+  // code points). A voice name has no non-empty requirement (it is purely a label).
+  if ('name' in voice) {
+    const name = voice.name;
+    if (typeof name !== 'string') {
+      err(issues, 'NAME_NOT_STRING', `${base}.name`, '"name" must be a string');
+    } else {
+      const count = [...name].length;
+      if (count > LIMITS.nameMaxCodePoints) {
+        err(issues, 'NAME_TOO_LONG', `${base}.name`, `"name" must be at most 80 characters, got ${count}`);
+      }
+    }
+  }
+
+  // gain — optional per-voice mix trim; finite, in [0,1].
+  if ('gain' in voice) {
+    const g = voice.gain;
+    if (!isFiniteNumber(g)) {
+      err(issues, 'VOICE_GAIN_NOT_FINITE', `${base}.gain`, '"gain" must be a finite number');
+    } else if (g < RANGES.voiceGain.min || g > RANGES.voiceGain.max) {
+      err(issues, 'VOICE_GAIN_OUT_OF_RANGE', `${base}.gain`, `"gain" must be within [0, 1], got ${g}`);
+    }
+  }
+
+  // nodes — same container rules as the primary, but with voice-specific codes, then the shared
+  // per-node contract (carrier@t=0, sorted/unique t ≤ durationSec, ParamPoint/ModPoint/exp).
+  const nodes = voice.nodes;
+  if (!Array.isArray(nodes)) {
+    err(issues, 'VOICE_NODES_NOT_ARRAY', `${base}.nodes`, '"nodes" must be an array');
+  } else if (nodes.length < 1) {
+    err(issues, 'VOICE_NODES_EMPTY', `${base}.nodes`, '"nodes" must contain at least one node');
+  } else {
+    validateNodeList(nodes, issues, duration, `${base}.nodes`);
+  }
+
+  checkUnknownKeys(voice, VOICE_KEYS, base, issues);
+}
+
+// Worklet-spawning lanes for one node array: one per param whose mod shape is `pulse`/`square`
+// on ANY node (a continuous-phase worklet is a single persistent node regardless of keyframe
+// count). Defensive over untrusted input — skips non-object nodes/params/mods.
+function countWorkletLanes(nodes: unknown): number {
+  if (!Array.isArray(nodes)) return 0;
+  let count = 0;
+  for (const param of PARAM_NAMES) {
+    for (const node of nodes) {
+      if (!isPlainObject(node)) continue;
+      const pp = node[param];
+      if (!isPlainObject(pp)) continue;
+      const mod = pp.mod;
+      if (isPlainObject(mod) && (mod.shape === 'pulse' || mod.shape === 'square')) {
+        count++;
+        break; // one lane per (voice, param) however many nodes set it.
+      }
+    }
+  }
+  return count;
+}
+
+// The finite carrier base at the t=0 node of a node array, or undefined if none is resolvable.
+function carrierBaseAtZero(nodes: unknown): number | undefined {
+  if (!Array.isArray(nodes)) return undefined;
+  for (const node of nodes) {
+    if (!isPlainObject(node) || node.t !== 0) continue;
+    const pp = node.carrier;
+    return isPlainObject(pp) && isFiniteNumber(pp.value) ? pp.value : undefined;
+  }
+  return undefined;
+}
+
+// Pairwise carrier-separation advisory across the primary voice + every extra voice. Warns
+// (ok stays true) at the later voice's carrier path when two t=0 carriers are within ratio 1.1
+// or 30 Hz. Uses the t=0 base only (deep warble could transiently narrow it — accepted, §2).
+function checkCarrierSeparation(primaryNodes: unknown, voices: unknown[], issues: ValidationIssue[]): void {
+  const entries: { path: string; carrier: number }[] = [];
+  const primary = carrierBaseAtZero(primaryNodes);
+  if (primary !== undefined) entries.push({ path: 'nodes[0].carrier', carrier: primary });
+  for (let k = 0; k < voices.length; k++) {
+    const v = voices[k];
+    const c = carrierBaseAtZero(isPlainObject(v) ? v.nodes : undefined);
+    if (c !== undefined) entries.push({ path: `voices[${k}].nodes[0].carrier`, carrier: c });
+  }
+  for (let i = 0; i < entries.length; i++) {
+    for (let j = i + 1; j < entries.length; j++) {
+      if (carriersTooClose(entries[i].carrier, entries[j].carrier)) {
+        warn(issues, 'VOICES_CARRIER_TOO_CLOSE', entries[j].path,
+          `Voice carriers ${entries[i].carrier} Hz and ${entries[j].carrier} Hz are too close (within ratio 1.1 or 30 Hz); separate them by ≥ ratio 1.25 (≈ one critical band) so the voices don't mask or cross-beat`);
+      }
+    }
+  }
+}
+
+// Two carrier bases are "too close" when their ratio is < 1.1 OR their absolute gap is < 30 Hz.
+function carriersTooClose(a: number, b: number): boolean {
+  if (a <= 0 || b <= 0) return Math.abs(a - b) < 30;
+  const ratio = Math.max(a, b) / Math.min(a, b);
+  return ratio < 1.1 || Math.abs(a - b) < 30;
+}
+
 // Normalized clone — built only when validation succeeds, so every read below is of
 // already-validated data. Copies known keys in canonical order; drops unknowns;
 // preserves mod:null and absent optionals; produces a fresh, unshared object graph.
 function normalizePreset(root: Record<string, unknown>): Preset {
   const out: Preset = {
-    schemaVersion: CURRENT_SCHEMA_VERSION as 5,
+    schemaVersion: CURRENT_SCHEMA_VERSION as 6,
     name: root.name as string,
     durationSec: root.durationSec as number,
     masterGain: root.masterGain as number,
@@ -1003,6 +1239,19 @@ function normalizePreset(root: Record<string, unknown>): Preset {
   // Absent `layers` stays absent (sparse); a present array (even empty) is preserved.
   if ('layers' in root) {
     out.layers = (root.layers as unknown[]).map((l) => normalizeLayer(l as Record<string, unknown>));
+  }
+  // Absent `voices` stays absent (sparse, like layers); a present array (even empty) is
+  // preserved. This copy is the round-trip linchpin — without it the allowlist clone would
+  // silently drop the multi-voice feature on the first parse/persistence round-trip (§1.4).
+  if ('voices' in root) {
+    out.voices = (root.voices as unknown[]).map((v) => normalizeVoice(v as Record<string, unknown>));
+  }
+  // Absent `voiceScript` stays absent; a present object is deep-cloned (opaque JSON) so the
+  // normalized preset never aliases the caller's object and survives the round-trip verbatim
+  // (D-043). Same allowlist-copy linchpin as layers/voices — without this copy the embedded
+  // narration would be silently dropped on the first parse/persistence round-trip.
+  if ('voiceScript' in root && root.voiceScript !== undefined) {
+    out.voiceScript = structuredClone(root.voiceScript) as EmbeddedVoiceScript;
   }
   return out;
 }
@@ -1014,6 +1263,17 @@ function normalizeNode(node: Record<string, unknown>): TimeNode {
   if ('volume' in node) out.volume = normalizeParam(node.volume as Record<string, unknown>);
   if ('waveform' in node) out.waveform = node.waveform as Waveform;
   if ('spatial' in node) out.spatial = normalizeParam(node.spatial as Record<string, unknown>);
+  return out;
+}
+
+// Voice normalization (v6): canonical key order id,name,gain,nodes. Absent name/gain stay
+// absent (sparse); per-voice nodes reuse the primary `normalizeNode` so a voice's nodes are
+// byte-identical to top-level nodes after a round-trip.
+function normalizeVoice(voice: Record<string, unknown>): Voice {
+  const out = { id: voice.id as string } as Voice;
+  if ('name' in voice) out.name = voice.name as string;
+  if ('gain' in voice) out.gain = voice.gain as number;
+  out.nodes = (voice.nodes as unknown[]).map((n) => normalizeNode(n as Record<string, unknown>));
   return out;
 }
 
@@ -1110,15 +1370,19 @@ function normalizeDuckIntent(duck: Record<string, unknown>): DuckIntent {
 //     0 Hz has no proportional warble — the engine already floors it to 0). volume/spatial
 //     depths are already fractional/positional and `steps` are explicit offsets, so both are
 //     left untouched. This is the one value-rewriting migration; the rest are version-bumps.
-// So a v4 preset walks v4→v5, a v3 preset v3→v4→v5, a v2 preset v2→v3→v4→v5; all stamp to the
-// current version, so the normalized output is always v5. There is no MIGRATIONS[1] — D-011
-// replaced the never-released v1 model and no v1 JSON contract exists, so any schemaVersion
-// < 2 returns SCHEMA_TOO_OLD (a loud failure, not fake success).
-// TODO(stub): future schemaVersion migrations register at MIGRATIONS[from] — next entry resolves when a >v5 schema is introduced
+//   MIGRATIONS[5] (v5→v6): `voices` is a new optional Preset field (absent = single-voice);
+//     a pure version-bump stamping schemaVersion=6 (D-040; multi-voice-architecture §1.4).
+// So a v5 preset walks v5→v6, a v4 preset v4→v5→v6, a v3 preset v3→v4→v5→v6, a v2 preset
+// v2→v3→v4→v5→v6; all stamp to the current version, so the normalized output is always v6.
+// There is no MIGRATIONS[1] — D-011 replaced the never-released v1 model and no v1 JSON
+// contract exists, so any schemaVersion < 2 returns SCHEMA_TOO_OLD (a loud failure, not fake
+// success).
+// TODO(stub): future schemaVersion migrations register at MIGRATIONS[from] — next entry resolves when a >v6 schema is introduced
 const MIGRATIONS: Record<number, (obj: Record<string, unknown>) => Record<string, unknown>> = {
   2: (obj) => ({ ...obj, schemaVersion: 3 }),
   3: (obj) => ({ ...obj, schemaVersion: 4 }),
   4: (obj) => migrateV4ToV5(obj),
+  5: (obj) => ({ ...obj, schemaVersion: 6 }),
 };
 
 // v4→v5: convert carrier/beat warble depth from absolute Hz to a fraction of the base
@@ -1269,12 +1533,27 @@ export function clonePreset(preset: Preset): Preset {
 
 export function createDefaultPreset(): Preset {
   return {
-    schemaVersion: CURRENT_SCHEMA_VERSION as 5,
+    schemaVersion: CURRENT_SCHEMA_VERSION as 6,
     name: 'Untitled Session',
     durationSec: 300,
     masterGain: 0.8,
     nodes: [{ t: 0, carrier: { value: 200 }, beat: { value: 8 }, volume: { value: 1 } }],
     // layers omitted — a fresh session is pure-binaural; the author adds layers later.
+  };
+}
+
+// Shared view helper (§1.5): a Preset-shaped, NON-recursive projection of a single voice's
+// nodes onto the session-global fields. Drops `layers`/`voices` so it cannot recurse, and so
+// transport, renderer, and the UI store all schedule a voice through the same shape — render ==
+// playback == preview by construction. The primary voice uses `voiceView(preset, preset.nodes)`;
+// each extra voice uses `voiceView(preset, voice.nodes)`.
+export function voiceView(preset: Preset, nodes: TimeNode[]): Preset {
+  return {
+    schemaVersion: preset.schemaVersion,
+    name: preset.name,
+    durationSec: preset.durationSec,
+    masterGain: preset.masterGain,
+    nodes,
   };
 }
 

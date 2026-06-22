@@ -23,6 +23,7 @@ function makeFakeTransport() {
       return fake.durationSec;
     }),
     setMasterTrim: vi.fn(),
+    setVoiceTrim: vi.fn(),
     setKeepScreenOn: vi.fn().mockResolvedValue(undefined),
     isKeepScreenOn: vi.fn().mockReturnValue(false),
     on: (ev: string, h: Handler) => {
@@ -266,5 +267,138 @@ describe('SessionStore — Phase-2 node ops', () => {
     expect(session.preset.nodes).toHaveLength(len);
     session.removeNode(1); // allowed
     expect(session.preset.nodes).toHaveLength(len - 1);
+  });
+});
+
+describe('SessionStore — multi-voice (v6)', () => {
+  function reapplyCount(t: FakeTransport): number {
+    return (t.reapply as ReturnType<typeof vi.fn>).mock.calls.length;
+  }
+
+  it('voices accessor is empty for a single-voice preset; addVoice appends with a fresh id', () => {
+    const { session } = setup();
+    expect(session.voices).toHaveLength(0);
+    const id = session.addVoice();
+    expect(id).toBe('voice_1');
+    expect(session.voices).toHaveLength(1);
+    expect(session.voices[0].id).toBe('voice_1');
+    expect(session.voices[0].gain).toBe(1); // DEFAULTS.voiceGain
+    expect(session.voices[0].nodes[0].carrier?.value).toBe(250); // separated default carrier
+  });
+
+  it('addVoice is a STRUCTURAL rebuild: transport.load, dirty=true, selectedId preserved, NO reset/reapply/setVoiceTrim', () => {
+    const { transport, session } = setup({ state: 'playing' });
+    session.reset(createDefaultPreset(), 'lib-7'); // adopt a library record
+    transport.load.mockClear();
+    const rev0 = session.revision;
+
+    const id = session.addVoice();
+    expect(id).toBe('voice_1');
+    expect(transport.load).toHaveBeenCalledTimes(1); // rebuild via load…
+    expect(transport.load).toHaveBeenCalledWith(session.preset);
+    expect(session.dirty).toBe(true); // …NOT reset() (which would clear dirty)
+    expect(session.selectedId).toBe('lib-7'); // …NOT reset() (which would detach the record)
+    expect(session.revision).toBe(rev0 + 1);
+    expect(reapplyCount(transport)).toBe(0); // structural, not a live reapply
+    expect(transport.setVoiceTrim).not.toHaveBeenCalled();
+  });
+
+  it('addVoice past the cap (1 + voices.length >= maxVoices) is rejected with null', () => {
+    const { transport, session } = setup();
+    expect(session.addVoice()).toBe('voice_1'); // total 2
+    expect(session.addVoice()).toBe('voice_2'); // total 3
+    expect(session.addVoice()).toBe('voice_3'); // total 4 == LIMITS.maxVoices
+    transport.load.mockClear();
+    expect(session.addVoice()).toBeNull(); // 5th rejected
+    expect(session.voices).toHaveLength(3);
+    expect(transport.load).not.toHaveBeenCalled(); // no rebuild on a rejected add
+  });
+
+  it('removeVoice rebuilds via load, preserves selectedId, restores sparseness when empty', () => {
+    const { transport, session } = setup();
+    session.reset(createDefaultPreset(), 'lib-9');
+    const id = session.addVoice()!;
+    transport.load.mockClear();
+
+    session.removeVoice('ghost'); // unknown id → no-op
+    expect(transport.load).not.toHaveBeenCalled();
+
+    session.removeVoice(id);
+    expect(session.voices).toHaveLength(0);
+    expect(session.preset.voices).toBeUndefined(); // absent again = single-voice byte-identical
+    expect(transport.load).toHaveBeenCalledTimes(1);
+    expect(session.dirty).toBe(true);
+    expect(session.selectedId).toBe('lib-9'); // selection preserved across the rebuild
+  });
+
+  it('setVoiceGain clamps to [0,1], writes preset.voices[k].gain AND ramps the live trim, NO reschedule', () => {
+    const { transport, session } = setup({ state: 'playing' });
+    const id = session.addVoice()!;
+    transport.reapply.mockClear();
+
+    session.setVoiceGain(id, 0.4);
+    expect(session.voices[0].gain).toBe(0.4); // edit-time write (survives a save)
+    expect(transport.setVoiceTrim).toHaveBeenCalledWith(id, 0.4); // live channel
+    expect(reapplyCount(transport)).toBe(0); // cheap live path, never reschedules
+
+    session.setVoiceGain(id, 5); // clamps above max
+    expect(session.voices[0].gain).toBe(1);
+    session.setVoiceGain(id, -2); // clamps below min
+    expect(session.voices[0].gain).toBe(0);
+
+    (transport.setVoiceTrim as ReturnType<typeof vi.fn>).mockClear();
+    session.setVoiceGain(id, Number.NaN); // non-finite → no-op
+    session.setVoiceGain('ghost', 0.5); // unknown id → no-op (never throws)
+    expect(transport.setVoiceTrim).not.toHaveBeenCalled();
+  });
+
+  it('setVoiceName writes the label (dirty + bump) without rescheduling', () => {
+    const { transport, session } = setup({ state: 'playing' });
+    const id = session.addVoice()!;
+    transport.reapply.mockClear();
+    const rev0 = session.revision;
+    session.setVoiceName(id, 'Theta layer');
+    expect(session.voices[0].name).toBe('Theta layer');
+    expect(session.dirty).toBe(true);
+    expect(session.revision).toBe(rev0 + 1);
+    expect(reapplyCount(transport)).toBe(0);
+    session.setVoiceName('ghost', 'x'); // unknown id → no-op, no throw
+  });
+
+  it('voiceView(id) returns a valid single-voice Preset that SHARES the voice nodes by reference', () => {
+    const { session } = setup();
+    const id = session.addVoice()!;
+    const view = session.voiceView(id);
+    expect(view.nodes).toBe(session.voices[0].nodes); // shared by reference (§1.5)
+    expect(view.durationSec).toBe(session.preset.durationSec);
+    expect('voices' in view).toBe(false); // non-recursive projection
+    expect('layers' in view).toBe(false);
+  });
+
+  it('voiceView(undefined) and an unknown id both fall back to the primary voice 0', () => {
+    const { session } = setup();
+    expect(session.voiceView().nodes).toBe(session.preset.nodes);
+    expect(session.voiceView('nope').nodes).toBe(session.preset.nodes); // stale id → primary, no throw
+  });
+
+  it('a trailing voiceId routes node mutators to that voice; omitted ⇒ voice 0 (byte-identical)', () => {
+    const { session } = setup();
+    const id = session.addVoice()!;
+    const primaryCarrier = session.preset.nodes[0].carrier?.value;
+
+    // Edit the extra voice — the primary voice 0 is untouched.
+    session.setNodeParam('carrier', 333, id);
+    expect(session.voices[0].nodes[0].carrier?.value).toBe(333);
+    expect(session.preset.nodes[0].carrier?.value).toBe(primaryCarrier);
+
+    // addNode targets the voice and carries forward from THAT voice's base value.
+    const key = session.addNode(120, 'carrier', id);
+    expect(session.voices[0].nodes).toHaveLength(2);
+    expect(session.voices[0].nodes[Number(key)].carrier?.value).toBe(333);
+    expect(session.preset.nodes).toHaveLength(1); // primary unchanged
+
+    // An unknown id falls back to the primary (no throw).
+    session.setNodeParam('beat', 4, 'ghost');
+    expect(session.preset.nodes[0].beat?.value).toBe(4);
   });
 });

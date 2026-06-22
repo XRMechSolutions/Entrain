@@ -81,7 +81,7 @@ function setup() {
 }
 
 function summary(id: string, updatedAt: number): PresetSummary {
-  return { id, name: id, durationSec: 60, nodeCount: 1, createdAt: 0, updatedAt };
+  return { id, name: id, durationSec: 60, nodeCount: 1, voiceCount: 1, createdAt: 0, updatedAt };
 }
 function saved(id: string, warnings: SavedPreset['warnings'] = []): SavedPreset {
   return { id, createdAt: 0, updatedAt: 1, preset: createDefaultPreset(), warnings };

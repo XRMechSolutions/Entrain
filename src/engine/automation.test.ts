@@ -41,7 +41,7 @@ const asCtx = (ctx: MockAudioContext): BaseAudioContext => ctx as unknown as Bas
 const mp = (p: AudioParam): MockAudioParam => p as unknown as MockAudioParam;
 
 function preset(durationSec: number, nodes: TimeNode[]): Preset {
-  return { schemaVersion: 5, name: 'test', durationSec, masterGain: 0.8, nodes };
+  return { schemaVersion: 6, name: 'test', durationSec, masterGain: 0.8, nodes };
 }
 function pp(value: number, transition?: ParamPoint['transition'], mod?: ModPoint | null): ParamPoint {
   const out: ParamPoint = { value };

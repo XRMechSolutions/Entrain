@@ -188,7 +188,7 @@ function installOfflineContext(): () => void {
 
 function basePreset(over: Partial<Preset> = {}): Preset {
   return {
-    schemaVersion: 5,
+    schemaVersion: 6,
     name: 'guided drift',
     durationSec: 10,
     masterGain: 0.8,
@@ -222,6 +222,18 @@ const voiceCueLayer: Layer = {
 
 function multiLayerPreset(): Preset {
   return basePreset({ layers: [toneLayer, ambianceLayer, voiceCueLayer] });
+}
+
+/** Two-voice preset: primary (carrier 200, beat 4) + 1 extra voice (carrier 400, beat 6). */
+function twoVoicePreset(): Preset {
+  return basePreset({
+    voices: [
+      {
+        id: 'v2',
+        nodes: [{ t: 0, carrier: { value: 400 }, beat: { value: 6 } }],
+      },
+    ],
+  });
 }
 
 /** Spy on createMixer and capture the Mixer it returns — the real composition object,
@@ -885,5 +897,127 @@ describe('encodeBuffer — MP3', () => {
         expect((e as RenderError).cause).toBeInstanceOf(Error);
       },
     );
+  });
+});
+
+// ===========================================================================
+// (k) renderToBuffer — multi-voice
+// ===========================================================================
+
+describe('renderToBuffer — multi-voice', () => {
+  it('should create 2 oscillators per voice (4 total for primary + 1 extra), all starting at t=0', async () => {
+    await renderToBuffer(twoVoicePreset());
+    const oscs = lastOffline!.created.oscillators;
+    expect(oscs).toHaveLength(4);
+    for (const osc of oscs) {
+      expect(osc.startTime).toBe(0);
+    }
+  });
+
+  it('should connect each extra voice through a per-voice trim into mixer.bedInput with the correct gain', async () => {
+    let bedInputCount = -1;
+    let trimGainValue = -1;
+    const realSL = layerScheduler.scheduleLayers;
+    vi.spyOn(layerScheduler, 'scheduleLayers').mockImplementation((mixer, nodes, layers, opts) => {
+      // By scheduleLayers time, all extra voices have been wired into bedInput.
+      const inputs = (
+        mixer.bedInput as unknown as { inputs: Array<{ gain: { value: number } }> }
+      ).inputs;
+      bedInputCount = inputs.length;
+      // inputs[0] = primary voice.output (masterGain, BUS_MASTER=1)
+      // inputs[1] = per-voice trim (clamp01(voice.gain ?? 1))
+      if (inputs.length >= 2) trimGainValue = inputs[1].gain?.value ?? -1;
+      return realSL(mixer, nodes, layers, opts);
+    });
+    const preset = basePreset({
+      voices: [
+        { id: 'v2', gain: 0.5, nodes: [{ t: 0, carrier: { value: 400 }, beat: { value: 6 } }] },
+      ],
+    });
+    await renderToBuffer(preset);
+    expect(bedInputCount).toBe(2); // primary output + 1 trim
+    expect(trimGainValue).toBeCloseTo(0.5); // clamp01(0.5)
+  });
+
+  it('should call scheduleAll with a voiceView (no voices key, extra voice nodes) for each extra voice', async () => {
+    const allSpy = vi.spyOn(automation, 'scheduleAll');
+    const extraNodes = [{ t: 0, carrier: { value: 400 }, beat: { value: 6 } }];
+    const preset = basePreset({
+      voices: [{ id: 'v2', nodes: [...extraNodes] }],
+    });
+    await renderToBuffer(preset);
+    // Twice: once for primary voice, once for the extra voice
+    expect(allSpy).toHaveBeenCalledTimes(2);
+    const extraCallPreset = allSpy.mock.calls[1][0] as Preset;
+    expect(extraCallPreset.nodes).toEqual(extraNodes);
+    // voiceView omits voices[] — no recursive embedding (multi-voice §1.5)
+    expect(extraCallPreset.voices).toBeUndefined();
+  });
+
+  it('should register exactly ONE ctx.suspend per distinct waveform-change time across all voices (same-t aggregation)', async () => {
+    const preset = basePreset({
+      durationSec: 10,
+      nodes: [
+        { t: 0, carrier: { value: 200 }, beat: { value: 4 }, waveform: 'sine' },
+        { t: 5, waveform: 'square' },
+      ],
+      voices: [
+        {
+          id: 'v2',
+          nodes: [
+            { t: 0, carrier: { value: 400 }, beat: { value: 6 }, waveform: 'sine' },
+            { t: 5, waveform: 'triangle' },
+          ],
+        },
+      ],
+    });
+    await renderToFile(preset, 'wav');
+    // Both voices switch waveform at t=5; the aggregator must produce exactly ONE suspend.
+    expect(lastOffline!.suspendCalls.filter((t) => t === 5)).toHaveLength(1);
+  });
+
+  it('should dispose all extra-voice oscillators (disconnected) on the success path', async () => {
+    await renderToBuffer(twoVoicePreset());
+    const oscs = lastOffline!.created.oscillators;
+    expect(oscs).toHaveLength(4);
+    // disposeAll disconnects both primary and extra voice nodes on success.
+    for (const osc of oscs) {
+      expect(osc.disconnectCalls).toBeGreaterThan(0);
+    }
+  });
+
+  it('should dispose all extra-voice oscillators (disconnected) on the cancel path', async () => {
+    const controller = new AbortController();
+    // Abort inside scheduleLayers: step (10b) already created + started the extra voice
+    // before scheduleLayers runs, so the finally-block disposeAll must still reach all voices.
+    const realSL = layerScheduler.scheduleLayers;
+    vi.spyOn(layerScheduler, 'scheduleLayers').mockImplementation((mixer, nodes, layers, opts) => {
+      controller.abort();
+      return realSL(mixer, nodes, layers, opts);
+    });
+    await expectRenderError(
+      renderToBuffer(twoVoicePreset(), { signal: controller.signal }),
+      'CANCELLED',
+    );
+    const oscs = lastOffline!.created.oscillators;
+    expect(oscs).toHaveLength(4);
+    for (const osc of oscs) {
+      expect(osc.disconnectCalls).toBeGreaterThan(0);
+    }
+  });
+
+  it('should render a multi-voice preset twice to bit-identical PCM', async () => {
+    const preset = twoVoicePreset();
+    const a = await renderToBuffer(preset);
+    const b = await renderToBuffer(preset);
+    expect(a.length).toBe(b.length);
+    const la = a.getChannelData(0);
+    const lb = b.getChannelData(0);
+    const ra = a.getChannelData(1);
+    const rb = b.getChannelData(1);
+    for (let i = 0; i < la.length; i += 997) {
+      expect(la[i]).toBe(lb[i]);
+      expect(ra[i]).toBe(rb[i]);
+    }
   });
 });

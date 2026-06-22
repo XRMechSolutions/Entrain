@@ -9,6 +9,7 @@ import {
   createDefaultPreset,
   sortNodes,
   presetsEqual,
+  voiceView,
   SessionModelError,
   CURRENT_SCHEMA_VERSION,
   MIN_SUPPORTED_SCHEMA_VERSION,
@@ -18,6 +19,7 @@ import {
 } from './session-model';
 import type {
   Preset,
+  Voice,
   TimeNode,
   ValidationIssue,
   ValidationCode,
@@ -38,7 +40,7 @@ type AnyObj = Record<string, unknown>;
 
 function mkPreset(over: AnyObj = {}): AnyObj {
   return {
-    schemaVersion: 5,
+    schemaVersion: 6,
     name: 'Test Session',
     durationSec: 100,
     masterGain: 0.8,
@@ -95,12 +97,13 @@ describe('constants and types', () => {
       paramTransition: 'linear',
       modShape: 'sine',
       modTransition: 'glide',
+      voiceGain: 1,
     });
     expect('carrier' in DEFAULTS).toBe(false);
   });
 
-  it('schema-version constants are 5 (current) and 2 (min supported)', () => {
-    expect(CURRENT_SCHEMA_VERSION).toBe(5);
+  it('schema-version constants are 6 (current) and 2 (min supported)', () => {
+    expect(CURRENT_SCHEMA_VERSION).toBe(6);
     expect(MIN_SUPPORTED_SCHEMA_VERSION).toBe(2);
   });
 
@@ -123,10 +126,10 @@ describe('constants and types', () => {
     expect(e.issues).toBe(issues);
   });
 
-  it('exposes Preset.schemaVersion as literal 5 and the TimeNode type', () => {
+  it('exposes Preset.schemaVersion as literal 6 and the TimeNode type', () => {
     const node: TimeNode = { t: 0, carrier: { value: 200 }, spatial: { value: 0 } };
-    const version: 5 = createDefaultPreset().schemaVersion;
-    expect(version).toBe(5);
+    const version: 6 = createDefaultPreset().schemaVersion;
+    expect(version).toBe(6);
     expect(node.t).toBe(0);
   });
 });
@@ -141,7 +144,7 @@ describe('validate — happy path & normalization', () => {
     if (r.ok) {
       expect(r.issues.every((i) => i.severity === 'warning')).toBe(true);
       expect(codes(r)).toContain('UNKNOWN_FIELD');
-      expect(r.preset.schemaVersion).toBe(5);
+      expect(r.preset.schemaVersion).toBe(6);
       expect('extra' in r.preset).toBe(false);
     }
   });
@@ -167,7 +170,7 @@ describe('validate — happy path & normalization', () => {
 
   it('drops unknown keys and warns at root and nested paths', () => {
     const r = validate({
-      schemaVersion: 5,
+      schemaVersion: 6,
       name: 'x',
       durationSec: 100,
       masterGain: 1,
@@ -187,7 +190,7 @@ describe('validate — happy path & normalization', () => {
 
   it('preserves mod absent / null / empty-object losslessly', () => {
     const r = validate({
-      schemaVersion: 5,
+      schemaVersion: 6,
       name: 'x',
       durationSec: 100,
       masterGain: 1,
@@ -241,7 +244,7 @@ describe('validate — happy path & normalization', () => {
 
   it('collects all independent errors without fail-fast', () => {
     const r = validate({
-      schemaVersion: 5,
+      schemaVersion: 6,
       name: '',
       durationSec: -1,
       masterGain: 2,
@@ -498,7 +501,7 @@ describe('validate — ModPoint advisory warnings keep ok:true', () => {
 describe('validate — box modulator shape', () => {
   it('accepts box as a valid mod shape (additive enum, no schema bump)', () => {
     expect(validate(beatMod({ shape: 'box', periodSec: 16, depth: 0.2 })).ok).toBe(true);
-    expect(CURRENT_SCHEMA_VERSION).toBe(5); // box is additive — version is the current schema
+    expect(CURRENT_SCHEMA_VERSION).toBe(6); // box is additive — version is the current schema
   });
 
   it('reads pulseWidth as the box hold ratio: in range, NOT ignored', () => {
@@ -571,7 +574,7 @@ describe('sortNodes', () => {
 describe('clonePreset', () => {
   it('returns a deep-equal, independent graph preserving null and double precision', () => {
     const p: Preset = {
-      schemaVersion: 5,
+      schemaVersion: 6,
       name: 'x',
       durationSec: 100,
       masterGain: 0.123456789012345,
@@ -591,7 +594,7 @@ describe('clonePreset', () => {
 describe('createDefaultPreset', () => {
   it('deep-equals the documented starter object', () => {
     expect(createDefaultPreset()).toEqual({
-      schemaVersion: 5,
+      schemaVersion: 6,
       name: 'Untitled Session',
       durationSec: 300,
       masterGain: 0.8,
@@ -617,33 +620,44 @@ describe('createDefaultPreset', () => {
 // --- Task 5: migrate / parse / parseOrThrow --------------------------------
 
 describe('migrate', () => {
-  it('passes a version-5 object through unchanged with fromVersion 5', () => {
-    const raw = { schemaVersion: 5, name: 'x' };
+  it('passes a version-6 object through unchanged with fromVersion 6', () => {
+    const raw = { schemaVersion: 6, name: 'x' };
     const r = migrate(raw);
     expect(r.ok).toBe(true);
     if (r.ok) {
       expect(r.value).toBe(raw);
+      expect(r.fromVersion).toBe(6);
+    }
+  });
+
+  it('migrates a version-5 object up to v6 (version-bumps) with fromVersion 5', () => {
+    const raw = { schemaVersion: 5, name: 'x' };
+    const r = migrate(raw);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect((r.value as { schemaVersion: number }).schemaVersion).toBe(6);
+      expect((r.value as { name: string }).name).toBe('x');
       expect(r.fromVersion).toBe(5);
     }
   });
 
-  it('migrates a version-3 object up to v5 (version-bumps) with fromVersion 3', () => {
+  it('migrates a version-3 object up to v6 (version-bumps) with fromVersion 3', () => {
     const raw = { schemaVersion: 3, name: 'x' };
     const r = migrate(raw);
     expect(r.ok).toBe(true);
     if (r.ok) {
-      expect((r.value as { schemaVersion: number }).schemaVersion).toBe(5);
+      expect((r.value as { schemaVersion: number }).schemaVersion).toBe(6);
       expect((r.value as { name: string }).name).toBe('x');
       expect(r.fromVersion).toBe(3);
     }
   });
 
-  it('migrates a version-2 object up to v5 (three version-bumps) with fromVersion 2', () => {
+  it('migrates a version-2 object up to v6 (four version-bumps) with fromVersion 2', () => {
     const raw = { schemaVersion: 2, name: 'x' };
     const r = migrate(raw);
     expect(r.ok).toBe(true);
     if (r.ok) {
-      expect((r.value as { schemaVersion: number }).schemaVersion).toBe(5);
+      expect((r.value as { schemaVersion: number }).schemaVersion).toBe(6);
       expect((r.value as { name: string }).name).toBe('x');
       expect(r.fromVersion).toBe(2);
     }
@@ -710,7 +724,7 @@ describe('migrate', () => {
     expect(notOkCode(migrate({}))).toBe('SCHEMA_VERSION_MISSING');
     expect(notOkCode(migrate({ schemaVersion: '2' }))).toBe('SCHEMA_VERSION_NOT_INTEGER');
     expect(notOkCode(migrate({ schemaVersion: 1 }))).toBe('SCHEMA_TOO_OLD');
-    expect(notOkCode(migrate({ schemaVersion: 6 }))).toBe('SCHEMA_TOO_NEW');
+    expect(notOkCode(migrate({ schemaVersion: 7 }))).toBe('SCHEMA_TOO_NEW');
     expect(notOkCode(migrate(5))).toBe('NOT_OBJECT');
   });
 });
@@ -732,45 +746,45 @@ describe('parse', () => {
     expect(notOkCode(parse('"hi"'))).toBe('NOT_OBJECT');
   });
 
-  it('loads a current (v5) preset with migratedFrom null', () => {
+  it('loads a current (v6) preset with migratedFrom null', () => {
     const r = parse(serialize(createDefaultPreset()));
     expect(r.ok).toBe(true);
     if (r.ok) expect(r.migratedFrom).toBeNull();
   });
 
-  it('migrates a v2 JSON preset up to v5 with migratedFrom 2', () => {
+  it('migrates a v2 JSON preset up to v6 with migratedFrom 2', () => {
     const r = parse('{"schemaVersion":2,"name":"x","durationSec":100,"masterGain":0.8,"nodes":[{"t":0,"carrier":{"value":200}}]}');
     expect(r.ok).toBe(true);
     if (r.ok) {
-      expect(r.preset.schemaVersion).toBe(5);
+      expect(r.preset.schemaVersion).toBe(6);
       expect(r.migratedFrom).toBe(2);
     }
   });
 
-  it('migrates a v3 JSON preset (with spatial) up to v5 with migratedFrom 3', () => {
+  it('migrates a v3 JSON preset (with spatial) up to v6 with migratedFrom 3', () => {
     const r = parse('{"schemaVersion":3,"name":"x","durationSec":100,"masterGain":0.8,"nodes":[{"t":0,"carrier":{"value":200},"spatial":{"value":-0.5}}]}');
     expect(r.ok).toBe(true);
     if (r.ok) {
-      expect(r.preset.schemaVersion).toBe(5);
+      expect(r.preset.schemaVersion).toBe(6);
       expect(r.migratedFrom).toBe(3);
-      expect('layers' in r.preset).toBe(false); // v3→v5 adds no layers
+      expect('layers' in r.preset).toBe(false); // v3→v6 adds no layers
       expect(r.preset.nodes[0].spatial).toEqual({ value: -0.5 });
     }
   });
 
   it('gates schema versions', () => {
     expect(notOkCode(parse('{"schemaVersion":1,"name":"x","durationSec":1,"masterGain":1,"nodes":[]}'))).toBe('SCHEMA_TOO_OLD');
-    expect(notOkCode(parse('{"schemaVersion":6,"name":"x","durationSec":1,"masterGain":1,"nodes":[]}'))).toBe('SCHEMA_TOO_NEW');
+    expect(notOkCode(parse('{"schemaVersion":7,"name":"x","durationSec":1,"masterGain":1,"nodes":[]}'))).toBe('SCHEMA_TOO_NEW');
     expect(notOkCode(parse('{"name":"x"}'))).toBe('SCHEMA_VERSION_MISSING');
     expect(notOkCode(parse('{"schemaVersion":2.5}'))).toBe('SCHEMA_VERSION_NOT_INTEGER');
   });
 
   it('pre-sorts out-of-order nodes; only true duplicates survive', () => {
-    const ordered = parse('{"schemaVersion":5,"name":"x","durationSec":100,"masterGain":1,"nodes":[{"t":0,"carrier":{"value":200}},{"t":10,"volume":{"value":0.5}},{"t":5,"volume":{"value":0.8}}]}');
+    const ordered = parse('{"schemaVersion":6,"name":"x","durationSec":100,"masterGain":1,"nodes":[{"t":0,"carrier":{"value":200}},{"t":10,"volume":{"value":0.5}},{"t":5,"volume":{"value":0.8}}]}');
     expect(ordered.ok).toBe(true);
     if (ordered.ok) expect(ordered.preset.nodes.map((n) => n.t)).toEqual([0, 5, 10]);
 
-    const dup = parse('{"schemaVersion":5,"name":"x","durationSec":100,"masterGain":1,"nodes":[{"t":0,"carrier":{"value":200}},{"t":5,"volume":{"value":0.5}},{"t":5,"volume":{"value":0.8}}]}');
+    const dup = parse('{"schemaVersion":6,"name":"x","durationSec":100,"masterGain":1,"nodes":[{"t":0,"carrier":{"value":200}},{"t":5,"volume":{"value":0.5}},{"t":5,"volume":{"value":0.8}}]}');
     expect(dup.ok).toBe(false);
     expect(codes(dup)).toContain('NODES_DUPLICATE_T');
   });
@@ -805,7 +819,7 @@ describe('serialize', () => {
 
   it('preserves mod:null through the round-trip', () => {
     const p: Preset = {
-      schemaVersion: 5,
+      schemaVersion: 6,
       name: 'x',
       durationSec: 100,
       masterGain: 1,
@@ -825,13 +839,13 @@ describe('serialize', () => {
   });
 
   it('produces canonical key order regardless of input key order', () => {
-    const a = validate({ schemaVersion: 5, name: 'x', durationSec: 100, masterGain: 0.8, nodes: [{ volume: { value: 1 }, beat: { value: 8 }, carrier: { value: 200 }, t: 0 }] });
-    const b = validate({ nodes: [{ t: 0, carrier: { value: 200 }, beat: { value: 8 }, volume: { value: 1 } }], masterGain: 0.8, durationSec: 100, name: 'x', schemaVersion: 5 });
+    const a = validate({ schemaVersion: 6, name: 'x', durationSec: 100, masterGain: 0.8, nodes: [{ volume: { value: 1 }, beat: { value: 8 }, carrier: { value: 200 }, t: 0 }] });
+    const b = validate({ nodes: [{ t: 0, carrier: { value: 200 }, beat: { value: 8 }, volume: { value: 1 } }], masterGain: 0.8, durationSec: 100, name: 'x', schemaVersion: 6 });
     expect(a.ok && b.ok).toBe(true);
     if (a.ok && b.ok) {
       const sa = serialize(a.preset);
       expect(sa).toBe(serialize(b.preset));
-      expect(sa.startsWith('{"schemaVersion":5,"name":"x","durationSec":100,"masterGain":0.8,"nodes":[{"t":0,"carrier":')).toBe(true);
+      expect(sa.startsWith('{"schemaVersion":6,"name":"x","durationSec":100,"masterGain":0.8,"nodes":[{"t":0,"carrier":')).toBe(true);
     }
   });
 
@@ -841,7 +855,7 @@ describe('serialize', () => {
   });
 
   it('throws SessionModelError on an invalid preset (never writes corrupt JSON)', () => {
-    const bad = { schemaVersion: 5, name: '', durationSec: 100, masterGain: 1, nodes: [{ t: 0, carrier: { value: 200 } }] } as unknown as Preset;
+    const bad = { schemaVersion: 6, name: '', durationSec: 100, masterGain: 1, nodes: [{ t: 0, carrier: { value: 200 } }] } as unknown as Preset;
     expect(() => serialize(bad)).toThrow(SessionModelError);
   });
 });
@@ -857,8 +871,8 @@ describe('isPreset', () => {
 
 describe('presetsEqual', () => {
   it('is key-order-independent', () => {
-    const p1 = { schemaVersion: 5, name: 'x', durationSec: 100, masterGain: 0.8, nodes: [{ t: 0, carrier: { value: 200 }, beat: { value: 8 } }] } as Preset;
-    const p2 = { nodes: [{ beat: { value: 8 }, carrier: { value: 200 }, t: 0 }], masterGain: 0.8, durationSec: 100, name: 'x', schemaVersion: 5 } as Preset;
+    const p1 = { schemaVersion: 6, name: 'x', durationSec: 100, masterGain: 0.8, nodes: [{ t: 0, carrier: { value: 200 }, beat: { value: 8 } }] } as Preset;
+    const p2 = { nodes: [{ beat: { value: 8 }, carrier: { value: 200 }, t: 0 }], masterGain: 0.8, durationSec: 100, name: 'x', schemaVersion: 6 } as Preset;
     expect(presetsEqual(p1, p2)).toBe(true);
   });
 
@@ -871,7 +885,7 @@ describe('presetsEqual', () => {
 
   it('throws SessionModelError when either argument is invalid', () => {
     const valid = createDefaultPreset();
-    const invalid = { schemaVersion: 5, name: '', durationSec: 100, masterGain: 1, nodes: [{ t: 0, carrier: { value: 200 } }] } as unknown as Preset;
+    const invalid = { schemaVersion: 6, name: '', durationSec: 100, masterGain: 1, nodes: [{ t: 0, carrier: { value: 200 } }] } as unknown as Preset;
     expect(() => presetsEqual(valid, invalid)).toThrow(SessionModelError);
     expect(() => presetsEqual(invalid, valid)).toThrow(SessionModelError);
   });
@@ -906,7 +920,7 @@ describe('spatial pan (v3)', () => {
 
   it('round-trips spatial (incl. mod) through serialize → parse', () => {
     const p: Preset = {
-      schemaVersion: 5,
+      schemaVersion: 6,
       name: 'spatial',
       durationSec: 100,
       masterGain: 0.8,
@@ -932,7 +946,7 @@ function withLayers(layers: unknown, over: AnyObj = {}): AnyObj {
 // The interfaces.md §10 layered example — the happy-path fixture.
 function layeredFixture(): Preset {
   return {
-    schemaVersion: 5,
+    schemaVersion: 6,
     name: 'Guided Drift',
     durationSec: 1800,
     masterGain: 0.8,
@@ -1312,28 +1326,28 @@ describe('v4 layers — normalization edge cases', () => {
 });
 
 describe('v4 layers — migration', () => {
-  it('migrates a v2 preset → v5 (migratedFrom 2, no spatial, no layers)', () => {
+  it('migrates a v2 preset → v6 (migratedFrom 2, no spatial, no layers)', () => {
     const r = parse('{"schemaVersion":2,"name":"x","durationSec":100,"masterGain":0.8,"nodes":[{"t":0,"carrier":{"value":200}}]}');
     expect(r.ok).toBe(true);
     if (r.ok) {
-      expect(r.preset.schemaVersion).toBe(5);
+      expect(r.preset.schemaVersion).toBe(6);
       expect(r.migratedFrom).toBe(2);
       expect('layers' in r.preset).toBe(false);
       expect('spatial' in r.preset.nodes[0]).toBe(false);
     }
   });
 
-  it('migrates a v3 preset → v5 (migratedFrom 3, layers absent)', () => {
+  it('migrates a v3 preset → v6 (migratedFrom 3, layers absent)', () => {
     const r = parse('{"schemaVersion":3,"name":"x","durationSec":100,"masterGain":0.8,"nodes":[{"t":0,"carrier":{"value":200}}]}');
     expect(r.ok).toBe(true);
     if (r.ok) {
-      expect(r.preset.schemaVersion).toBe(5);
+      expect(r.preset.schemaVersion).toBe(6);
       expect(r.migratedFrom).toBe(3);
       expect('layers' in r.preset).toBe(false);
     }
   });
 
-  it('passes a v5 layered preset through with migratedFrom null', () => {
+  it('passes a v6 layered preset through with migratedFrom null', () => {
     const r = parse(serialize(layeredFixture()));
     expect(r.ok).toBe(true);
     if (r.ok) {
@@ -1342,8 +1356,8 @@ describe('v4 layers — migration', () => {
     }
   });
 
-  it('gates schemaVersion 6 (too new) and 1 (too old)', () => {
-    expect(notOkCode(parse('{"schemaVersion":6,"name":"x","durationSec":1,"masterGain":1,"nodes":[]}'))).toBe('SCHEMA_TOO_NEW');
+  it('gates schemaVersion 7 (too new) and 1 (too old)', () => {
+    expect(notOkCode(parse('{"schemaVersion":7,"name":"x","durationSec":1,"masterGain":1,"nodes":[]}'))).toBe('SCHEMA_TOO_NEW');
     expect(notOkCode(parse('{"schemaVersion":1,"name":"x","durationSec":1,"masterGain":1,"nodes":[]}'))).toBe('SCHEMA_TOO_OLD');
   });
 });
@@ -1389,5 +1403,382 @@ describe('v4 layers — sparse round-trip guarantees', () => {
     expect(round.layers?.[0].duck).toEqual({ toGain: 0.2, attackSec: 0.3, releaseSec: 1 });
     expect('duck' in (round.layers![1] as object)).toBe(false);
     expect(presetsEqual(p, round)).toBe(true);
+  });
+});
+
+// --- v6: multi-voice (voices[]) --------------------------------------------
+// Each voice is an independent generator stacked on the session; its `nodes` reuse the SAME
+// shape + validation as the top-level (primary) nodes (multi-voice-architecture §1). The
+// container/identity/gain/cap/separation surface mints the NEW VOICE_*/VOICES_* codes (§1.2).
+
+// A well-separated extra voice (carrier 400 vs the mkPreset primary's 200 → ratio 2.0,
+// gap 200 Hz) — clears the VOICES_CARRIER_TOO_CLOSE advisory by default.
+function mkVoice(over: AnyObj = {}): AnyObj {
+  return { id: 'v1', nodes: [{ t: 0, carrier: { value: 400 }, beat: { value: 6 } }], ...over };
+}
+
+// Wrap a voices value onto an otherwise-valid single-voice preset.
+function withVoices(voices: unknown, over: AnyObj = {}): AnyObj {
+  return mkPreset({ voices, ...over });
+}
+
+describe('v6 multi-voice — constants', () => {
+  it('RANGES.voiceGain caps per-voice trim at [0,1]', () => {
+    expect(RANGES.voiceGain).toEqual({ min: 0, max: 1 });
+  });
+
+  it('LIMITS carries the v6 voice caps (1 + voices.length ≤ 4; ≤ 8 pulse worklets)', () => {
+    expect(LIMITS.maxVoices).toBe(4);
+    expect(LIMITS.maxPulseWorklets).toBe(8);
+  });
+
+  it('DEFAULTS.voiceGain is 1 (eval-time carry, never baked)', () => {
+    expect(DEFAULTS.voiceGain).toBe(1);
+  });
+});
+
+describe('v6 multi-voice — Voice type (type-level)', () => {
+  it('exposes the Voice shape and Preset.voices', () => {
+    const voice: Voice = { id: 'iso', name: 'Gamma', gain: 0.7, nodes: [{ t: 0, carrier: { value: 432 } }] };
+    const minimal: Voice = { id: 'beta', nodes: [{ t: 0, carrier: { value: 700 } }] };
+    const preset: Preset = { ...createDefaultPreset(), voices: [voice, minimal] };
+    expect(preset.voices?.[0].id).toBe('iso');
+    expect(preset.voices?.[1].gain).toBeUndefined();
+  });
+});
+
+describe('voiceView', () => {
+  it('projects a voice\'s nodes onto the session-global fields, dropping layers/voices', () => {
+    const preset = layeredFixture();
+    const voiceNodes: TimeNode[] = [{ t: 0, carrier: { value: 400 }, beat: { value: 0 } }];
+    const view = voiceView(preset, voiceNodes);
+    expect(view).toEqual({
+      schemaVersion: 6,
+      name: preset.name,
+      durationSec: preset.durationSec,
+      masterGain: preset.masterGain,
+      nodes: voiceNodes,
+    });
+    expect('layers' in view).toBe(false);
+    expect('voices' in view).toBe(false);
+  });
+
+  it('shares the passed nodes by reference (no copy) so edits stay in sync', () => {
+    const preset = createDefaultPreset();
+    expect(voiceView(preset, preset.nodes).nodes).toBe(preset.nodes);
+  });
+
+  it('returns a Preset that itself validates (render == playback by construction)', () => {
+    const view = voiceView(createDefaultPreset(), [{ t: 0, carrier: { value: 400 }, beat: { value: 6 } }]);
+    expect(validate(view).ok).toBe(true);
+  });
+});
+
+describe('v6 multi-voice — happy path & normalization', () => {
+  it('accepts a preset with a well-separated isochronic extra voice (no issues)', () => {
+    const r = validate(withVoices([
+      { id: 'iso', nodes: [{ t: 0, carrier: { value: 432 }, beat: { value: 0 }, volume: { value: 1, mod: { shape: 'pulse', periodSec: 0.025, depth: 0.8 } } }] },
+    ]));
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.issues).toEqual([]);
+      expect(r.preset.voices).toHaveLength(1);
+    }
+  });
+
+  it('treats absent voices as single-voice (no key created on the normalized clone)', () => {
+    const r = validate(mkPreset());
+    expect(r.ok).toBe(true);
+    if (r.ok) expect('voices' in r.preset).toBe(false);
+  });
+
+  it('preserves an explicit empty voices:[] (present, like layers:[])', () => {
+    const r = validate(withVoices([]));
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.preset.voices).toEqual([]);
+      expect('voices' in r.preset).toBe(true);
+    }
+  });
+
+  it('normalizes voice keys into canonical order id, name, gain, nodes', () => {
+    const r = validate(withVoices([{ nodes: [{ carrier: { value: 400 }, t: 0 }], gain: 0.5, name: 'B', id: 'b' }]));
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(JSON.stringify(r.preset.voices)).toContain(
+        '{"id":"b","name":"B","gain":0.5,"nodes":[{"t":0,"carrier":{"value":400}}]}',
+      );
+    }
+  });
+
+  it('keeps absent name/gain absent on the normalized voice (sparse)', () => {
+    const r = validate(withVoices([mkVoice()]));
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      const v = r.preset.voices![0] as object;
+      expect('name' in v).toBe(false);
+      expect('gain' in v).toBe(false);
+    }
+  });
+
+  it('never mutates the input multi-voice preset', () => {
+    const input = withVoices([mkVoice({ gain: 0.5, name: 'B' })]);
+    const snapshot = structuredClone(input);
+    validate(input);
+    expect(input).toEqual(snapshot);
+  });
+});
+
+describe('v6 multi-voice — every container/identity/gain/cap code is reachable', () => {
+  const V = (over: AnyObj): AnyObj => ({ id: 'V', nodes: [{ t: 0, carrier: { value: 400 } }], ...over });
+  const cases: Array<[string, unknown, ValidationCode]> = [
+    ['voices not array', withVoices({}), 'VOICES_NOT_ARRAY'],
+    ['voice not object', withVoices([5]), 'VOICE_NOT_OBJECT'],
+    ['id not string', withVoices([V({ id: 5 })]), 'VOICE_ID_NOT_STRING'],
+    ['id empty (whitespace)', withVoices([V({ id: '  ' })]), 'VOICE_ID_EMPTY'],
+    ['id duplicate', withVoices([V({ id: 'dup' }), V({ id: 'dup', nodes: [{ t: 0, carrier: { value: 700 } }] })]), 'VOICE_ID_DUPLICATE'],
+    ['gain not finite', withVoices([V({ gain: NaN })]), 'VOICE_GAIN_NOT_FINITE'],
+    ['gain out of range', withVoices([V({ gain: 1.5 })]), 'VOICE_GAIN_OUT_OF_RANGE'],
+    ['nodes not array', withVoices([V({ nodes: {} })]), 'VOICE_NODES_NOT_ARRAY'],
+    ['nodes empty', withVoices([V({ nodes: [] })]), 'VOICE_NODES_EMPTY'],
+    ['too many voices', withVoices([
+      V({ id: 'a', nodes: [{ t: 0, carrier: { value: 300 } }] }),
+      V({ id: 'b', nodes: [{ t: 0, carrier: { value: 450 } }] }),
+      V({ id: 'c', nodes: [{ t: 0, carrier: { value: 600 } }] }),
+      V({ id: 'd', nodes: [{ t: 0, carrier: { value: 900 } }] }),
+    ]), 'VOICES_TOO_MANY'],
+  ];
+
+  it.each(cases)('flags %s as %s', (_desc, input, code) => {
+    const r = validate(input);
+    expect(r.ok).toBe(false);
+    expect(codes(r)).toContain(code);
+  });
+});
+
+describe('v6 multi-voice — per-voice nodes reuse the node contract at voices[k].nodes paths', () => {
+  it('flags an out-of-range carrier inside a voice at voices[0].nodes[0].carrier.value', () => {
+    const r = validate(withVoices([{ id: 'a', nodes: [{ t: 0, carrier: { value: 5 } }] }]));
+    expect(r.ok).toBe(false);
+    const issue = r.issues.find((i) => i.code === 'PARAM_VALUE_OUT_OF_RANGE');
+    expect(issue?.path).toBe('voices[0].nodes[0].carrier.value');
+    // message stays param-relative (not path-prefixed), mirroring spatial's reuse.
+    expect(issue?.message).toBe('"carrier.value" must be within [20, 1000], got 5');
+  });
+
+  it('requires carrier at t=0 inside a voice (CARRIER_NOT_AT_START at voices[0].nodes[0])', () => {
+    const r = validate(withVoices([{ id: 'a', nodes: [{ t: 0, beat: { value: 8 } }] }]));
+    expect(r.ok).toBe(false);
+    expect(r.issues.find((i) => i.code === 'CARRIER_NOT_AT_START')?.path).toBe('voices[0].nodes[0]');
+  });
+
+  it('enforces unique t and t ≤ durationSec per voice', () => {
+    const dup = validate(withVoices([{ id: 'a', nodes: [{ t: 0, carrier: { value: 400 } }, { t: 5, beat: { value: 6 } }, { t: 5, beat: { value: 4 } }] }]));
+    expect(codes(dup)).toContain('NODES_DUPLICATE_T');
+    const exceeds = validate(withVoices([{ id: 'a', nodes: [{ t: 0, carrier: { value: 400 } }, { t: 200, beat: { value: 6 } }] }], { durationSec: 100 }));
+    expect(codes(exceeds)).toContain('NODE_T_EXCEEDS_DURATION');
+  });
+
+  it('reports a primary-node error AND a voice-node error in one pass (collect-all)', () => {
+    const r = validate(mkPreset({
+      nodes: [{ t: 0, carrier: { value: 5 } }],
+      voices: [{ id: 'a', nodes: [{ t: 0, carrier: { value: 9 } }] }],
+    }));
+    expect(r.ok).toBe(false);
+    const paths = r.issues.filter((i) => i.code === 'PARAM_VALUE_OUT_OF_RANGE').map((i) => i.path);
+    expect(paths).toContain('nodes[0].carrier.value');
+    expect(paths).toContain('voices[0].nodes[0].carrier.value');
+  });
+});
+
+describe('v6 multi-voice — verbatim container/identity/gain messages', () => {
+  function findIn(input: unknown, code: ValidationCode): ValidationIssue | undefined {
+    return validate(input).issues.find((i) => i.code === code);
+  }
+  const V = (over: AnyObj): AnyObj => ({ id: 'V', nodes: [{ t: 0, carrier: { value: 400 } }], ...over });
+
+  it('uses documented messages and voices[i]… paths', () => {
+    expect(findIn(withVoices({}), 'VOICES_NOT_ARRAY')?.message).toBe('"voices" must be an array');
+    expect(findIn(withVoices([5]), 'VOICE_NOT_OBJECT')?.path).toBe('voices[0]');
+    expect(findIn(withVoices([5]), 'VOICE_NOT_OBJECT')?.message).toBe('Voice must be an object');
+    const dup = findIn(withVoices([V({ id: 'dup' }), V({ id: 'dup', nodes: [{ t: 0, carrier: { value: 700 } }] })]), 'VOICE_ID_DUPLICATE');
+    expect(dup?.path).toBe('voices[1].id');
+    expect(dup?.message).toBe('Duplicate voice id "dup"; voice ids must be unique');
+    expect(findIn(withVoices([V({ gain: 1.5 })]), 'VOICE_GAIN_OUT_OF_RANGE')?.message).toBe('"gain" must be within [0, 1], got 1.5');
+    const many = findIn(withVoices([
+      V({ id: 'a', nodes: [{ t: 0, carrier: { value: 300 } }] }),
+      V({ id: 'b', nodes: [{ t: 0, carrier: { value: 450 } }] }),
+      V({ id: 'c', nodes: [{ t: 0, carrier: { value: 600 } }] }),
+      V({ id: 'd', nodes: [{ t: 0, carrier: { value: 900 } }] }),
+    ]), 'VOICES_TOO_MANY');
+    expect(many?.path).toBe('voices');
+    expect(many?.message).toBe('A session may have at most 4 voices (1 primary + 3 additional), got 5');
+  });
+});
+
+describe('v6 multi-voice — carrier-separation advisory (warning, ok stays true)', () => {
+  it('warns VOICES_CARRIER_TOO_CLOSE when two t=0 carriers are within 30 Hz', () => {
+    // primary carrier 200 (mkPreset), voice 210 → gap 20 Hz < 30 (also ratio 1.05 < 1.1).
+    const r = validate(withVoices([{ id: 'a', nodes: [{ t: 0, carrier: { value: 210 }, beat: { value: 6 } }] }]));
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      const w = r.issues.find((i) => i.code === 'VOICES_CARRIER_TOO_CLOSE');
+      expect(w?.severity).toBe('warning');
+      expect(w?.path).toBe('voices[0].nodes[0].carrier');
+      expect(w?.message).toBe(
+        'Voice carriers 200 Hz and 210 Hz are too close (within ratio 1.1 or 30 Hz); separate them by ≥ ratio 1.25 (≈ one critical band) so the voices don\'t mask or cross-beat',
+      );
+    }
+  });
+
+  it('does not warn when carriers clear ratio 1.1 and 30 Hz', () => {
+    const r = validate(withVoices([{ id: 'a', nodes: [{ t: 0, carrier: { value: 400 }, beat: { value: 6 } }] }]));
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(codes(r)).not.toContain('VOICES_CARRIER_TOO_CLOSE');
+  });
+});
+
+describe('v6 multi-voice — pulse-worklet cap across all voices', () => {
+  const carrierPulse = { shape: 'pulse', periodSec: 1, depth: 0.2 };
+  const volPulse = { shape: 'pulse', periodSec: 1, depth: 0.5 };
+  const lanedNode = (carrier: number): AnyObj => ({
+    t: 0,
+    carrier: { value: carrier, mod: carrierPulse },
+    beat: { value: 6, mod: carrierPulse },
+    volume: { value: 1, mod: volPulse },
+    spatial: { value: 0, mod: volPulse },
+  });
+
+  it('flags VOICES_TOO_MANY_PULSES when pulse-shaped mods across voices exceed 8', () => {
+    // primary 4 lanes + voice a 4 lanes + voice b 1 lane = 9 > 8.
+    const r = validate(mkPreset({
+      nodes: [lanedNode(200)],
+      voices: [
+        { id: 'a', nodes: [lanedNode(450)] },
+        { id: 'b', nodes: [{ t: 0, carrier: { value: 700 }, beat: { value: 6, mod: carrierPulse } }] },
+      ],
+    }));
+    expect(r.ok).toBe(false);
+    expect(codes(r)).toContain('VOICES_TOO_MANY_PULSES');
+  });
+
+  it('accepts pulse mods at or below the limit of 8', () => {
+    const r = validate(mkPreset({
+      nodes: [{ t: 0, carrier: { value: 200 }, beat: { value: 6, mod: carrierPulse } }],
+      voices: [{ id: 'a', nodes: [{ t: 0, carrier: { value: 400 }, beat: { value: 6, mod: carrierPulse } }] }],
+    }));
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(codes(r)).not.toContain('VOICES_TOO_MANY_PULSES');
+  });
+});
+
+describe('v6 multi-voice — round-trip linchpin (the executable channel proof)', () => {
+  function multiVoiceFixture(): Preset {
+    return {
+      schemaVersion: 6,
+      name: 'Dual',
+      durationSec: 600,
+      masterGain: 0.8,
+      nodes: [{ t: 0, carrier: { value: 200 }, beat: { value: 8 }, volume: { value: 1 } }],
+      voices: [
+        { id: 'iso', name: 'Gamma Pulse', gain: 0.6, nodes: [{ t: 0, carrier: { value: 432 }, beat: { value: 0 }, volume: { value: 1, mod: { shape: 'pulse', periodSec: 0.025, depth: 0.8 } } }] },
+        { id: 'beta', nodes: [{ t: 0, carrier: { value: 700 }, beat: { value: 18 } }] },
+      ],
+    };
+  }
+
+  it('survives serialize → parse as presetsEqual (proves normalizeVoice + PRESET_KEYS are live)', () => {
+    const p = multiVoiceFixture();
+    const round = parseOrThrow(serialize(p));
+    expect(presetsEqual(p, round)).toBe(true);
+    expect(round.voices).toHaveLength(2);
+    expect(round.voices?.[0]).toEqual({
+      id: 'iso',
+      name: 'Gamma Pulse',
+      gain: 0.6,
+      nodes: [{ t: 0, carrier: { value: 432 }, beat: { value: 0 }, volume: { value: 1, mod: { shape: 'pulse', periodSec: 0.025, depth: 0.8 } } }],
+    });
+    // a voice with no name/gain keeps them absent through the round-trip.
+    expect('name' in (round.voices![1] as object)).toBe(false);
+    expect('gain' in (round.voices![1] as object)).toBe(false);
+  });
+
+  it('keeps absent voices absent through serialize → parse', () => {
+    const p = createDefaultPreset();
+    const round = parseOrThrow(serialize(p));
+    expect('voices' in round).toBe(false);
+    expect(presetsEqual(p, round)).toBe(true);
+  });
+
+  it('keeps a present empty voices:[] through serialize → parse', () => {
+    const p: Preset = { ...createDefaultPreset(), voices: [] };
+    const s = serialize(p);
+    expect(s).toContain('"voices":[]');
+    const round = parseOrThrow(s);
+    expect(round.voices).toEqual([]);
+    expect(presetsEqual(p, round)).toBe(true);
+  });
+});
+
+describe('v6 multi-voice — migration', () => {
+  it('passes a v6 multi-voice preset through with migratedFrom null', () => {
+    const p: Preset = { ...createDefaultPreset(), voices: [{ id: 'a', nodes: [{ t: 0, carrier: { value: 400 }, beat: { value: 6 } }] }] };
+    const r = parse(serialize(p));
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.migratedFrom).toBeNull();
+      expect(r.preset.voices).toHaveLength(1);
+    }
+  });
+
+  it('migrates a v5 preset → v6 with voices absent (migratedFrom 5)', () => {
+    const r = parse('{"schemaVersion":5,"name":"x","durationSec":100,"masterGain":0.8,"nodes":[{"t":0,"carrier":{"value":200}}]}');
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.preset.schemaVersion).toBe(6);
+      expect(r.migratedFrom).toBe(5);
+      expect('voices' in r.preset).toBe(false);
+    }
+  });
+});
+
+describe('v6 voiceScript — embedded narration script (D-043)', () => {
+  const SCRIPT = { version: 1, purpose: 'meditation', blocks: [{ lines: [{ say: 'hello' }] }] };
+
+  it('normalize preserves an embedded voiceScript verbatim (the allowlist-copy linchpin)', () => {
+    const r = validate({ ...createDefaultPreset(), voiceScript: SCRIPT });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.preset.voiceScript).toEqual(SCRIPT);
+  });
+
+  it('round-trips through serialize→parse (save/load) unchanged', () => {
+    const p = { ...createDefaultPreset(), voiceScript: SCRIPT } as Preset;
+    const r = parse(serialize(p));
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.preset.voiceScript).toEqual(SCRIPT);
+  });
+
+  it('deep-clones so the normalized preset never aliases the input object', () => {
+    const input = { ...createDefaultPreset(), voiceScript: { version: 1, blocks: [{ lines: [{ say: 'x' }] }] } };
+    const r = validate(input);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.preset.voiceScript).not.toBe(input.voiceScript); // distinct reference (deep clone)
+      expect(r.preset.voiceScript).toEqual(input.voiceScript); // same content
+    }
+  });
+
+  it('absent voiceScript stays absent (sparse, like layers/voices)', () => {
+    const r = validate(createDefaultPreset());
+    expect(r.ok).toBe(true);
+    if (r.ok) expect('voiceScript' in r.preset).toBe(false);
+  });
+
+  it('rejects a non-object voiceScript with VOICE_SCRIPT_NOT_OBJECT', () => {
+    for (const bad of [[1, 2], 'a string', 42, true]) {
+      const r = validate({ ...createDefaultPreset(), voiceScript: bad });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.issues.some((i) => i.code === 'VOICE_SCRIPT_NOT_OBJECT')).toBe(true);
+    }
   });
 });

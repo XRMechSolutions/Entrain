@@ -29,8 +29,10 @@
     /** Show the transition selector. The console hides it (node-0 interpolation is a no-op,
      *  there is no previous node to ramp from); the inspector shows it. */
     showInterpolation?: boolean;
+    /** Which voice's nodes to read/mutate. Omit for the primary voice (voice 0). */
+    voiceId?: string;
   }
-  let { index, param, showInterpolation = false }: Props = $props();
+  let { index, param, showInterpolation = false, voiceId }: Props = $props();
 
   const { session } = getAppContext();
 
@@ -43,22 +45,26 @@
   const spec = $derived(CONTROL[param]);
   const label = $derived(param.charAt(0).toUpperCase() + param.slice(1));
 
+  // Derive the active voice's preset view — re-resolves on every revision and voiceId change.
+  // All display reads go through this view so an extra-voice inspector shows the correct values.
+  const vView = $derived(read(() => session.voiceView(voiceId)));
+
   // One-way derived displays (all depend on session.revision). An absent lane shows its
   // eval-time default (spatial = 0 center, volume = 1, beat = 0) — NOT spec.min, which for
   // spatial would wrongly read full-left. Carrier is always present, so its min is only a
   // defensive fallback.
   const fallback = $derived(param === 'carrier' ? spec.min : DEFAULTS[param]);
-  const value = $derived(read(() => session.preset.nodes[index]?.[param]?.value ?? fallback));
-  const transition = $derived<ParamTransition>(read(() => session.preset.nodes[index]?.[param]?.transition ?? 'linear'));
-  const expGreyed = $derived(read(() => expDisabled(session.preset, index, param)));
+  const value = $derived(vView.nodes[index]?.[param]?.value ?? fallback);
+  const transition = $derived<ParamTransition>(vView.nodes[index]?.[param]?.transition ?? 'linear');
+  const expGreyed = $derived(expDisabled(vView, index, param));
 
   const TRANSITIONS: ReadonlyArray<ParamTransition> = ['linear', 'exp', 'hold', 'smooth'];
 
   function commitValue(v: number): void {
-    session.setNodeValue(index, param, v);
+    session.setNodeValue(index, param, v, voiceId);
   }
   function commitTransition(tr: ParamTransition): void {
-    session.setNodeTransition(index, param, tr);
+    session.setNodeTransition(index, param, tr, voiceId);
   }
 </script>
 
@@ -81,7 +87,7 @@
     </label>
   {/if}
 
-  <ModulationPanel {param} {index} />
+  <ModulationPanel {param} {index} {voiceId} />
 </section>
 
 <style>

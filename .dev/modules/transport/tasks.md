@@ -102,6 +102,51 @@
   - Verify every edge case in `edge-cases.md` (A1–A10, B1–B5, C1–C7, D1–D7, E1–E5, F1–F7, G1–G4, H1–H6, I1–I4, J1–J6) has evidence of handling in the code.
   - Write findings to `.dev/.task-state/audit-transport.md`; PASS required before the module is complete.
 
+## Feature: Multi-Voice (v6)
+
+> Multi-voice lands almost entirely here as an ADDITIVE loop over `preset.voices ?? []`; the
+> primary "voice 0" path stays byte-identical (multi-voice-architecture.md §3). Each extra voice =
+> a `createVoiceFn(c,{master:'bus'})` → single-writer trim GainNode (`Voice.gain`) → the SAME
+> `mixer.bedInput`, scheduled by its OWN `scheduler.apply` over a shared `voiceView`. automation
+> needs NO change. Layer C — after the schema gate (A) and the mixer `bedHeadroom` opt (B).
+> Transport is the integration hub gating the UI.
+>
+> **Naming:** transport's local `Voice` is the audio-engine RUNTIME handle; import the session-model
+> DATA type aliased `import type { Voice as PresetVoice }`.
+
+- [x] [impl] In `startFresh` (transport.ts ~945), after the primary voice's `scheduler.apply`, loop `preset.voices ?? []` building one `{voice, trimGain, source}` record each: `createVoiceFn(c,{master:'bus'})`, drop its destination edge (`voice.output.disconnect(c.destination)` in try/catch — mirrors the primary/mediastream rewire), create a single-writer `trimGain = clamp01(source.gain ?? 1)`, wire `voice.output → trimGain → mixer.bedInput`, `scheduler.apply(voice, voiceView(p, source.nodes), startOffset, t0, {pulseAvailable})`, `voice.start(t0)`. Compute `N = 1 + (preset.voices?.length ?? 0)` and construct the mixer with `{ bedHeadroom: 1/Math.sqrt(N) }`. **All-or-nothing**: any per-voice apply failure disposes every voice created so far and routes the failure through the EXISTING primary SCHEDULE_FAILED path — nest the per-voice loop inside the existing apply-failure `try`, so a throw runs `teardown(false)` + emits a fatal `'error'` `SCHEDULE_FAILED` notice + returns (do NOT throw out of `play()` — §16/I1 convention), preserving I1 "no half-started session" | file: src/engine/transport.ts | model: T1
+  - Ref: .dev/planning/multi-voice-architecture.md @ §3 (startFresh row); §2 (bedHeadroom); §1.5 (voiceView)
+  - Ref: .dev/planning/decisions-log.md @ D-040, D-041
+  - Ref: src/engine/transport.ts @ startFresh (~945; the createVoiceFn + createMixer + scheduler.apply region; the existing primary apply-failure `try` that emits SCHEDULE_FAILED + teardown(false) — the I1 all-or-nothing semantics)
+  - Creates: the `extraVoices: {voice,trimGain,source}[]` records keyed by `source.id`; the per-voice create+drop-destination+wire+schedule+start loop; the `bedHeadroom` argument; import `voiceView` + `PresetVoice` from session-model
+  - Tests: a preset with 3 extra voices spins up 4 voices, each `{master:'bus'}` → its own trimGain → bedInput, each with NO direct `ctx.destination` edge; assert the `createMixer` DI seam is invoked with `bedHeadroom === 1/Math.sqrt(1 + voices.length)` for a multi-voice preset and `=== 1` for `voices:undefined`; pulse worklet registered exactly once (shared); `voices:undefined` behaves byte-identically to today; a per-voice apply throw aborts the whole start with zero half-started voices AND emits a fatal `'error'` `SCHEDULE_FAILED` notice (does not throw out of `play()`)
+  - Ripple: depends on session-model v6 (`Voice`, `preset.voices`, `voiceView`, `LIMITS.maxVoices`) and the mixer `bedHeadroom` opt
+
+- [x] [impl] In `seekWhilePlaying` and `resume`'s reschedule branch, after the primary voice cancel+apply, iterate the extra-voice records calling `scheduler.cancel(rec.voice)` then `scheduler.apply(rec.voice, voiceView(p, rec.source.nodes), t, anchorCtxTime, {pulseAvailable})` — oscillators keep running; the A10 seekToken guard gates the whole batch | file: src/engine/transport.ts | model: T1
+  - Ref: .dev/planning/multi-voice-architecture.md @ §3 (seek/resume row)
+  - Ref: src/engine/transport.ts @ seekWhilePlaying (~1100) + resume reschedule branch (~1025); the A10 seekToken guard (~1109, gates the whole batch)
+  - Tests: seek/resume reschedules every voice from the new offset; the seekToken guard still discards a superseded batch; phase continuity across all voices
+
+- [x] [impl] In `reapply` (transport.ts ~1152), after `scheduler.retarget` for the primary, iterate records calling `scheduler.retarget(rec.voice, voiceView(preset, rec.source.nodes), atCtx)` and re-ramp each `rec.trimGain` to `clamp01(rec.source.gain ?? 1)`; ADD `transport.setVoiceTrim(voiceId, value)` — a single-writer cheap ramp on the keyed per-voice trimGain (the live UI gain path, analogous to `setMasterTrim`). DECLARE `setVoiceTrim(voiceId: string, value: number): void` on the public `Transport` interface (`transport-types.ts`, mirroring `setMasterTrim`) AND in `transport/interfaces.md` — without it the explicitly-typed factory literal (`const transport: Transport = {…}`, transport.ts:1244) is a TS2353 excess-property error and the UI cannot type-resolve the call → `npm run check` red | file: src/engine/transport.ts, src/engine/transport-types.ts | model: T1
+  - Ref: .dev/planning/multi-voice-architecture.md @ §3 (reapply row + setVoiceTrim); D-042
+  - Ref: .dev/planning/modules/transport/interfaces.md @ setMasterTrim (the analog to mirror — add `setVoiceTrim` beside it)
+  - Ref: src/engine/transport.ts @ reapply (~1152) + setMasterTrim (~1130, the impl pattern); transport-types.ts @ `Transport` interface (~223, `setMasterTrim` ~266)
+  - Creates: the per-voice retarget loop; `setVoiceTrim(voiceId: string, value: number): void` ON the `Transport` interface (transport-types.ts) + in transport/interfaces.md + in the factory literal. Contract: `clamp01` the value, IGNORE non-finite (early return, like setMasterTrim/A9), ramp `trimGain.gain` over `TRANSPORT_DEFAULTS.trimRampSec`, find the record in `extraVoices` by `voiceId` (single-writer = transport); when no live record exists it is a safe no-op — do NOT store a pending value (unlike `setMasterTrim`; the not-playing per-voice gain is owned by `source.gain` at the next `startFresh`)
+  - Tests: a live param edit retargets every voice with phase KEPT; `setVoiceTrim` ramps only the named voice's trim over `trimRampSec` and does NOT trigger a full reschedule; an unknown/not-playing voiceId is a safe no-op; a non-finite value is ignored; `setVoiceTrim` is declared on the `Transport` type so the factory literal and the UI call type-check (`npm run check` green)
+
+- [x] [impl] In `teardown` (transport.ts ~820), after the primary cancel + `v.stop(now+fadeSec)`, iterate records: `scheduler.cancel(rec.voice)` + `rec.voice.stop(now+fadeSec)`; in `finish()` (~849, post-fade) `rec.voice.dispose()` + `rec.trimGain.disconnect()`; clear `extraVoices = []`. The single bus master fade already covers every voice via `bedInput`. Update `transport-types.ts` SessionScheduler doc-comments to state apply/retarget/cancel run once per voice (this is a doc-comment-only change to the **SessionScheduler** interface — no change to its signature; note the `Transport` interface itself separately gained `setVoiceTrim` in task 3) | file: src/engine/transport.ts, src/engine/transport-types.ts | model: T1
+  - Ref: .dev/planning/multi-voice-architecture.md @ §3 (teardown row)
+  - Ref: src/engine/transport.ts @ teardown (~820) / finish() (~849)
+  - Tests: teardown stops + disposes every voice and disconnects every trim on the success path; the single `rampMaster(0,fadeSec)` covers all voices; idempotent re-teardown safe
+
+- [x] [test] Add a 'multi-voice presets' suite to transport.test.ts: N+1 voices each `{master:'bus'}`→trim→bedInput; per-voice apply/cancel/retarget on play/seek/resume/reapply/teardown; `setVoiceTrim` ramps one voice; pulse worklet once; single bus fade on teardown; `voices:undefined` identical to today | file: src/engine/transport.test.ts | model: T2
+  - Ref: .dev/planning/multi-voice-architecture.md @ §3; §8
+  - Note: bump any `schemaVersion:5` fixture literal here as part of the Layer-A sweep
+
+- [x] [audit] Confirm `automation.ts` requires NO source change (`scheduleAll`/`schedule` never read `preset.voices`, remain per-voice) and the UI scheduler-adapter's `WeakMap<Voice>` already yields independent per-voice schedules; record the cross-module finding that renderer needs the identical per-voice loop | file: src/engine/automation.ts | model: T2
+  - Ref: .dev/planning/multi-voice-architecture.md @ §3 (automation UNCHANGED)
+  - Note: this audit also bumps the un-owned `automation.test.ts:44` `schemaVersion:5` literal IF the Layer-A sweep has not already — confirm it is 6 and `npm run check` green
+
 ## Completion Criteria
 - [ ] All tasks above marked [x] — none left [ ] (Pending) or [!] (Needs-Attention)
 - [ ] Zero active stubs for the `transport` module in .dev/.task-state/stub-registry.md

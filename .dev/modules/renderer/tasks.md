@@ -107,6 +107,36 @@ import `transport` (enforced by `renderer.test.ts`). It is consumed by the `ui` 
   - Write findings to .dev/.task-state/renderer/behavioral-audit.md
   - PASS required before marking this module complete
 
+## Feature: Multi-Voice (v6)
+
+> Offline render sums each extra voice on the SAME OfflineAudioContext into the existing bus, with
+> ZERO public-API change and ZERO transport import (multi-voice-architecture.md §4). Uses the SHARED
+> `voiceView` helper so render == playback by construction. Layer C (parallel to transport; both
+> depend only on the schema gate). The only sharp edge is the OfflineAudioContext `suspend(t)`
+> per-quantum constraint for waveform keyframes across multiple voices.
+
+- [x] [impl] In `renderToBuffer`, after the primary voice is composed, iterate `preset.voices ?? []`: `createVoice(ctx,{master:'bus'})`, DROP its default destination edge (`voice.output.disconnect(ctx.destination)` wrapped in try/catch — identical to the primary at renderer.ts:556; `createVoice` connects `masterGain → ctx.destination` unconditionally even in bus mode, so WITHOUT this drop each extra voice double-routes at full unity straight to the offline destination, bypassing the per-voice trim, `1/√N` bedHeadroom, master fades, and duck → audibly wrong render), then per-voice trim GainNode (`gain = clamp01(voice.gain ?? 1)`) → `mixer.bedInput`, then `scheduleAll(voiceView(preset, v.nodes), voiceNode, {startTime:0})` and `voiceNode.start(0)`, tracking `{voice,trim,source}` (mirroring transport's record so the waveform aggregator can reach each voice's nodes). Construct the mixer with `{ bedHeadroom: 1/Math.sqrt(N) }` (N = `1 + (preset.voices?.length ?? 0)`), matching transport | file: src/engine/renderer.ts | model: T1
+  - Ref: .dev/planning/multi-voice-architecture.md @ §4; §1.5 (shared voiceView); §2 (bedHeadroom)
+  - Ref: src/engine/renderer.ts @ renderToBuffer (495-641) — the primary-voice compose region to mirror, incl. the destination-edge drop at :556 then connect at :560
+  - Ref: src/engine/audio-engine.ts @ 341 (`masterGain.connect(ctx.destination)` runs unconditionally, incl. bus mode — why the drop is required)
+  - Creates: the per-voice offline compose loop using the SAME `voiceView` import as transport (no second copy); the per-voice `voice.output.disconnect(ctx.destination)` drop; `{voice,trim,source}` tracking for the waveform aggregator + teardown
+  - Tests: oscillator count/start for N voices; per-voice trim value + bedInput connectivity; each extra voice has NO direct `ctx.destination` edge (no doubling); the mixer is constructed with `bedHeadroom === 1/Math.sqrt(1 + voices.length)` (and `=== 1` for `voices:undefined`); per-voice `scheduleAll` voiceView nodes; render==playback equivalence
+  - Ripple: depends on session-model v6 (`voiceView`, `Voice as PresetVoice`)
+
+- [x] [impl] Rework `registerWaveformKeyframes` into an all-voices aggregator: register exactly ONE `ctx.suspend(t)` per DISTINCT offline keyframe time across the primary + every extra voice, applying all due `voice.setWaveform` calls in that single callback before `ctx.resume()` — keep the suspend-unavailable one-time-notice fallback | file: src/engine/renderer.ts | model: T1
+  - Ref: .dev/planning/multi-voice-architecture.md @ §4 (waveform aggregator); §1.5 (each voice's keyframes come from its OWN nodes via the shared `voiceView`)
+  - Ref: src/engine/renderer.ts @ registerWaveformKeyframes (445; the `ctx.suspend` call is at ~465) — OfflineAudioContext rejects two suspends in the same render quantum
+  - Creates: the reworked signature accepting the primary `voice` + the `{voice,source}` records from task 1; each voice's keyframes computed via `waveformKeyframes(voiceView(preset, voice.nodes))` (primary from `preset.nodes`), merged by distinct `t`, all due `setWaveform` applied in one suspend callback — a naive `waveformKeyframes(preset)` per voice would (wrongly) apply voice 0's switches to every extra voice
+  - Tests: two voices with a waveform change at the SAME t → ONE suspend, both setWaveform applied; distinct times → distinct suspends; each voice gets its OWN waveform switches (not voice 0's); suspend-unavailable fallback still notices once
+
+- [x] [impl] Extend `disposeAll` and the `renderToBuffer` finally block to dispose every extra voice and disconnect every per-voice trim (best-effort) on the success, cancel, and error paths | file: src/engine/renderer.ts | model: T2
+  - Ref: .dev/planning/multi-voice-architecture.md @ §4
+  - Tests: dispose-all on success + cancel + error; no leaked voices/trims
+
+- [x] [test] Add renderer.test.ts multi-voice coverage (oscillator count/start, per-voice trim + bedInput connectivity, per-voice voiceView nodes, same-t waveform aggregation, dispose-all on success+cancel, render-twice bit-identical for a multi-voice preset) and bump the basePreset `schemaVersion` literal 5→6 (Layer-A sweep) | file: src/engine/renderer.test.ts | model: T2
+  - Ref: .dev/planning/multi-voice-architecture.md @ §4; §8
+  - Tests: green renderer.test.ts incl. the no-transport-import static check; render-twice bit-identical
+
 ## Completion Criteria
 - [x] All tasks marked [x] — zero tasks left [ ] (Pending) or [!] (Needs-Attention) — verified 2026-06-16: config + 3 impl + test + audit all [x]
 - [x] Zero active stubs for the `renderer` module in .dev/.task-state/stub-registry.md — verified 2026-06-16: the MP3/WAV encoder seam moved to Resolved (implemented, no `TODO(stub)` marker in code)

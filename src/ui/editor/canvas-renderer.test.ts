@@ -55,10 +55,15 @@ describe('canvas-renderer — renderTimeline draws imperatively', () => {
         stroke: rec('stroke'),
         arc: rec('arc'),
         fill: rec('fill'),
+        save: rec('save'),
+        restore: rec('restore'),
+        setLineDash: rec('setLineDash'),
+        closePath: rec('closePath'),
         fillStyle: '',
         strokeStyle: '',
         lineWidth: 0,
         font: '',
+        textBaseline: '',
       } as unknown as CanvasRenderingContext2D,
       calls,
     };
@@ -78,6 +83,41 @@ describe('canvas-renderer — renderTimeline draws imperatively', () => {
     expect(calls.lineTo).toBeGreaterThan(0); // base curve sampled
     expect(calls.stroke).toBeGreaterThan(0);
     expect(calls.arc).toBeGreaterThan(0); // node handles + playhead dots
+  });
+
+  it('marks each in-view voice cue at its scripted time, skipping off-screen ones (D-043)', () => {
+    const { ctx, calls } = makeCtx();
+    const layout = computeLayout(640, 360);
+    renderTimeline(ctx, {
+      preset: createDefaultPreset(),
+      view: { startSec: 0, endSec: 300 },
+      layout,
+      positionSec: 0,
+      playing: false,
+      cues: [
+        { t: 30, label: 'Welcome' },
+        { t: 90, label: 'Breathe in' },
+        { t: 9999, label: 'off-screen' }, // outside the visible window → skipped
+      ],
+    });
+    expect(calls.setLineDash).toBeGreaterThan(0); // dashed cue markers drawn
+    const labels = (ctx.fillText as unknown as { mock: { calls: unknown[][] } }).mock.calls.map((c) => c[0]);
+    expect(labels).toContain('Welcome');
+    expect(labels).toContain('Breathe in');
+    expect(labels).not.toContain('off-screen'); // the out-of-window cue is not labelled
+  });
+
+  it('draws no cue markers when cues are absent (pure-binaural unchanged)', () => {
+    const { ctx, calls } = makeCtx();
+    const layout = computeLayout(640, 360);
+    renderTimeline(ctx, {
+      preset: createDefaultPreset(),
+      view: { startSec: 0, endSec: 300 },
+      layout,
+      positionSec: 0,
+      playing: false,
+    });
+    expect(calls.setLineDash ?? 0).toBe(0); // no cue pass ran
   });
 });
 

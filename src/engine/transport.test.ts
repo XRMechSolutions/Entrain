@@ -1510,3 +1510,188 @@ describe('Phase-2 layer driving (K5/K6/K8 — §19.5)', () => {
     expect(notices.error).toHaveLength(0);
   });
 });
+
+// =====================================================================================
+// Multi-voice presets (D-040/D-041/D-042 — §3 transport)
+// =====================================================================================
+
+describe('multi-voice presets (D-040/D-041/D-042 — §3 transport)', () => {
+  /** Minimal node set for an extra voice: carrier at t=0 (only required field). */
+  const extraNodes = [{ t: 0, carrier: { value: 300 }, beat: { value: 6 }, volume: { value: 1 } }];
+
+  it('play: N+1 createVoice {master:"bus"} calls; each extra voice wired voice→trim→bedInput', async () => {
+    const fakeCtx = new FakeAudioContext();
+    const fakeMixerInst = makeFakeMixer(fakeCtx);
+    const createVoiceSpy = vi.fn(createVoice);
+    const transport = createTransport({
+      scheduler: makeScheduler() as unknown as SessionScheduler,
+      audioContextFactory: (() => fakeCtx) as unknown as () => AudioContext,
+      registerWorklet: () => Promise.resolve(),
+      backgroundAudioMode: 'none',
+      createVoice: createVoiceSpy as unknown as (ctx: BaseAudioContext) => Voice,
+      createMixer: () => fakeMixerInst.asMixer,
+    });
+    transport.load(
+      makePreset({ voices: [{ id: 'v1', nodes: extraNodes }, { id: 'v2', nodes: extraNodes }] }),
+    );
+    await transport.play();
+
+    // 1 primary + 2 extra = 3 createVoice calls, all with { master: 'bus' }
+    expect(createVoiceSpy).toHaveBeenCalledTimes(3);
+    for (const call of createVoiceSpy.mock.calls) {
+      expect(call[1]).toEqual({ master: 'bus' });
+    }
+    // bedInput: primary voice output (index 0) + 2 extra-voice trimGains (index 1, 2)
+    expect(fakeMixerInst.bedInput.inputs).toHaveLength(3);
+  });
+
+  it('play: scheduler.apply called once per voice (N+1 total for N extra voices)', async () => {
+    const { transport, scheduler } = setup({
+      fakeMixer: true,
+      preset: makePreset({ voices: [{ id: 'v1', nodes: extraNodes }, { id: 'v2', nodes: extraNodes }] }),
+    });
+    await transport.play();
+    expect(scheduler.apply).toHaveBeenCalledTimes(3); // primary + 2 extra
+  });
+
+  it('seekWhilePlaying: cancel + apply called for every voice from the new offset', async () => {
+    const { transport, scheduler } = setup({
+      fakeMixer: true,
+      preset: makePreset({ durationSec: 100, voices: [{ id: 'v1', nodes: extraNodes }] }),
+    });
+    await transport.play();
+    scheduler.apply.mockClear();
+    scheduler.cancel.mockClear();
+
+    const seekPromise = transport.seek(50);
+    await vi.advanceTimersByTimeAsync(20); // seekFadeSec
+    await seekPromise;
+
+    expect(scheduler.cancel).toHaveBeenCalledTimes(2); // primary + extra
+    expect(scheduler.apply).toHaveBeenCalledTimes(2);
+    for (const call of scheduler.apply.mock.calls) {
+      expect(call[2]).toBe(50); // every voice rescheduled from the new offset
+    }
+  });
+
+  it('A10: stale seeks gate all extra voices — only the latest seekToken completes the full batch', async () => {
+    const { transport, scheduler } = setup({
+      fakeMixer: true,
+      preset: makePreset({ durationSec: 100, voices: [{ id: 'v1', nodes: extraNodes }] }),
+    });
+    await transport.play();
+    scheduler.apply.mockClear();
+    scheduler.cancel.mockClear();
+
+    void transport.seek(10);
+    void transport.seek(20);
+    void transport.seek(50);
+    await vi.advanceTimersByTimeAsync(20);
+    await microflush();
+
+    // Only the latest seek completes: 1 primary + 1 extra = 2 cancel + 2 apply
+    expect(scheduler.cancel).toHaveBeenCalledTimes(2);
+    expect(scheduler.apply).toHaveBeenCalledTimes(2);
+    expect(scheduler.apply.mock.calls[1][2]).toBe(50); // extra voice also at the latest offset
+  });
+
+  it('resume after seek-while-paused: every extra voice rescheduled from the paused offset', async () => {
+    const { transport, scheduler } = setup({
+      fakeMixer: true,
+      preset: makePreset({ durationSec: 100, voices: [{ id: 'v1', nodes: extraNodes }] }),
+    });
+    await transport.play();
+    const pausePromise = transport.pause();
+    await vi.advanceTimersByTimeAsync(20);
+    await pausePromise;
+    scheduler.cancel.mockClear();
+    scheduler.apply.mockClear();
+
+    await transport.seek(60); // paused → sets needsReschedule
+    await transport.play(); // resume → cancel + apply all voices from 60
+
+    expect(scheduler.cancel).toHaveBeenCalledTimes(2); // primary + extra
+    expect(scheduler.apply).toHaveBeenCalledTimes(2);
+    for (const call of scheduler.apply.mock.calls) {
+      expect(call[2]).toBe(60);
+    }
+  });
+
+  it('reapply: retarget called for every extra voice; trim re-ramped to source.gain', async () => {
+    const { transport, scheduler, getMixer } = setup({
+      fakeMixer: true,
+      preset: makePreset({ voices: [{ id: 'v1', gain: 0.5, nodes: extraNodes }] }),
+    });
+    await transport.play();
+    scheduler.retarget.mockClear();
+    const mixer = getMixer()!;
+    // bedInput.inputs[1] is the first extra voice's trimGain (index 0 is the primary voice output)
+    const trimGain = mixer.bedInput.inputs[1] as unknown as MockGainNode;
+
+    transport.reapply();
+
+    expect(scheduler.retarget).toHaveBeenCalledTimes(2); // primary + extra
+    expect(lastRampTarget(trimGain.gain, 'linearRampToValueAtTime')).toBeCloseTo(0.5);
+  });
+
+  it('setVoiceTrim ramps the keyed extra-voice trimGain; unknown voiceId and non-finite are no-ops', async () => {
+    const { transport, getMixer } = setup({
+      fakeMixer: true,
+      preset: makePreset({ voices: [{ id: 'v1', gain: 1, nodes: extraNodes }] }),
+    });
+    await transport.play();
+    const mixer = getMixer()!;
+    const trimGain = mixer.bedInput.inputs[1] as unknown as MockGainNode;
+
+    transport.setVoiceTrim('v1', 0.4);
+    expect(lastRampTarget(trimGain.gain, 'linearRampToValueAtTime')).toBeCloseTo(0.4);
+
+    const evBefore = trimGain.gain.events.length;
+    transport.setVoiceTrim('ghost-id', 0.5); // unknown voiceId → no-op
+    transport.setVoiceTrim('v1', Number.NaN); // non-finite → no-op
+    expect(trimGain.gain.events.length).toBe(evBefore);
+  });
+
+  it('teardown: single bus master fade covers all voices; trim disconnects + mixer disposes post-fade', async () => {
+    const { transport, getMixer } = setup({
+      fakeMixer: true,
+      preset: makePreset({ durationSec: 100, voices: [{ id: 'v1', nodes: extraNodes }] }),
+    });
+    await transport.play();
+    const mixer = getMixer()!;
+    const trimGain = mixer.bedInput.inputs[1] as unknown as MockGainNode;
+
+    await transport.stop();
+
+    // One bus master ramp to 0 covers the whole SUM (no per-voice fade needed)
+    expect(lastRampTarget(mixer.masterParam, 'linearRampToValueAtTime')).toBeCloseTo(0);
+    // Trim disconnect is deferred until after the fade
+    expect(trimGain.disconnectCalls).toBe(0);
+
+    await vi.advanceTimersByTimeAsync(600); // flush the fade-out deferred disposal
+    expect(trimGain.disconnectCalls).toBeGreaterThan(0);
+    expect(mixer.disposeSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('pulse worklet is registered once regardless of extra voice count', async () => {
+    const registerWorklet = vi.fn(() => Promise.resolve());
+    const { transport } = setup({
+      fakeMixer: true,
+      registerWorklet,
+      preset: makePreset({
+        voices: [{ id: 'v1', nodes: extraNodes }, { id: 'v2', nodes: extraNodes }],
+      }),
+    });
+    await transport.play();
+    expect(registerWorklet).toHaveBeenCalledTimes(1);
+  });
+
+  it('voices:undefined is byte-identical to single-voice — no extra apply or createVoice calls', async () => {
+    const { transport, scheduler } = setup({
+      fakeMixer: true,
+      preset: makePreset({ voices: undefined }),
+    });
+    await transport.play();
+    expect(scheduler.apply).toHaveBeenCalledTimes(1); // only the primary voice
+  });
+});

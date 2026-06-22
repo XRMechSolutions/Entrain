@@ -91,6 +91,10 @@ export interface RenderState {
   positionSec: number;
   playing: boolean;
   selected?: { index: number; param: AutomatableParam } | null;
+  /** Voice-narration cues to mark on the timeline at their scheduled session times (D-043).
+   *  Each is a voice-kind layer's `t` plus a short label (ordinal or the spoken text). Absent
+   *  ⇒ no markers (pure-binaural / no narration), so the lane drawing is unchanged. */
+  cues?: ReadonlyArray<{ t: number; label: string }>;
 }
 
 const COLORS = {
@@ -102,6 +106,7 @@ const COLORS = {
   nodeSel: '#ffb454',
   playhead: '#5ad17a',
   text: '#9aa7b4',
+  cue: '#c792ea', // voice-narration cue markers (distinct from beat curves)
 };
 
 /** Draw the whole timeline. Idempotent: clears then redraws every element. */
@@ -117,7 +122,43 @@ export function renderTimeline(ctx: CanvasRenderingContext2D, state: RenderState
     drawNodes(ctx, state, lane);
   }
   drawWaveformLane(ctx, state);
+  drawVoiceCues(ctx, state);
   if (state.playing) drawPlayhead(ctx, state);
+}
+
+/** Mark each voice-narration cue at its scheduled time: a dashed vertical line across the plot,
+ *  a speech triangle at the top, and a short label (the spoken text or an ordinal) — so the
+ *  scripted narration is visible on the timeline alongside the beat curves (D-043). Cues outside
+ *  the visible window are skipped. A no-op when there are no cues. */
+function drawVoiceCues(ctx: CanvasRenderingContext2D, state: RenderState): void {
+  const cues = state.cues;
+  if (!cues || cues.length === 0) return;
+  const { layout, view } = state;
+  ctx.save();
+  ctx.font = '10px system-ui, sans-serif';
+  ctx.textBaseline = 'alphabetic';
+  for (const cue of cues) {
+    const x = xOf(layout, view, cue.t);
+    if (x < layout.laneLeft - 2 || x > layout.laneLeft + layout.laneWidth + 2) continue;
+    ctx.strokeStyle = COLORS.cue;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(x, 9);
+    ctx.lineTo(x, layout.height);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    // speech triangle marker at the top of the line
+    ctx.fillStyle = COLORS.cue;
+    ctx.beginPath();
+    ctx.moveTo(x, 9);
+    ctx.lineTo(x - 4, 2);
+    ctx.lineTo(x + 4, 2);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillText(cue.label, x + 6, 9);
+  }
+  ctx.restore();
 }
 
 function drawLaneBackground(ctx: CanvasRenderingContext2D, layout: CanvasLayout, lane: Lane): void {

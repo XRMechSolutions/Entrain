@@ -19,6 +19,7 @@
   import { formatClock, parseClock } from '../lib/format';
   import { MIN_NODE_DT_SEC } from '../lib/constants';
   import { PARAM_ORDER } from '../editor/interactions';
+  import { LIMITS } from '../../engine/session-model';
   import type { AutomatableParam, LayerKind, TimeNode, Waveform } from '../../engine/session-model';
   import type { NodeHit } from '../editor/interactions';
   import TimelineCanvas from '../editor/TimelineCanvas.svelte';
@@ -69,13 +70,43 @@
     return layers[0]?.id ?? null;
   });
 
+  // ----- Multi-voice: active voice selection -----
+  // `undefined` = Primary (preset.nodes); a voice id = that extra voice's nodes.
+  // Initial undefined means Primary is selected, matching the single-voice default.
+  let activeVoiceId = $state<string | undefined>(undefined);
+  const voices = $derived(rev(() => session.voices));
+
+  // True when another voice cannot be added (total = 1 + voices.length ≥ LIMITS.maxVoices).
+  const atVoiceCap = $derived(1 + voices.length >= LIMITS.maxVoices);
+  // The currently active extra-voice object (null when Primary is active).
+  const activeVoice = $derived(voices.find((v) => v.id === activeVoiceId) ?? null);
+
+  function selectVoice(id: string | undefined): void {
+    activeVoiceId = id;
+    selectedNode = null; // reset node selection so the new voice starts at its own node 0
+  }
+
+  function addVoice(): void {
+    const id = session.addVoice();
+    if (id !== null) activeVoiceId = id;
+  }
+
+  function removeVoice(): void {
+    if (!activeVoiceId) return;
+    session.removeVoice(activeVoiceId);
+    activeVoiceId = undefined; // on remove of the active voice, reset to Primary (§5)
+  }
+
   // Selection by stable identity ($state.raw keeps the preset node a PLAIN object, not a
   // $state proxy — so `includes`/`indexOf` identity checks hold across re-sorts).
   let selectedNode = $state.raw<TimeNode | null>(null);
 
-  const nodes = $derived(rev(() => session.preset.nodes));
+  // Route nodes through the active voice — voiceView shares nodes BY REFERENCE so edits land
+  // on the real voice (primary or extra). Switching voice resets selectedNode → falls back to
+  // the new voice's node 0 via `resolved`.
+  const nodes = $derived(rev(() => session.voiceView(activeVoiceId).nodes));
   // Resolve the live selection; fall back to the start node if the tracked node is gone
-  // (after reset / removeNode), so the inspector is never empty.
+  // (after reset / removeNode / voice switch), so the inspector is never empty.
   const resolved = $derived.by<TimeNode | null>(() => {
     const list = nodes;
     if (selectedNode && list.includes(selectedNode)) return selectedNode;
@@ -93,12 +124,11 @@
 
   const name = $derived(rev(() => session.preset.name));
   const durationSec = $derived(rev(() => session.preset.durationSec));
-  // Node-0 oscillator shape (the preset's waveform). Edited here in the Advanced toolbar since
-  // the Player page is now a read-only monitor.
-  const waveform = $derived<Waveform>(rev(() => session.preset.nodes[0].waveform ?? 'sine'));
+  // Waveform from the active voice's start node (Primary or extra voice).
+  const waveform = $derived<Waveform>(rev(() => session.voiceView(activeVoiceId).nodes[0].waveform ?? 'sine'));
 
   function selectByHit(hit: NodeHit | null): void {
-    selectedNode = hit ? (session.preset.nodes[hit.index] ?? null) : null;
+    selectedNode = hit ? (session.voiceView(activeVoiceId).nodes[hit.index] ?? null) : null;
   }
   function selectNode(n: TimeNode): void {
     selectedNode = n;
@@ -113,8 +143,8 @@
     const base = parsed ?? (Number.isFinite(playhead) && playhead > 0 ? playhead : dur / 2);
     // Clamp strictly inside (0, duration) so a new node never duplicates the start node's t=0.
     const t = Math.min(dur - MIN_NODE_DT_SEC, Math.max(MIN_NODE_DT_SEC, base));
-    const idx = Number(session.addNode(t, 'carrier' satisfies AutomatableParam));
-    selectedNode = session.preset.nodes[idx] ?? selectedNode;
+    const idx = Number(session.addNode(t, 'carrier' satisfies AutomatableParam, activeVoiceId));
+    selectedNode = session.voiceView(activeVoiceId).nodes[idx] ?? selectedNode;
     addTimeText = '';
   }
 </script>
@@ -150,6 +180,89 @@
     {/if}
 
     <div class="toolbar" class:hidden={subTab !== 'nodes'}>
+      <!-- Voice selector strip: Primary tab + one tab per extra voice + Add/Remove buttons.
+           Add is disabled at the cap (`1 + voices.length >= LIMITS.maxVoices`). Remove is
+           shown only when a non-primary voice is active. -->
+      <div class="voice-strip" role="tablist" aria-label="Voices">
+        <button
+          type="button"
+          role="tab"
+          class="voice-tab"
+          class:active={activeVoiceId === undefined}
+          aria-selected={activeVoiceId === undefined}
+          data-testid="voice-tab-primary"
+          onclick={() => selectVoice(undefined)}
+        >
+          Primary
+        </button>
+        {#each voices as voice (voice.id)}
+          <button
+            type="button"
+            role="tab"
+            class="voice-tab"
+            class:active={activeVoiceId === voice.id}
+            aria-selected={activeVoiceId === voice.id}
+            data-testid={`voice-tab-${voice.id}`}
+            onclick={() => selectVoice(voice.id)}
+          >
+            {voice.name || voice.id}
+          </button>
+        {/each}
+        <button
+          type="button"
+          class="voice-add"
+          disabled={atVoiceCap}
+          title={atVoiceCap
+            ? `Maximum ${LIMITS.maxVoices} voices reached`
+            : 'Add a voice (each voice is an independent carrier)'}
+          data-testid="voice-add"
+          onclick={addVoice}
+        >
+          + Voice
+        </button>
+        {#if activeVoiceId !== undefined}
+          <button
+            type="button"
+            class="voice-remove"
+            data-testid="voice-remove"
+            onclick={removeVoice}
+          >
+            Remove
+          </button>
+        {/if}
+      </div>
+
+      <!-- Per-voice name+gain header — only for non-primary (extra) voices. -->
+      {#if activeVoice}
+        {@const voiceId = activeVoiceId!}
+        <div class="voice-header">
+          <label class="voice-name-row">
+            <span class="lbl">Voice name</span>
+            <input
+              class="voice-name-field"
+              type="text"
+              value={activeVoice.name ?? ''}
+              maxlength="80"
+              aria-label="Voice name"
+              oninput={(e) => session.setVoiceName(voiceId, (e.currentTarget as HTMLInputElement).value)}
+            />
+          </label>
+          <label class="voice-gain-row">
+            <span class="lbl">Gain</span>
+            <input
+              class="voice-gain-slider"
+              type="range"
+              min="0"
+              max="1"
+              step="0.01"
+              value={activeVoice.gain ?? 1}
+              aria-label="Voice gain"
+              oninput={(e) => session.setVoiceGain(voiceId, Number((e.currentTarget as HTMLInputElement).value))}
+            />
+          </label>
+        </div>
+      {/if}
+
       <label class="name">
         <span class="lbl">Name</span>
         <input
@@ -166,7 +279,7 @@
 
       <div class="waveform">
         <span class="lbl">Waveform</span>
-        <WaveformPicker value={waveform} onchange={(w) => session.setWaveform(w)} />
+        <WaveformPicker value={waveform} onchange={(w) => session.setWaveform(w, activeVoiceId)} />
       </div>
 
       <div class="add-node">
@@ -200,14 +313,14 @@
 
     {#if subTab === 'nodes'}
       <div class="canvas-wrap">
-        <TimelineCanvas selected={selectedHit} onselect={selectByHit} />
+        <TimelineCanvas selected={selectedHit} onselect={selectByHit} {activeVoiceId} />
       </div>
     {/if}
   </div>
 
   <div class="inspector-wrap">
     {#if subTab === 'nodes' && resolved}
-      <NodeInspector node={resolved} />
+      <NodeInspector node={resolved} voiceId={activeVoiceId} />
     {:else if subTab === 'layers' && inspectedLayerId}
       <LayerInspector layerId={inspectedLayerId} />
     {/if}
@@ -264,6 +377,95 @@
   .toolbar.hidden {
     display: none;
   }
+
+  /* Voice selector strip — horizontal thumb-scroll strip (responsive variant lives in the
+     responsive task; this baseline works on both mobile and wide). */
+  .voice-strip {
+    display: flex;
+    flex-wrap: nowrap;
+    gap: var(--sp-2);
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    padding-bottom: 2px; /* avoid content clipping against scrollbar rail */
+  }
+  .voice-strip::-webkit-scrollbar {
+    display: none;
+  }
+  .voice-tab {
+    flex: none;
+    min-height: var(--tap-min);
+    padding: 0 var(--sp-3);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-dim);
+    white-space: nowrap;
+  }
+  .voice-tab.active {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: var(--surface-2);
+  }
+  .voice-add {
+    flex: none;
+    min-height: var(--tap-min);
+    padding: 0 var(--sp-3);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--accent);
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .voice-add:disabled {
+    color: var(--text-dim);
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+  .voice-remove {
+    flex: none;
+    min-height: var(--tap-min);
+    padding: 0 var(--sp-3);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--danger);
+    white-space: nowrap;
+  }
+
+  /* Per-voice name+gain header (extra voices only). */
+  .voice-header {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-2);
+    padding: var(--sp-3);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+  }
+  .voice-name-row {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-1);
+  }
+  .voice-name-field {
+    min-height: var(--tap-min);
+    padding: 0 var(--sp-2);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+  }
+  .voice-gain-row {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+  }
+  .voice-gain-slider {
+    flex: 1;
+    min-width: 0;
+  }
+
   .name {
     display: flex;
     flex-direction: column;
@@ -344,5 +546,13 @@
   .editor.wide .inspector-wrap {
     width: 340px;
     flex: none;
+  }
+
+  /* Wide: voice selector switches from thumb-scroll strip to inline wrapping tabs
+     (design §13 multi-voice). The strip no longer clips, so padding-bottom is also gone. */
+  .editor.wide .voice-strip {
+    overflow-x: visible;
+    flex-wrap: wrap;
+    padding-bottom: 0;
   }
 </style>

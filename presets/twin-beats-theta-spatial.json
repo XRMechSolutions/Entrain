@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 6,
+  "name": "Twin Beats — Theta 6 (left) + Theta 4 (right)",
+  "durationSec": 600,
+  "masterGain": 0.7,
+  "nodes": [
+    {
+      "t": 0,
+      "carrier": {
+        "value": 200,
+        "mod": { "shape": "sine", "periodSec": 40, "depth": 0.012, "transition": "glide" }
+      },
+      "beat": { "value": 6, "transition": "linear" },
+      "volume": { "value": 0, "transition": "linear" },
+      "spatial": {
+        "value": -0.4,
+        "transition": "linear",
+        "mod": { "shape": "sine", "periodSec": 28, "depth": 0.35, "transition": "glide" }
+      }
+    },
+    { "t": 12, "volume": { "value": 1, "transition": "linear" } },
+    { "t": 420, "beat": { "value": 5, "transition": "smooth" } },
+    { "t": 570, "volume": { "value": 1, "transition": "linear" } },
+    { "t": 600, "beat": { "value": 5 }, "volume": { "value": 0, "transition": "linear" } }
+  ],
+  "voices": [
+    {
+      "id": "twin-right",
+      "name": "Theta 4 (right)",
+      "gain": 0.9,
+      "nodes": [
+        {
+          "t": 0,
+          "carrier": {
+            "value": 256,
+            "mod": { "shape": "sine", "periodSec": 44, "depth": 0.012, "transition": "glide" }
+          },
+          "beat": { "value": 4, "transition": "linear" },
+          "volume": { "value": 0, "transition": "linear" },
+          "spatial": {
+            "value": 0.4,
+            "transition": "linear",
+            "mod": { "shape": "sine", "periodSec": 32, "depth": 0.35, "transition": "glide" }
+          }
+        },
+        { "t": 12, "volume": { "value": 1, "transition": "linear" } },
+        { "t": 420, "beat": { "value": 3.5, "transition": "smooth" } },
+        { "t": 570, "volume": { "value": 1, "transition": "linear" } },
+        { "t": 600, "beat": { "value": 3.5 }, "volume": { "value": 0, "transition": "linear" } }
+      ]
+    }
+  ]
+}

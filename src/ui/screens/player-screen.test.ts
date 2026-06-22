@@ -4,6 +4,7 @@ import { render, fireEvent, cleanup } from '@testing-library/svelte';
 import { APP_CONTEXT_KEY } from '../context';
 import { makeAppContext, makeFakeTransport, type FakeTransport } from '../test-harness';
 import PlayerScreen from './PlayerScreen.svelte';
+import type { Preset } from '../../engine/session-model';
 
 beforeEach(() => {
   // The monitor mounts a <canvas>; jsdom has no 2D context, so return null cleanly to avoid
@@ -50,16 +51,71 @@ describe('PlayerScreen — playback controls (not signal shaping)', () => {
 });
 
 describe('PlayerScreen — headphone reminder (design §8)', () => {
-  it('the dismissible banner closes on ✕ while the permanent caption remains', async () => {
-    const { getByLabelText, queryByText, getByText } = renderPlayer();
-    expect(getByText(/commonly used for the binaural effect/i)).toBeInTheDocument();
-    expect(getByText(/Use headphones for the binaural effect/i)).toBeInTheDocument();
+  it('the dismissible banner closes on ✕ while the binaural notice remains', async () => {
+    // default preset has beat=8 → hasBinauralVoice=true → HeadphoneNotice is shown
+    const { getByLabelText, queryByText, getByTestId } = renderPlayer();
+    expect(getByTestId('binaural-notice')).toBeInTheDocument();
+    expect(queryByText(/commonly used for the binaural effect/i)).toBeInTheDocument();
 
     await fireEvent.click(getByLabelText('Dismiss headphone reminder'));
     await tick();
 
     expect(queryByText(/commonly used for the binaural effect/i)).not.toBeInTheDocument();
-    // the permanent caption on the monitor is unaffected
+    // the binaural notice is permanent and not affected by dismissal
+    expect(getByTestId('binaural-notice')).toBeInTheDocument();
+  });
+});
+
+describe('PlayerScreen — binaural notice (perf-safety §4)', () => {
+  it('shows for the default preset (beat=8 at t=0)', () => {
+    const { getByTestId } = renderPlayer();
+    expect(getByTestId('binaural-notice')).toBeInTheDocument();
+  });
+
+  it('hidden for an isochronic-only preset (beat=0 everywhere); generic caption shown instead', async () => {
+    const { ctx, queryByTestId, getByText } = renderPlayer();
+    const isoPreset: Preset = {
+      schemaVersion: 6,
+      name: 'Iso only',
+      durationSec: 300,
+      masterGain: 0.8,
+      nodes: [{ t: 0, carrier: { value: 200 }, beat: { value: 0 }, volume: { value: 1 } }],
+    };
+    ctx.session.reset(isoPreset);
+    await tick();
+    expect(queryByTestId('binaural-notice')).not.toBeInTheDocument();
     expect(getByText(/Use headphones for the binaural effect/i)).toBeInTheDocument();
+  });
+
+  it('shows when a keyframed beat is 0 at t=0 but > 0 later', async () => {
+    const { ctx, getByTestId } = renderPlayer();
+    const delayedBeatPreset: Preset = {
+      schemaVersion: 6,
+      name: 'Delayed beat',
+      durationSec: 300,
+      masterGain: 0.8,
+      nodes: [
+        { t: 0, carrier: { value: 200 }, beat: { value: 0 }, volume: { value: 1 } },
+        { t: 60, beat: { value: 4 } },
+      ],
+    };
+    ctx.session.reset(delayedBeatPreset);
+    await tick();
+    expect(getByTestId('binaural-notice')).toBeInTheDocument();
+  });
+
+  it('shows when an extra voice has beat > 0 even if the primary voice does not', async () => {
+    const { ctx, getByTestId } = renderPlayer();
+    const extraVoiceBinauralPreset: Preset = {
+      schemaVersion: 6,
+      name: 'Extra voice binaural',
+      durationSec: 300,
+      masterGain: 0.8,
+      nodes: [{ t: 0, carrier: { value: 200 }, beat: { value: 0 }, volume: { value: 1 } }],
+      voices: [{ id: 'v1', nodes: [{ t: 0, carrier: { value: 300 }, beat: { value: 6 }, volume: { value: 1 } }] }],
+    };
+    ctx.session.reset(extraVoiceBinauralPreset);
+    await tick();
+    expect(getByTestId('binaural-notice')).toBeInTheDocument();
   });
 });

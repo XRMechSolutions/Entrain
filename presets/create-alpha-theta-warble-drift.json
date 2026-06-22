@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 5,
+  "schemaVersion": 6,
   "name": "Create — Alpha→Theta 10→7 Hz (Warble + Drift)",
   "durationSec": 2400,
   "masterGain": 0.7,

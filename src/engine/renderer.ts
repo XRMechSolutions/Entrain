@@ -26,7 +26,13 @@
 
 import { Mp3Encoder } from 'lamejs';
 
-import type { Preset, Layer } from './session-model';
+import {
+  voiceView,
+  type Preset,
+  type Layer,
+  type Voice as PresetVoice,
+  type Waveform,
+} from './session-model';
 import { createVoice, registerPulseWorklet, type Voice } from './audio-engine';
 import { createMixer, type Mixer } from './mixer';
 import { createLayerNode, type LayerNode } from './layer-engine';
@@ -187,6 +193,12 @@ function notify(onNotice: ((n: string) => void) | undefined, message: string): v
   } catch {
     // Notices are advisory only.
   }
+}
+
+/** Clamp a per-voice trim into [0, 1] (NaN → 0). Local copy — the renderer must NOT import
+ *  from transport (arch §5/§6); transport keeps its own identical clamp01. */
+function clamp01(v: number): number {
+  return !Number.isFinite(v) ? 0 : v < 0 ? 0 : v > 1 ? 1 : v;
 }
 
 // ===========================================================================
@@ -438,18 +450,37 @@ async function preDecodeClips(
   return { byId, missing };
 }
 
-/** Register the offline waveform keyframes via suspend/resume (design §6). Each keyframe
- *  at t>0 is registered BEFORE startRendering; the t=0 waveform is the one the voice was
- *  built with. If the context lacks `suspend`, fall back to the initial waveform + a
- *  one-time notice (edge-cases §7) and never block the render. */
+/** Register the offline waveform keyframes via suspend/resume (design §6; multi-voice §4).
+ *  An ALL-VOICES aggregator: each t>0 waveform switch is collected from the primary voice
+ *  AND every extra voice — each voice's keyframes come from its OWN nodes via the shared
+ *  `voiceView` (multi-voice §1.5) — then keyed by distinct offline time so EXACTLY ONE
+ *  `ctx.suspend(t)` is registered per time, applying every due `voice.setWaveform` in that
+ *  single callback before `ctx.resume()` (OfflineAudioContext rejects two suspends in the
+ *  same render quantum, so two voices switching at the same t MUST share one suspend). The
+ *  t=0 waveform is the one each voice was built with. If the context lacks `suspend`, fall
+ *  back to the initial waveform + a one-time notice (edge-cases §7) and never block the
+ *  render. */
 function registerWaveformKeyframes(
   ctx: OfflineAudioContext,
   voice: Voice,
   preset: Preset,
+  extraVoices: readonly ExtraVoiceRecord[],
   onNotice: ((n: string) => void) | undefined,
 ): void {
-  const keyframes = waveformKeyframes(preset).filter((k) => k.t > 0);
-  if (keyframes.length === 0) return;
+  // time → every voice's discrete switch due at that time (keyed so a shared time = one suspend).
+  const dueByTime = new Map<number, { voice: Voice; waveform: Waveform }[]>();
+  const collect = (v: Voice, p: Preset): void => {
+    for (const kf of waveformKeyframes(p)) {
+      if (kf.t <= 0) continue; // t=0 is the waveform the voice was built with
+      const due = dueByTime.get(kf.t);
+      if (due) due.push({ voice: v, waveform: kf.waveform });
+      else dueByTime.set(kf.t, [{ voice: v, waveform: kf.waveform }]);
+    }
+  };
+  collect(voice, preset);
+  for (const rec of extraVoices) collect(rec.voice, voiceView(preset, rec.source.nodes));
+
+  if (dueByTime.size === 0) return;
 
   if (typeof ctx.suspend !== 'function') {
     notify(
@@ -459,14 +490,24 @@ function registerWaveformKeyframes(
     return;
   }
 
-  for (const kf of keyframes) {
-    // suspend(t) resolves when the offline clock reaches t; apply the discrete switch
-    // then resume. Bounded by the (small, deduplicated) keyframe count.
-    void ctx.suspend(kf.t).then(() => {
-      voice.setWaveform(kf.waveform);
+  for (const [t, due] of dueByTime) {
+    // suspend(t) resolves when the offline clock reaches t; apply every voice's discrete
+    // switch due at t, then resume. ONE suspend per distinct time across all voices.
+    void ctx.suspend(t).then(() => {
+      for (const { voice: v, waveform } of due) v.setWaveform(waveform);
       void ctx.resume();
     });
   }
+}
+
+/** A composed extra voice (multi-voice §4): its runtime graph, the single-writer per-voice
+ *  trim GainNode (voice.output → trim → mixer.bedInput), and the source `Voice` it came from
+ *  (mirrors transport's `extraVoices` record so the waveform aggregator can reach each voice's
+ *  nodes). */
+interface ExtraVoiceRecord {
+  voice: Voice;
+  trim: GainNode;
+  source: PresetVoice;
 }
 
 /** Dispose every render-owned graph object best-effort (each in its own try/catch) so a
@@ -476,6 +517,7 @@ function disposeAll(
   layerNodes: readonly LayerNode[],
   voice: Voice | undefined,
   mixer: Mixer | undefined,
+  extraVoices: readonly ExtraVoiceRecord[],
 ): void {
   const safe = (fn: () => void): void => {
     try {
@@ -487,6 +529,11 @@ function disposeAll(
   if (schedule) safe(() => schedule.dispose());
   for (const node of layerNodes) safe(() => node.dispose());
   if (voice) safe(() => voice.dispose());
+  // Each extra voice: dispose its runtime graph and disconnect its per-voice trim (§4).
+  for (const rec of extraVoices) {
+    safe(() => rec.voice.dispose());
+    safe(() => rec.trim.disconnect());
+  }
   if (mixer) safe(() => mixer.dispose());
 }
 
@@ -532,6 +579,7 @@ export async function renderToBuffer(
   let mixer: Mixer | undefined;
   let schedule: LayerSchedule | undefined;
   const layerNodes: LayerNode[] = [];
+  const extraVoices: ExtraVoiceRecord[] = [];
 
   try {
     // (4) Register the pulse worklet — AWAIT to completion. Offline there is no gesture
@@ -551,7 +599,11 @@ export async function renderToBuffer(
 
     // (6) Compose the mixer and rewire: drop voice→destination, route voice into the bed,
     //     and make mixer.master→destination the ONLY edge into the offline destination.
-    mixer = createMixer(ctx);
+    //     MULTI-VOICE (v6, §2/D-041): equal-power headroom on bedInput for N = primary +
+    //     extra voices, so summing N near-full-scale voices does not overdrive busSum →
+    //     master. N=1 ⇒ bedHeadroom 1 ⇒ single-voice byte-identical. Matches transport.
+    const N = 1 + (preset.voices?.length ?? 0);
+    mixer = createMixer(ctx, { bedHeadroom: 1 / Math.sqrt(N) });
     try {
       voice.output.disconnect(ctx.destination);
     } catch {
@@ -585,14 +637,43 @@ export async function renderToBuffer(
       node.output.connect(target);
     }
 
-    // (9) Register the offline waveform keyframes (suspend/resume) BEFORE startRendering.
-    registerWaveformKeyframes(ctx, voice, preset, onNotice);
-
     // (10) Schedule EVERYTHING at offline t0 = 0 — the SAME calls transport makes.
     //      scheduleAll drives the four binaural lanes; scheduleLayers drives the layer
     //      gain/pan lanes AND the duck (single-writer D-019 — the renderer never writes
     //      duckParam itself).
     scheduleAll(preset, voice, { startTime: 0 });
+
+    // (10b) MULTI-VOICE (v6, §4): sum each extra voice on the SAME OfflineAudioContext.
+    //       Each is an independent createVoice graph in 'bus' mode whose default
+    //       masterGain → ctx.destination edge MUST be dropped (audio-engine.ts:341 connects
+    //       it unconditionally even in bus mode — without the drop the voice double-routes at
+    //       full unity straight to the offline destination, bypassing the per-voice trim, the
+    //       1/√N bedHeadroom, the master fades and the duck → an audibly wrong render). Then
+    //       voice.output → single-writer per-voice trim (clamp01(gain ?? 1)) → mixer.bedInput,
+    //       scheduled by its OWN scheduleAll over the shared voiceView (guarantees
+    //       render == playback), and started at offline t0 = 0. Each record is tracked so the
+    //       waveform aggregator and disposeAll can reach every voice's nodes.
+    for (const source of preset.voices ?? []) {
+      const voiceNode = createVoice(ctx, { master: 'bus' });
+      try {
+        voiceNode.output.disconnect(ctx.destination); // drop the default destination edge
+      } catch {
+        // best-effort: the construction edge may already be absent (mirrors the primary)
+      }
+      const trim = ctx.createGain();
+      trim.gain.value = clamp01(source.gain ?? 1);
+      voiceNode.output.connect(trim);
+      trim.connect(mixer.bedInput);
+      extraVoices.push({ voice: voiceNode, trim, source });
+      scheduleAll(voiceView(preset, source.nodes), voiceNode, { startTime: 0 });
+      voiceNode.start(0);
+    }
+
+    // (10c) Register the offline waveform keyframes (suspend/resume) BEFORE startRendering —
+    //       an ALL-VOICES aggregator: exactly ONE suspend per distinct keyframe time across the
+    //       primary + every extra voice (two suspends in the same render quantum are rejected).
+    registerWaveformKeyframes(ctx, voice, preset, extraVoices, onNotice);
+
     schedule = scheduleLayers(mixer, layerNodes, layers, { t0: 0, startOffsetSec: 0 });
 
     // (11) Master fade-in (0 → trim) via the param-agnostic controller, then the closing
@@ -636,7 +717,7 @@ export async function renderToBuffer(
     return buffer;
   } finally {
     // Dispose on BOTH the success and the cancel/error paths (best-effort each).
-    disposeAll(schedule, layerNodes, voice, mixer);
+    disposeAll(schedule, layerNodes, voice, mixer, extraVoices);
   }
 }
 
@@ -649,7 +730,7 @@ export async function renderToBuffer(
 function sanitizeFilename(name: string): string {
   const stem = String(name ?? '')
     .normalize('NFKD')
-    .replace(/[\\/:*?"<>| -]/g, '-') // path-illegal + control chars
+    .replace(/[\\/:*?"<>|\x00-\x1f]/g, '-') // path-illegal + control chars
     .replace(/\s+/g, '-')
     .replace(/-+/g, '-')
     .replace(/^[-.]+|[-.]+$/g, '')

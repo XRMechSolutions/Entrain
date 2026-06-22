@@ -81,6 +81,15 @@ export interface TransportEventMap {
 }
 
 // --- The SessionScheduler contract (implemented by `automation`) -----------
+//
+// Per-voice contract. Every method operates on ONE voice + its own preset view and
+// holds no cross-voice state. In a multi-voice session (multi-voice-architecture.md §3)
+// transport invokes apply/retarget/cancel ONCE PER VOICE — the primary voice off
+// `preset.nodes`, then each extra voice off its `voiceView(preset, voice.nodes)` — so
+// each voice gets an independent schedule. Single-voice presets call each method exactly
+// once (byte-identical to pre-multi-voice). (The multi-voice mix trim + teardown live on
+// transport, not here: the `Transport` interface separately gained `setVoiceTrim`, and
+// transport drives each voice's fade through the shared bus master.)
 
 export interface SessionScheduler {
   /** INITIAL START. Build a FRESH schedule for the WHOLE preset onto the voice:
@@ -210,8 +219,11 @@ export interface TransportOptions {
    *  double-attenuation; phase2-audio-architecture.md §2.1 / §2.2). */
   createVoice?: (ctx: BaseAudioContext, opts?: VoiceOptions) => Voice;
   /** PHASE-2, OPTIONAL. Build the per-session mixer (the unified bus).
-   *  Default (ctx) => mixer.createMixer(ctx). Inject a fake in tests. */
-  createMixer?: (ctx: BaseAudioContext) => Mixer;
+   *  Default (ctx, opts) => mixer.createMixer(ctx, opts). Inject a fake in tests.
+   *  MULTI-VOICE (v6): transport passes `{ bedHeadroom: 1/√N }` (N = 1 + extra voices)
+   *  so summing N voices at `bedInput` does not overdrive busSum → master
+   *  (multi-voice-architecture.md §2, D-041). Default 1 ⇒ single-voice byte-identical. */
+  createMixer?: (ctx: BaseAudioContext, opts?: { bedHeadroom?: number; masterStart?: number }) => Mixer;
   /** Register the shepard ("lift") worklet. Default shepard.registerShepardWorklet. */
   registerShepard?: (ctx: BaseAudioContext) => Promise<void>;
   /** Build a shepard ("lift") node. Default shepard.createShepardNode. */
@@ -250,6 +262,15 @@ export interface Transport {
    *  Synchronous. Throws NO_PRESET if nothing is loaded. See design §10. */
   reapply(): void;
 
+  /** Rebuild + reschedule the LAYER subsystem at the current position WITHOUT touching the
+   *  binaural voices (auto-synth-on-play, D-043). Disposes the current layer nodes and rebuilds
+   *  them from the live `preset.layers` (decoding any now-available clip buffers), scheduling
+   *  from here forward — so a voice clip synthesized in the background after play() "streams in"
+   *  for the rest of the session (a missing-clip node is silent for life; the only fix is a
+   *  rebuild). Cues already past are not restarted. No-op unless actively playing with a layer
+   *  scheduler. Idempotent and safe to call repeatedly as clips arrive. */
+  refreshLayers(): Promise<void>;
+
   /** End the session: fade out, stop + dispose the voice, clear MediaSession,
    *  release Wake Lock. → 'stopped'. The AudioContext stays open for reuse.
    *  No 'ended' event. No-op if already 'stopped'/'idle'. */
@@ -264,6 +285,12 @@ export interface Transport {
   /** Live master-volume trim (the one non-automated control). v clamped 0..1.
    *  Ramps masterGain over 10 ms if playing; otherwise stored for the next fade-in. */
   setMasterTrim(v: number): void;
+
+  /** MULTI-VOICE (v6): live per-voice mix trim — the UI gain-slider path for an extra
+   *  voice (keyed by Voice.id). value clamped 0..1, cheap single-writer 10 ms ramp on that
+   *  voice's trim gain (analogous to setMasterTrim; no whole-session reapply). Unknown
+   *  voiceId or non-finite value is a no-op. */
+  setVoiceTrim(voiceId: string, value: number): void;
 
   /** Enable/update/disable the Shepard–Risset "lift" overlay (an endless ascending or
    *  descending glissando mixed in PARALLEL to the binaural voice, feeding the same

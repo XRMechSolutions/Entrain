@@ -141,3 +141,37 @@ describe('EditorScreen — selection survives a reorder (identity, not index)', 
     expect(nodeB.carrier?.value).toBe(321);
   });
 });
+
+describe('EditorScreen — multi-voice routing (FIX-1 regression)', () => {
+  it('canvas tap adds a node to the active extra voice, not the primary', async () => {
+    const { ctx, canvas, getByTestId } = renderEditor();
+    const voiceId = ctx.session.addVoice()!;
+    await tick();
+    await fireEvent.click(getByTestId(`voice-tab-${voiceId}`));
+    await tick();
+
+    const primaryBefore = ctx.session.preset.nodes.length;
+    const extraBefore = ctx.session.preset.voices![0].nodes.length;
+
+    await fireEvent(canvas, new MouseEvent('pointerdown', { clientX: 320, clientY: 50, bubbles: true }));
+    await fireEvent(canvas, new MouseEvent('pointerup', { clientX: 320, clientY: 50, bubbles: true }));
+
+    expect(ctx.session.preset.nodes.length).toBe(primaryBefore);
+    expect(ctx.session.preset.voices![0].nodes.length).toBe(extraBefore + 1);
+  });
+
+  it('NodeInspector param edit lands on the extra voice, not the primary', async () => {
+    const { ctx, getByTestId, getByLabelText } = renderEditor();
+    const voiceId = ctx.session.addVoice()!;
+    await tick();
+    await fireEvent.click(getByTestId(`voice-tab-${voiceId}`));
+    await tick();
+
+    // Extra voice node 0 has carrier=250 Hz; change to a distinctive value.
+    await fireEvent.change(getByLabelText('Carrier value'), { target: { value: '333' } });
+    await tick();
+
+    expect(ctx.session.preset.voices![0].nodes[0].carrier?.value).toBe(333);
+    expect(ctx.session.preset.nodes[0].carrier?.value).not.toBe(333); // primary untouched
+  });
+});

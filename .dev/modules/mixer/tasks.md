@@ -113,10 +113,29 @@ module's work — no edits to them by this module): `automation.test.ts`,
   - Write findings to .dev/.task-state/mixer/behavioral-audit.md
   - PASS required before marking this module complete
 
+## Feature: Multi-Voice (v6)
+
+> Multi-voice needs ONE mixer change: an optional construction-time bed headroom so summing N
+> voices at `bedInput` doesn't overdrive `busSum → master` (multi-voice-architecture.md §2, D-041).
+> Layer B — after the session-model v6 schema gate (Layer A). The mixer never self-writes `master`;
+> the master trim stays the user-facing `preset.masterGain` ceiling.
+
+- [x] [impl] Add `createMixer(ctx, opts?: { bedHeadroom?: number; masterStart?: number })` — write `bedInput.gain` ONCE at construction to `bedHeadroom` (default `1`, so single-voice is byte-identical); no second writer to `master`, no auto-normalisation of the fan-in; UPDATE the mixer contract docs to match the new signature — `interfaces.md §1` (the `createMixer` signature + a `bedHeadroom` doc-comment) and `design.md §2` (note `bedHeadroom` as a SECOND optional construction value, default 1, written once on `bedInput.gain` — `masterStart` is no longer "the only construction option") | file: src/engine/mixer.ts, .dev/planning/modules/mixer/interfaces.md, .dev/planning/modules/mixer/design.md | model: T1
+  - Ref: .dev/planning/multi-voice-architecture.md @ §2 (equal-power headroom on bedInput, default 1); §7 spine
+  - Ref: .dev/planning/decisions-log.md @ D-041
+  - Ref: .dev/planning/modules/mixer/interfaces.md @ §1 (createMixer signature — "verbatim source of truth", update it); design.md @ §2 (the construction-options prose)
+  - Creates: the `bedHeadroom` opt; `bedInput.gain.value = opts?.bedHeadroom ?? 1` at construction; everything else unchanged; the matching interfaces.md §1 + design.md §2 doc updates
+  - Behavior: transport/renderer compute `N = 1 + extraVoices` and pass `bedHeadroom = 1/√N`; bed-routed tone/ambiance layers share the headroom for N>1 (documented, accepted)
+  - Tests: default (no opt) → `bedInput.gain === 1`, existing six-node topology byte-identical; `bedHeadroom: 0.5` → `bedInput.gain === 0.5`; `bedInput` still SUMS without normalising
+
+- [x] [test] Add a mixer.test.ts case: N external gains fan into `bedInput` (`bedInput.inputs.length === N`), the `bed→duckGain→busSum→master` topology is unchanged, and the default keeps `bedInput.gain` unity | file: src/engine/mixer.test.ts | model: T2
+  - Ref: .dev/planning/multi-voice-architecture.md @ §2; §7
+  - Tests: N-way fan-in connectivity; default unity; explicit `bedHeadroom` attenuates; reconciles with the EXISTING mixer topology test (mixer.test.ts ~66-76, which asserts `bedInput.gain === 1.0` by default — default `bedHeadroom` keeps that assertion byte-identical). (The audio-engine N-reuse test uses a plain shared GainNode, not `mixer.bedInput`, so there is no cross-test `bedInput.gain` contradiction to reconcile there.)
+
 ## Completion Criteria
 - [x] All tasks marked [x] — zero tasks left [ ] (Pending) or [!] (Needs-Attention)
 - [x] Zero active stubs for this module (the graph-task stubs resolved by the duck and connect/dispose tasks)
-- [x] All module tests passing (`mixer.test.ts` green via `npm run test` — 48/48)
+- [x] All module tests passing (`mixer.test.ts` green via `npm run test` — 49/49)
 - [x] The three guardrail suites unchanged and green BEFORE and AFTER: `automation.test.ts` (65), `audio-engine.test.ts` (63), `transport-master-gain.test.ts` (8)
 - [x] Audit PASS for every task
 - [x] last-step-summary.md written for every task with a concrete Observable Verification entry

@@ -7,8 +7,8 @@
 ## Agent Briefing
 `tts-local` is the `source: 'tts'` arm of the `ClipSourceAdapter` seam: a single factory,
 `createTtsAdapter`, that turns a line of text into a content-addressed `ClipDraft` by running
-Kokoro-82M ONNX (dtype `q8`) **entirely in-browser, offline** (Transformers.js, webgpu→wasm; kuromoji
-for Japanese G2P). It is **authoring-only** — consumed only by `voice-script` (D-034) and the
+Kokoro-82M ONNX (dtype `q8`) **entirely in-browser, offline** (kokoro-js, webgpu→wasm; kokoro-js owns
+G2P for all languages). It is **authoring-only** — consumed only by `voice-script` (D-034) and the
 authoring `ui`, and never imported by `transport`, `renderer`, `mixer`, `layer-engine`, or
 `layer-scheduler` (the offline-path firewall, design §5). It depends on `clip-library` for types only
 (`ClipSourceAdapter` / `ClipDraft` / `ClipMeta` / `ClipSource`) and produces a draft the caller stores
@@ -49,7 +49,7 @@ Before this module starts:
   - Tests: `npm install` resolves both packages at the pinned versions; the bundled `kokoro` model `.onnx` + voice config and the kuromoji dictionary files exist under `public/models/` at the app origin; a production build's generated SW precache manifest **includes** the model `.onnx`/`.bin` and dictionary (NOT silently excluded by the default size limit) OR they are covered by a `CacheFirst` runtimeCaching route; `vite dev` still emits no SW; the existing pwa-shell build tests stay green
   - Ripple: pwa-shell owns `vite.config.ts` `VitePWA()`; coordinate the Workbox change with that module — do not duplicate or fork its manifest/registration config
 
-- [ ] [impl] Author the module types, the VOICES config table, the TtsError class, and the dependency-free WAV encoder | file: src/engine/clip-sources/tts-local.ts | model: T1Lite
+- [x] [impl] Author the module types, the VOICES config table, the TtsError class, and the dependency-free WAV encoder | file: src/engine/clip-sources/tts-local.ts | model: T1Lite
   - Ref: .dev/planning/modules/tts-local/interfaces.md @ 3. Module types (TtsLanguage, TtsInput, TtsAdapterOptions)
   - Ref: .dev/planning/modules/tts-local/interfaces.md @ 5. Errors (TtsErrorCode, TtsError — name:'TtsError', code, optional cause)
   - Ref: .dev/planning/modules/tts-local/interfaces.md @ 2. Imported contracts (from clip-library — import ClipSourceAdapter/ClipDraft/ClipMeta/ClipSource type-only; do NOT redefine)
@@ -62,7 +62,7 @@ Before this module starts:
   - Tests: each `TtsErrorCode` constructs a `TtsError` whose `name==='TtsError'`, `code` is set, and `.cause` is preserved when passed; `encodeWav` produces a valid 44-byte-header WAV whose declared sample rate, mono channel count, and PCM-16 sample count match the input Float32 length; samples outside [-1,1] and NaN clamp without overflow; a decoded round-trip of the WAV has the same sample count as the input PCM (duration parity)
   - Stubs expected: the engine loader, G2P, synth, and `produce` are stubbed/absent until the next two tasks resolve them — register a stub for `createTtsAdapter` if this task lands it as a not-yet-functional shell
 
-- [ ] [impl] Implement the lazy engine loader: webgpu→wasm device negotiation, offline Kokoro ONNX load, and lazy kuromoji dictionary | file: src/engine/clip-sources/tts-local.ts | model: T1
+- [x] [impl] Implement the lazy engine loader: webgpu→wasm device negotiation, offline Kokoro ONNX load, and lazy kuromoji dictionary | file: src/engine/clip-sources/tts-local.ts | model: T1
   - Ref: .dev/planning/modules/tts-local/design.md @ 3.1 Library & model (D-032, D-033) (Transformers.js + Kokoro-82M ONNX dtype q8 via onnxruntime-web)
   - Ref: .dev/planning/modules/tts-local/design.md @ 3.2 Lazy load, single warm session (module-internal lazily-initialized Promise; first produce awaits, later produce reuses; a FAILED load is NOT cached forever — next produce retries)
   - Ref: .dev/planning/modules/tts-local/design.md @ 3.3 Device negotiation (webgpu → wasm) (probe navigator.gpu + requestAdapter; construct-time fallback re-attempts ONCE on wasm; same PCM either way; COOP/COEP / crossOriginIsolated detected only to inform, never required)
@@ -77,7 +77,7 @@ Before this module starts:
   - Tests: first `ensureEngine()` loads once and is reused (one load for N concurrent callers — assert single underlying load); a thrown webgpu construction is caught and the wasm path succeeds (mock the runtime); a forced `device:'webgpu'` on a no-GPU mock still resolves via wasm; a load rejection rejects the first `produce` with `MODEL_LOAD_FAILED` (`.cause` preserved) AND the NEXT `produce` retries the load (not cached); with `allowRemoteModels=false`, a simulated hub-resolution attempt surfaces as `MODEL_LOAD_FAILED`, never a network fetch; kuromoji dict failure rejects only `language:'ja'` and leaves en/es/fr loadable
   - Resolves stubs: the engine-load portion of the `createTtsAdapter` shell from the previous task
 
-- [ ] [impl] Implement createTtsAdapter.produce: validate/normalize → SHA-256 hash → G2P (espeak en/es/fr, kuromoji ja) → synth Float32 PCM → WAV encode → measure durationSec → ClipDraft, with serialized synthesis | file: src/engine/clip-sources/tts-local.ts | model: T1 [data]
+- [x] [impl] Implement createTtsAdapter.produce: validate/normalize → SHA-256 hash → G2P (espeak en/es/fr, kuromoji ja) → synth Float32 PCM → WAV encode → measure durationSec → ClipDraft, with serialized synthesis | file: src/engine/clip-sources/tts-local.ts | model: T1 [data]
   - Ref: .dev/planning/modules/tts-local/interfaces.md @ 1. Authoritative contract (phase2-audio-architecture.md §6, verbatim) (createTtsAdapter(opts?) → ClipSourceAdapter over { text; voice?; language?; rateScale? }; produce → ClipDraft hash=SHA256(model+voice+lang+text+rate))
   - Ref: .dev/planning/modules/tts-local/interfaces.md @ 4. Factory (the public surface) (returned { source:'tts'; produce }; concrete ClipDraft shape incl. meta.name/language/voice/text)
   - Ref: .dev/planning/modules/tts-local/design.md @ 2. Input, output, and the produce() pipeline (the fixed 8-step pipeline; validate before any model work; duration from sample count; meta.name = first few words)
@@ -97,7 +97,8 @@ Before this module starts:
   - Resolves stubs: the `produce` portion of the `createTtsAdapter` shell — after this task the adapter is fully functional
   - Ripple: `voice-script` (D-034) and the authoring `ui` consume `createTtsAdapter` / the `ClipDraft` shape — they read `meta.name`/`language`/`voice`/`text` and `durationSec`; confirm no field rename relative to interfaces.md §4
 
-- [ ] [test] VALIDATION: measure Kokoro q8 quality + per-line synthesis latency (webgpu vs single-threaded wasm) and confirm kuromoji→Kokoro Japanese G2P quality; record fallback decisions | file: .dev/.task-state/tts-local/q8-ja-validation.md | model: T1Lite
+- [!] [test] VALIDATION: measure Kokoro q8 quality + per-line synthesis latency (webgpu vs single-threaded wasm) and confirm kuromoji→Kokoro Japanese G2P quality; record fallback decisions | file: .dev/.task-state/tts-local/q8-ja-validation.md | model: T1Lite
+  - STATUS [!] Needs-Attention (2026-06-21): the record `.dev/.task-state/tts-local/q8-ja-validation.md` is written; the desk-verifiable items are RESOLVED (item 4 dep versions §1; item 3 first-run size/precache §2) and the architecture is reconciled to D-039 (kokoro-js + HF-hub fetch, kuromoji NOT on the JA path, WebGPU pinned off). Items 1 & 2 (q8 audible quality + per-line latency on webgpu vs single-threaded WASM; Japanese G2P quality) REQUIRE A USER-MACHINE PASS — the §4 protocol + §5 checklist must be filled (an agent cannot run WebGPU or listen). Provisional verdict: GO on q8 + kokoro-js JA + WASM + hub-fetch. Flip to [x] once §4/§5 are filled and §6 confirmed.
   - Ref: .dev/planning/modules/tts-local/design.md @ 8. Validation tasks (Tier-5, flagged not assumed) (item 1 q8 quality & latency; item 2 Japanese G2P quality; item 3 bundle size / precache; item 4 exact dependency versions)
   - Ref: .dev/planning/modules/tts-local/design.md @ 3.1 Library & model / 3.5 Japanese G2P (the q8 footprint/quality balance D-031/D-037; kuromoji→Kokoro v1 JA path; sherpa-onnx VITS the documented fallback)
   - Ref: .dev/planning/modules/tts-local/design.md @ 7. Lifecycle, concurrency & performance (per-line latency on webgpu and single-threaded WASM sets the authoring progress UX — a measured number, not a Tier-3 assumption)
@@ -109,9 +110,23 @@ Before this module starts:
   - Handles: q8 audibly poor → dtype fallback recorded; JA quality poor → sherpa-onnx VITS swap recorded; bundle size too large for precache → feeds the pwa-shell runtime-cache (CacheFirst) decision
   - Tests: the validation record exists and states a concrete verdict per language and a measured latency figure for both backends; if it recommends a fallback, the corresponding follow-up task is filed; the existing module unit tests remain green regardless of the verdict (the contract is unchanged)
 
+## Follow-ups (filed from the Tier-5 validation, q8-ja-validation.md §7)
+
+- [x] [config] Resolve the unused `kuromoji` dependency | file: package.json | model: T2
+  - D-039 removed kuromoji from the JA path (kokoro-js owns G2P); `kuromoji@^0.1.2` is declared but imported nowhere in `src/` (grep hits only test/comment strings). Either REMOVE it (smaller dep tree) or add a one-line note pinning it as the JA-tokenizer hook reserved for the deferred sherpa-onnx VITS fallback (edge-cases §3). Decide + apply.
+  - Ref: .dev/.task-state/tts-local/q8-ja-validation.md @ §1 (dep table), §3 (JA path is kokoro-js, not kuromoji)
+  - Tests: full suite stays green; if removed, `grep -rn "kuromoji" src/` returns only the existing test/comment occurrences (no import) and `npm install` still resolves.
+
+- [!] [test] Validate WebGPU (`device:'auto'`) on target GPUs | file: .dev/.task-state/tts-local/webgpu-validation.md | model: T1Lite
+  - STATUS [!] Needs-Attention (2026-06-21): the record `.dev/.task-state/tts-local/webgpu-validation.md` is written; the DESK-VERIFIABLE half is RESOLVED — `device:'auto'` is already the resolver default (tts-local.ts:308), the probe + webgpu→wasm construct-fallback are in place, and `device` is excluded from the content hash (tts-local.ts:282) so the `wasm`→`auto` flip causes ZERO clip churn and the device-agnostic suite stays green (41 passed). Key finding (§2): the existing fallback catches a construct THROW, not a HANG, which is why the flip cannot ship on faith. The per-GPU "does it hang?" pass REQUIRES A USER-MACHINE GPU+browser session (an agent cannot run WebGPU) — §3 protocol + §4 fill-in table. Flip to [x] once §4 is filled; if all-GO, apply the §5 `bootstrap.ts:110` flip (`device:'wasm'`→`'auto'`) and confirm the full suite stays green.
+  - Production pins `device:'wasm'` (bootstrap.ts:110) because WebGPU/JSEP can hang on some GPUs (D-039). Confirm WebGPU does not hang on the target machines, then re-enable `device:'auto'`. This is also the prerequisite for the q8-ja-validation §4 WebGPU latency column.
+  - Ref: .dev/.task-state/tts-local/q8-ja-validation.md @ §4 (WebGPU note), §6 (device verdict)
+  - Tests: a record stating WebGPU GO/NO-GO per tested GPU; if GO, `bootstrap.ts` flips to `device:'auto'` and the suite stays green (device is excluded from the hash, so no clip churn).
+
 ## Behavioral Audit (runs after all tasks above are [x])
 
-- [ ] [audit] Module behavioral audit: tts-local | file: .dev/.task-state/tts-local/behavioral-audit.md | model: T1
+- [x] [audit] Module behavioral audit: tts-local | file: .dev/.task-state/tts-local/behavioral-audit.md | model: T1
+  - DONE (2026-06-21): PASS. Every public interface (`createTtsAdapter` → `{source:'tts';produce}` → `ClipDraft`, all 6 `TtsErrorCode`s, `encodeWav`) traces input → observable output; `produce` always rejects with a typed `TtsError`, never throws synchronously, never returns a malformed (zero/non-finite-duration) draft. Offline-path firewall verified (no transport/renderer/mixer/layer-engine/layer-scheduler import). Consumer `voice-script` reads `clip.durationSec` via `importVia` with correct field names. Full suite 1294 green; cohesion guardrails green. Two design-doc divergences are INTENTIONAL per D-039 (hub-fetch vs bundled-offline; kokoro-js vs kuromoji G2P) and preserve the observable contract — filed as a doc-reconciliation cleanup below. No CRITICAL/FIX. Report: .dev/.task-state/tts-local/behavioral-audit.md
   - Ref: C:/Projects/.dev-shared/behavioral-audit.md — Module Behavioral Audit checklist
   - Ref: .dev/planning/modules/tts-local/interfaces.md — every public interface (createTtsAdapter, the returned { source:'tts'; produce }, the ClipDraft shape incl. meta, TtsInput/TtsAdapterOptions, TtsError + codes) must trace input → implementation → observable output
   - Ref: .dev/planning/modules/tts-local/design.md — verify intended behavior: pure/synchronous factory, lazy single warm load, webgpu→wasm fallback, normalized-input hash, authoring-only (never on the playback/offline path), serialized synthesis, duration finite>0
@@ -123,12 +138,30 @@ Before this module starts:
   - Write findings to .dev/.task-state/tts-local/behavioral-audit.md
   - PASS required before marking this module complete
 
+## Cleanup
+
+- [x] [cleanup] Reconcile design.md/edge-cases.md to D-039 (hub-fetch + kokoro-js G2P) | file: .dev/planning/modules/tts-local/design.md, .dev/planning/modules/tts-local/edge-cases.md | model: T2
+  - Ref: behavioral audit 2026-06-21 — the implementation deliberately diverges from the as-written planning docs per recorded decision D-039: (1) model source is kokoro-js fetching from the HF hub on first use then browser-caching (offline thereafter), NOT `env.allowRemoteModels=false` bundled-offline (design §6); edge-cases §1 "remote-fetch-while-offline → loud MODEL_LOAD_FAILED" no longer applies as written. (2) kokoro-js owns G2P for all languages, NOT kuromoji (design §3.5 / edge-cases §3) — the observable `PHONEMIZER_UNAVAILABLE` (JA-scoped) contract is preserved. Update design.md §3.1/§3.5/§6 and edge-cases §1/§3 to match the shipped D-039 behavior; the public contract (interfaces.md) is unchanged and needs no edit.
+  - DONE 2026-06-21: design.md §3.1 updated to kokoro-js + hub-fetch; §3.5 rewritten (kokoro-js owns G2P, PHONEMIZER_UNAVAILABLE preserved JA-scoped, sherpa-onnx fallback retained); §6 rewritten (hub-fetch first use, browser-cache offline after, no allowRemoteModels/localModelPath). edge-cases §1 third bullet updated (first-use offline failure); §3 rewritten (kokoro-js JA engine, no kuromoji). Remaining stale refs in §1/§2/§3.2/§3.3/§3.4/§8 added as new cleanup task below.
+
+- [x] [cleanup] Reconcile design.md §1/§2/§3.2/§3.3/§3.4/§8 residual D-039 stale refs | file: .dev/planning/modules/tts-local/design.md | model: T2
+  - Ref: doc-reconciliation 2026-06-21 — after updating §3.1/§3.5/§6 these sections still reference the pre-D-039 design: (a) §1 "What it does NOT do" bullet says "not fetch from HF hub; bundled/precached; never touches network"; (b) §2 step 4 says "Japanese via kuromoji.js (D-037, §3.3)"; (c) §3.2 says "The ONNX session and the kuromoji dictionary are expensive to load"; (d) §3.3 says "Transformers.js runs the ONNX graph on a device"; (e) §3.4 table JA row says "kuromoji.js → phonemes | dictionary G2P (§3.3, D-037)" (§3.3 ref is also wrong — JA G2P is §3.5); (f) §8 item 2 says "kuromoji.js → Kokoro Japanese" and item 4 says pin "@huggingface/transformers and kuromoji". Update each to match D-039 (kokoro-js + hub-fetch; kokoro-js G2P for all languages). No contract change.
+  - DONE 2026-06-21: all six stale refs corrected — (a) §1 network bullet rewritten to hub-fetch-first-use/cache-after; (b) §2 step 4 updated to kokoro-js owns all-language G2P with §3.5 ref; (c) §3.2 kuromoji-dict mention removed; (d) §3.3 "Transformers.js" → "kokoro-js"; (e) §3.4 JA row updated to kokoro-js G2P / §3.5 / D-039; (f) §8 item 2 updated to kokoro-js / §3.5, item 3 "dictionary" removed, item 4 updated to kokoro-js only.
+
+- [x] [cleanup] Reconcile design.md §7 residual D-039 stale ref — kuromoji dict mention | file: .dev/planning/modules/tts-local/design.md | model: T2
+  - Ref: doc-reconciliation 2026-06-21 — §7 "Lazy single load" bullet still reads "the engine (ONNX session + kuromoji dict) loads on first `produce`". D-039 removed kuromoji; kokoro-js owns all G2P. Remove "and the kuromoji dict" / "+ kuromoji dict" to match. No contract change.
+  - DONE 2026-06-21: removed "+ kuromoji dict" from §7 "Lazy single load" bullet; now reads "the engine (ONNX session) loads on first `produce`".
+
+- [x] [cleanup] Reconcile tasks.md Agent Briefing residual D-039 stale refs — Transformers.js + kuromoji | file: .dev/modules/tts-local/tasks.md | model: T2
+  - Ref: doc-reconciliation 2026-06-21 — Agent Briefing line reads "Kokoro-82M ONNX (dtype `q8`) entirely in-browser, offline (Transformers.js, webgpu→wasm; kuromoji for Japanese G2P)". D-039 replaced Transformers.js with kokoro-js and removed kuromoji from the JA path. Update to "kokoro-js, webgpu→wasm; kokoro-js owns G2P for all languages". No contract change.
+  - DONE 2026-06-21: Agent Briefing updated — "(Transformers.js, webgpu→wasm; kuromoji for Japanese G2P)" → "(kokoro-js, webgpu→wasm; kokoro-js owns G2P for all languages)". No contract change.
+
 ## Completion Criteria
-- [ ] All tasks above marked [x] — zero tasks left [ ] (Pending) or [!] (Needs-Attention)
-- [ ] Zero active stubs for this module (the `createTtsAdapter` shell stub is resolved by the produce task; the sherpa-onnx JA fallback stays a registered deferral per design §3.5 / edge-cases §3, not an active blocker — unless the validation task triggers it)
-- [ ] All module tests passing (full suite, not just this module's tests) — run `npx vitest run` green
-- [ ] Cohesion guardrails green and byte-identical before AND after: `automation.test.ts`, `audio-engine.test.ts`, `transport-master-gain.test.ts`
-- [ ] Offline-path firewall verified: no `transport` / `renderer` / `mixer` / `layer-engine` / `layer-scheduler` import of `clip-sources/tts-local` (design §5)
-- [ ] Audit PASS for every task
-- [ ] last-step-summary.md written for every task with a concrete Observable Verification entry
-- [ ] Behavioral audit PASS (see the [audit] task above)
+- [ ] All tasks above marked [x] — zero tasks left [ ] (Pending) or [!] (Needs-Attention) — BLOCKED: q8-ja-validation and webgpu-validation remain [!] pending a USER-MACHINE pass (an agent cannot run WebGPU or judge audible quality)
+- [x] Zero active stubs for this module — the `createTtsAdapter` shell stub is resolved (produce fully implemented); the sherpa-onnx JA fallback stays a registered deferral per design §3.5 / edge-cases §3, not an active blocker
+- [x] All module tests passing (full suite, not just this module's tests) — `npx vitest run` green: 1294 passed / 59 files (2026-06-21)
+- [x] Cohesion guardrails green: `automation.test.ts`, `audio-engine.test.ts`, `transport-master-gain.test.ts` all pass (behavior intact; `automation`/`audio-engine` show git-modified from broader Phase-2 branch churn, not this module — byte-identical claim deferred to the Phase-2 checkpoint)
+- [x] Offline-path firewall verified: no `transport` / `renderer` / `mixer` / `layer-engine` / `layer-scheduler` import of `clip-sources/tts-local` (design §5) — grep-confirmed 2026-06-21
+- [x] Audit PASS for every task (per-task audits passed; behavioral audit PASS this date)
+- [x] last-step-summary.md written for every task with a concrete Observable Verification entry
+- [x] Behavioral audit PASS (see the [audit] task above) — .dev/.task-state/tts-local/behavioral-audit.md

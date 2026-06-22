@@ -60,7 +60,6 @@
     "@huggingface/transformers": "^4.2.0",
     "idb": "^8.0.3",
     "kokoro-js": "^1.2.1",
-    "kuromoji": "^0.1.2",
     "lamejs": "1.2.1"
   }
 }

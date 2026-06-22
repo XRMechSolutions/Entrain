@@ -224,6 +224,13 @@ export interface VoiceScriptStore {
   /** Pick→compile→inject. Atomic: nothing is injected unless the compile fully succeeds
    *  (design §20 / edge O1). Warnings still inject (O5). */
   importAndCompile(scriptJson: unknown): void;
+
+  /** Auto-synth-on-play (D-043): when playback starts on a preset carrying an embedded
+   *  `voiceScript`, compile it in the BACKGROUND (feature C synthesizes only un-cached clips),
+   *  inject the timed cues, and stream them into the running session via refreshLayers — no
+   *  user steps, beats never blocked. No-op without a script, without studio TTS (mobile), or
+   *  when already prepared for the current preset. Failures surface as a notice, never throw. */
+  ensureNarrationForPlayback(): Promise<void>;
 }
 
 type CompileVoiceScriptFn = typeof defaultCompileVoiceScript;
@@ -296,6 +303,41 @@ export function createVoiceScriptStore(deps: {
       });
   }
 
+  // Tracks the preset object we've already auto-synthesized for, so entering 'playing' again
+  // (pause/resume, re-press play) doesn't recompile. A new preset load (new object identity)
+  // re-arms it; a transient failure clears it so the next play retries.
+  let ensuredFor: object | null = null;
+
+  async function ensureNarrationForPlayback(): Promise<void> {
+    if (!canCompile || !tts) return; // no studio TTS (e.g. mobile) → beats play, narration silent
+    const preset = session.preset;
+    const script = (preset as { voiceScript?: unknown }).voiceScript;
+    if (!script || typeof script !== 'object') return; // preset carries no embedded narration
+    if (ensuredFor === preset) return; // already prepared this working preset
+    ensuredFor = preset;
+    try {
+      const res = await compileVoiceScript(script as never, {
+        tts,
+        clipLib,
+        durationSec: preset.durationSec,
+      });
+      if (!res.ok) {
+        notices.push({ severity: 'error', message: `Couldn't prepare narration — ${issuesList(res.issues)}` });
+        return;
+      }
+      // Inject only cues not already in the preset (idempotent across replays), then rebuild the
+      // LIVE layer subsystem so the freshly-synthesized clips stream in for the rest of the run.
+      const have = new Set((preset.layers ?? []).map((l) => l.id));
+      const fresh = res.compiled.layers.filter((l) => !have.has(l.id));
+      if (fresh.length > 0) session.injectLayers(fresh);
+      await session.refreshLayers();
+    } catch (e) {
+      ensuredFor = null; // transient failure (e.g. model load) → let the next play retry
+      const message = e instanceof Error ? e.message : String(e);
+      notices.push({ severity: 'error', message: `Couldn't prepare narration: ${message}` });
+    }
+  }
+
   return {
     get phase() {
       return phase;
@@ -307,5 +349,6 @@ export function createVoiceScriptStore(deps: {
       return canCompile;
     },
     importAndCompile,
+    ensureNarrationForPlayback,
   };
 }

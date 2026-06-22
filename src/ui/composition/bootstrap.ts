@@ -115,6 +115,16 @@ export function bootstrap(target?: HTMLElement, overrides: BootstrapOverrides = 
     clipLib: { importVia },
   });
 
+  // Auto-synth-on-play (D-043): the moment playback starts, if the working preset carries an
+  // embedded voiceScript, synthesize any missing narration clips in the background and stream the
+  // timed cues into the running session — no extra steps, beats never blocked. The coordinator
+  // no-ops without a script, without studio TTS (mobile), or when already prepared. Hooked to the
+  // transport state (not the play button) so EVERY play entry point — TransportBar, PlayerScreen,
+  // MediaSession — triggers it.
+  transport.on('statechange', () => {
+    if (transport.state === 'playing') void voiceScript.ensureNarrationForPlayback();
+  });
+
   // 5. seed the library once (idempotent) and adopt the working preset BY REFERENCE so
   //    duration() > 0 and the scrubber has a range from the first frame.
   library.seed();

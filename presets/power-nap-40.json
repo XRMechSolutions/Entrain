@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 5,
+  "schemaVersion": 6,
   "name": "Power Nap — 40 min (Sleep Fast, Gentle Wake)",
   "durationSec": 2400,
   "masterGain": 0.7,

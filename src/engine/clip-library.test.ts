@@ -188,6 +188,77 @@ describe('clip-library — dedup by full hash', () => {
 });
 
 // ---------------------------------------------------------------------------
+// (c2) importVia hashFor fast-path — incremental re-synth (skip produce on a cache hit)
+// ---------------------------------------------------------------------------
+
+describe('clip-library — importVia hashFor fast-path (incremental re-synth)', () => {
+  const HASH = 'a1b2c3d4e5f6a7b8'.padEnd(64, '0');
+
+  /** A tts-like adapter that COUNTS produce()/hashFor() calls so the cache skip is observable. */
+  function countingAdapter(hash: string) {
+    const calls = { produce: 0, hashFor: 0 };
+    const adapter: ClipSourceAdapter<{ tag: string }> = {
+      source: 'tts',
+      hashFor: async () => {
+        calls.hashFor++;
+        return hash;
+      },
+      produce: async () => {
+        calls.produce++;
+        return {
+          hash,
+          blob: fakeFile([1, 2, 3], 'v.wav'),
+          format: 'audio/wav',
+          durationSec: 2,
+          source: 'tts',
+          meta: { name: 'v' },
+        };
+      },
+    };
+    return { adapter, calls };
+  }
+
+  it('produces on a MISS, then reuses the cached clip on a HIT without calling produce again', async () => {
+    const { adapter, calls } = countingAdapter(HASH);
+
+    const first = await importVia(adapter, { tag: 'hello' });
+    expect(calls.produce).toBe(1); // miss → synthesized once
+    expect(first.id).toBe('clip_' + HASH.slice(0, 16));
+
+    const second = await importVia(adapter, { tag: 'hello' });
+    expect(calls.hashFor).toBe(2); // hash checked both times (cheap)
+    expect(calls.produce).toBe(1); // HIT → produce (synthesis) NOT called again
+    expect(second.id).toBe(first.id); // same stored clip
+    expect(await list()).toHaveLength(1); // no duplicate record
+    expect(second.lastUsedAt).toBeGreaterThanOrEqual(first.lastUsedAt); // LRU bumped on the hit
+  });
+
+  it('still produces when hashFor resolves a hash NOT in the store (a real content change)', async () => {
+    const a = countingAdapter(HASH);
+    await importVia(a.adapter, { tag: 'one' });
+    const b = countingAdapter('b9b9b9b9b9b9b9b9'.padEnd(64, '0')); // different content → different hash
+    await importVia(b.adapter, { tag: 'two' });
+    expect(b.calls.produce).toBe(1); // miss on the new hash → synthesized
+    expect(await list()).toHaveLength(2);
+  });
+
+  it('an adapter WITHOUT hashFor always produces (back-compat; file-import path unchanged)', async () => {
+    const calls = { produce: 0 };
+    const adapter: ClipSourceAdapter<null> = {
+      source: 'file',
+      produce: async () => {
+        calls.produce++;
+        return draftWith(HASH, [9], 'n.wav');
+      },
+    };
+    await importVia(adapter, null);
+    await importVia(adapter, null);
+    expect(calls.produce).toBe(2); // no hashFor → produce runs every time (dedup only at storage)
+    expect(await list()).toHaveLength(1); // still deduped to one record at the storage layer
+  });
+});
+
+// ---------------------------------------------------------------------------
 // (d) id-prefix collision (§2.1 / edge-cases §8)
 // ---------------------------------------------------------------------------
 

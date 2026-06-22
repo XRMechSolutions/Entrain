@@ -19,7 +19,11 @@
   <button type="button" class="open" onclick={onopen}>
     <span class="name">{summary.name}</span>
     <span class="meta">
-      {formatClock(summary.durationSec)} · {summary.nodeCount} node{summary.nodeCount === 1 ? '' : 's'} · {formatAgo(summary.updatedAt)}
+      {formatClock(summary.durationSec)} · {summary.nodeCount} node{summary.nodeCount === 1 ? '' : 's'}
+      {#if summary.voiceCount > 1}
+        · {summary.voiceCount} voices
+      {/if}
+      · {formatAgo(summary.updatedAt)}
     </span>
   </button>
   <div class="actions">

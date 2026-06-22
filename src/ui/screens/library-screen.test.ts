@@ -42,7 +42,7 @@ function renderLibrary() {
 }
 
 function summary(id: string, updatedAt: number): PresetSummary {
-  return { id, name: id, durationSec: 60, nodeCount: 1, createdAt: 0, updatedAt };
+  return { id, name: id, durationSec: 60, nodeCount: 1, voiceCount: 1, createdAt: 0, updatedAt };
 }
 
 describe('LibraryScreen (design §7)', () => {

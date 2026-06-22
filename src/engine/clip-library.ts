@@ -79,6 +79,15 @@ export interface ClipSourceAdapter<TInput> {
   readonly source: ClipSource;
   /** hash + decode + package; throws ClipLibraryError('DECODE_FAILED') */
   produce(input: TInput): Promise<ClipDraft>;
+  /**
+   * Optional fast-path: compute the content hash for `input` WITHOUT producing the clip
+   * (no model load, no synthesis, no decode). When present, `importVia` checks the store by
+   * this hash first and reuses a cached clip — skipping the expensive `produce()` on a hit.
+   * MUST return the SAME hash `produce()` stamps on its ClipDraft for the same input, or a
+   * stale/incorrect clip would be served. Adapters whose hash needs the produced bytes (e.g.
+   * file-import, which hashes decoded audio) simply omit this; importVia then always produces.
+   */
+  hashFor?(input: TInput): Promise<string>;
 }
 
 // ---------------------------------------------------------------------------
@@ -462,12 +471,47 @@ export async function getBlob(id: string): Promise<Blob | undefined> {
  * add-stage error (QUOTA_EXCEEDED/DB_ERROR) both propagate AS-IS — same code/message/
  * cause, never re-coded or wrapped (design §6.3). The caller always sees one typed
  * ClipLibraryError whose code names the real failure stage.
+ *
+ * Incremental fast-path: when the adapter exposes `hashFor`, the content hash is computed
+ * WITHOUT producing the clip and looked up in the store; on a hit the cached clip is reused
+ * (lastUsedAt bumped) and `produce()` is skipped entirely. This makes re-importing unchanged
+ * content cheap — recompiling a VoiceScript after editing only timing (or one other line)
+ * re-synthesizes ONLY the lines whose text/voice/rate actually changed. Adapters without
+ * `hashFor` (e.g. file-import) always produce, exactly as before.
  */
 export async function importVia<T>(
   adapter: ClipSourceAdapter<T>,
   input: T,
 ): Promise<Clip> {
+  if (adapter.hashFor) {
+    const hash = await adapter.hashFor(input);
+    const cached = await touchByHash(hash);
+    if (cached) return cached;
+  }
   return add(await adapter.produce(input));
+}
+
+/**
+ * Bump lastUsedAt and return a clip by its content hash in ONE readwrite transaction — the
+ * cache-hit fast-path of importVia. Resolves undefined with NO write when no clip has that
+ * hash. Mirrors getBlob's atomic read+bump so an LRU timestamp is never lost or clobbered.
+ */
+async function touchByHash(hash: string): Promise<Clip | undefined> {
+  const db = await getDb();
+  try {
+    const tx = db.transaction(STORE, 'readwrite');
+    const record = await tx.store.index(IDX_HASH).get(hash);
+    if (record === undefined) {
+      await tx.done; // no write — nothing to bump
+      return undefined;
+    }
+    record.lastUsedAt = Date.now();
+    await tx.store.put(record);
+    await tx.done;
+    return toClip(record);
+  } catch (cause) {
+    throw asDbError(cause);
+  }
 }
 
 // ---------------------------------------------------------------------------

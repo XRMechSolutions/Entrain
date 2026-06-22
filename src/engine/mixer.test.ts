@@ -140,6 +140,29 @@ describe('topology — fixed three-input → one-master graph', () => {
     // via an automation call; the mixer never calls a scheduling method on it.
     expect(mp(mixer.masterParam).events).toHaveLength(0);
   });
+
+  it('should allow N external gains to fan into bedInput without disturbing topology or bedInput.gain', () => {
+    const N = 3;
+    const { ctx, mixer } = makeMixer();
+    const { bed, duck, busSum, master } = gainsOf(ctx);
+
+    // Simulate N voice-trim gains (multi-voice §2) connecting their outputs into bedInput.
+    const trims = Array.from({ length: N }, () => new MockAudioNode(ctx, 'gain'));
+    for (const trim of trims) {
+      trim.connect(mixer.bedInput as unknown as MockAudioNode);
+    }
+
+    // N upstream edges fan into bedInput.
+    expect(mn(mixer.bedInput).inputs).toHaveLength(N);
+
+    // bed→duckGain→busSum→master topology is unchanged.
+    expect(bed.isConnectedTo(duck)).toBe(true);
+    expect(duck.isConnectedTo(busSum)).toBe(true);
+    expect(busSum.isConnectedTo(master)).toBe(true);
+
+    // Default bedHeadroom: bedInput.gain stays at unity (single-voice byte-identical).
+    expect(bed.gain.value).toBe(1.0);
+  });
 });
 
 // =====================================================================================
@@ -670,7 +693,6 @@ describe('automation seam — scheduleLane + LanePoint/ScheduleLaneOpts exports'
   it('should import LanePoint type from automation', async () => {
     // Confirm the type is exported for mixer's duck scheduling (design §3).
     // Note: TypeScript types are erased at runtime, so this validates module structure.
-    const mod = await import('./automation');
     const src = (await import('node:fs')).readFileSync(
       ((await import('node:path')).dirname((await import('node:url')).fileURLToPath(import.meta.url)) + '/automation.ts'),
       'utf8'
@@ -681,7 +703,6 @@ describe('automation seam — scheduleLane + LanePoint/ScheduleLaneOpts exports'
 
   it('should import ScheduleLaneOpts interface from automation', async () => {
     // Confirm the interface is exported for mixer's duck scheduling (arch §6).
-    const mod = await import('./automation');
     const src = (await import('node:fs')).readFileSync(
       ((await import('node:path')).dirname((await import('node:url')).fileURLToPath(import.meta.url)) + '/automation.ts'),
       'utf8'

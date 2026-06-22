@@ -288,6 +288,88 @@ each task; a diff in those three files is a regression, not a spec change.
   - Write findings + PASS/FAIL to .dev/.task-state/ui/behavioral-audit-phase2.md
   - PASS required before the Phase-2 feature is considered complete
 
+## Feature: Multi-Voice (v6)
+
+> The largest lift. Every authoring/monitor surface is hardwired to `session.preset.nodes` (the
+> primary "voice 0"); multi-voice introduces an `activeVoiceId` and routes through a `voiceView`
+> (multi-voice-architecture.md §5). Layer D — depends on the schema gate (A, for types/cap) and
+> transport (C, for multi-voice load/reapply + `setVoiceTrim`). Each voice is edited with the SAME
+> node editor as today; a voice can be binaural (beat>0) or isochronic (beat=0 + a volume pulse).
+> Build the SessionStore spine FIRST (the cross-component contract), then the screens.
+
+- [x] [ui] Extend `createSessionStore`: a `voices` accessor; `addVoice`/`removeVoice`/`setVoiceName`/`setVoiceGain`; a `voiceView(voiceId?): Preset` builder that DELEGATES to the shared session-model `voiceView(preset, nodes)` helper (sharing each voice's nodes by reference — NOT a hand-rolled literal, so render==playback==preview stay byte-identical, §1.5); and a trailing optional `voiceId?: string` on all 8 node mutators routed through a `targetNodes(voiceId?)` resolver. SENTINEL CONVENTION: `voiceId` is `string | undefined`, where `undefined` (and any unknown/stale id) ⇒ the primary voice 0 (`preset.nodes`); `voiceView`/`targetNodes` NEVER throw on a missing id (fall back to primary). `setVoiceGain(voiceId, value)`: clamp to `RANGES.voiceGain` [0,1], WRITE `preset.voices[k].gain` + set `dirty` + bump revision AND call `transport.setVoiceTrim` (live ramp) — the edit-time AND live channel (D-042), mirroring `setMasterGain`. `addVoice`/`removeVoice` are STRUCTURAL count changes ⇒ mutate `preset.voices`, set `dirty=true`, bump, then `transport.load(preset)` to rebuild — do NOT call `session.reset()` (it clears `dirty` + `selectedId`, losing the unsaved-changes guard and detaching the library record); this is the `addLayer`/`removeLayer` mutate+commit precedent, not a live reapply. Removing the active voice reselects Primary (`activeVoiceId → undefined`) | file: src/ui/stores/session.svelte.ts | model: T1
+  - Ref: .dev/planning/multi-voice-architecture.md @ §5 (SessionStore); §3 (add/remove = rebuild; setVoiceTrim); §1.5 (shared `voiceView`)
+  - Ref: .dev/planning/decisions-log.md @ D-040, D-042 (Voice.gain is edit-time AND live-adjustable)
+  - Ref: src/ui/stores/session.svelte.ts @ setMasterGain (the write-preset+dirty+bump+transport.setMasterTrim dual-write analog to mirror), reset() (clears dirty/selectedId — why NOT to call it for add/remove), addLayer/removeLayer (the structural mutate+commit precedent)
+  - Creates: the voice CRUD + `voiceView` (delegating to session-model) + the `voiceId?`-threaded mutators (the cross-component spine every other UI task builds on)
+  - Behavior: the cap uses the `1 + voices.length` formula (mirrors `LIMITS.maxVoices`); a voice's nodes are shared by reference so canvas edits mutate the live voice
+  - Tests: addVoice past the cap is rejected; mutators with no voiceId target voice 0 (byte-identical to today); an unknown/absent voiceId falls back to the primary (no throw); `voiceView(id)` returns a valid single-voice Preset and delegates to the shared session-model helper; `setVoiceGain` writes `preset.voices[k].gain` (survives a save) AND calls `transport.setVoiceTrim` without a full reschedule; `addVoice`/`removeVoice` trigger `transport.load` (rebuild) with `dirty=true` and a preserved `selectedId`, and do NOT call `reset()`/`reapply`/`setVoiceTrim`; removing the active voice reselects Primary
+
+- [x] [ui] Rebuild EditorScreen's Nodes view with a voice selector strip (Primary + extra-voice tabs), Add/Remove voice buttons (Add disabled at `1 + voices.length >= MAX_VOICES` with an explanatory title), a per-voice name+gain header for non-primary voices, and `activeVoiceId: string | undefined` `$state` (initial `undefined` = Primary; on Remove of the active voice, reset to `undefined`) threaded into the toolbar/canvas/inspector | file: src/ui/screens/EditorScreen.svelte | model: T2
+  - Ref: .dev/planning/multi-voice-architecture.md @ §5; §1.3 (cap formula)
+  - Tests: selecting a voice re-targets the canvas/inspector; Add disabled at the cap; per-voice gain slider drives setVoiceGain
+
+- [x] [ui] Add an `activeVoiceId` prop to TimelineCanvas so it renders + hit-tests via `session.voiceView(activeVoiceId)` and routes `setNodeValue`/`moveNode`/`addNode` with that voiceId | file: src/ui/editor/TimelineCanvas.svelte | model: T2
+  - Ref: .dev/planning/multi-voice-architecture.md @ §5
+  - Tests: canvas of voice k shows voice k's nodes; edits land on voice k
+
+- [x] [ui] Thread an optional `voiceId` prop through NodeInspector, ParamSection, and ModulationPanel so index resolution, the display/carry-forward READS, and every `session.setNode*` call all target the active voice's `voiceView` — including the non-mutator reads `baseValueAt`/`valueAt`/`expDisabled` and the `session.preset.nodes[index]?.[param]` lookups (NodeInspector.svelte:73, ParamSection.svelte:51-53, ModulationPanel.svelte:95/101/116), NOT just the mutators — else an extra voice's inspector would DISPLAY voice 0's values. Same control set as today (carrier/beat/volume/spatial/waveform + warble mods) | file: src/ui/editor/NodeInspector.svelte, src/ui/components/ParamSection.svelte, src/ui/components/ModulationPanel.svelte | model: T2
+  - Ref: .dev/planning/multi-voice-architecture.md @ §5 (components "render/hit-test/mutate via the active voice")
+  - Ref: src/ui/editor/NodeInspector.svelte @ 73 (baseValueAt); src/ui/components/ParamSection.svelte @ 51-53 (value/transition/expDisabled reads); src/ui/components/ModulationPanel.svelte @ 95/101/116 (mod/baseValue reads)
+  - Tests: inspector edits target the active voice; an extra voice's inspector DISPLAYS that voice's values (not voice 0's); an isochronic voice (beat 0 + volume pulse) authors via the existing modulation panel
+
+- [x] [ui] Add `MAX_VOICES` (mirrored from session-model `LIMITS.maxVoices`, same `1 + voices.length` formula) to lib/constants.ts and a `CONTROL.voiceGain` spec to lib/controls.ts for the per-voice trim slider | file: src/ui/lib/constants.ts, src/ui/lib/controls.ts | model: T3
+  - Ref: .dev/planning/multi-voice-architecture.md @ §1.3; §5
+  - Tests: `MAX_VOICES === LIMITS.maxVoices` (tripwire so the UI mirror can't drift from session-model — spec §1.3 "UI mirrors it, never a bare voices.length compare"); `CONTROL.voiceGain` range derives from `RANGES.voiceGain` {0,1}
+
+- [x] [ui] Add a voice selector to PlayerScreen passing a `voiceId` into SignalMonitor and SignalGauges so each renders the selected voice via `session.voiceView(voiceId)` (one voice monitored at a time) | file: src/ui/screens/PlayerScreen.svelte, src/ui/components/SignalMonitor.svelte, src/ui/components/SignalGauges.svelte | model: T2
+  - Ref: .dev/planning/multi-voice-architecture.md @ §5
+  - Tests: the monitor follows the selected voice
+
+- [x] [ui] Show a voice-count badge in PresetListItem when `PresetSummary.voiceCount > 1` (rendered only when present) | file: src/ui/components/PresetListItem.svelte | model: T3
+  - Ref: .dev/planning/multi-voice-architecture.md @ §5; D-042
+  - Tests: badge renders when `voiceCount > 1`; hidden when `=== 1` or absent
+
+- [x] [ux] Make the voice selector responsive (horizontal thumb-scroll strip below 720px, inline tabs when `ui.isWide`) and document the multi-voice mobile+wide behavior in ui/design.md §13 and the new SessionStore voice contract in interfaces.md | file: src/ui/screens/EditorScreen.svelte, .dev/planning/modules/ui/design.md, .dev/planning/modules/ui/interfaces.md | model: T2
+  - Ref: .dev/planning/multi-voice-architecture.md @ §5 (responsive REQUIRED)
+  - Tests: the selector renders as a horizontal scroll strip below 720px and as inline tabs when `ui.isWide`
+
+- [x] [ui] Show a "headphones required for binaural voices · experimental, no medical/therapeutic claims" notice whenever a loaded preset contains a binaural voice. PREDICATE: any node in the primary `preset.nodes` OR any `preset.voices[k].nodes` sets `beat` with `value > 0` (include voice 0; a keyframed beat that is 0 at t=0 but >0 later still counts). RECONCILE with the existing UNCONDITIONAL caption + one-time `HeadphoneReminder` already in `PlayerScreen.svelte:38-42` — do NOT add a redundant third headphone element; either fold the new binaural-specific disclaimer into the existing reminder copy or render this conditional notice in place of the generic caption when the predicate holds | file: src/ui/components/HeadphoneNotice.svelte (new) + src/ui/screens/PlayerScreen.svelte + its test | model: T2
+  - Ref: .dev/planning/multi-voice-architecture.md @ §6 (integrity notice)
+  - Ref: .dev/planning/modules/perf-safety-binaural-integrity/design.md @ §4 (any voice with beat>0; isochronic-only presets play on speakers)
+  - Ref: src/ui/screens/PlayerScreen.svelte @ 38-42 (existing caption + HeadphoneReminder to reconcile with); .dev/knowledge/binaural-beats/safety.md (no medical claims)
+  - Tests: notice shows for a binaural preset (incl. one whose only binaural voice is an extra voice, and a keyframed beat 0→>0); hidden for an all-isochronic preset; no duplicate headphone element rendered
+
+- [x] [audit] Verify canvas-renderer.ts and interactions.ts need ZERO code change by feeding them `voiceView` (they only read `preset.nodes`/`durationSec`); then behavioral audit of the ui multi-voice surface | file: .dev/.task-state/ui/behavioral-audit-v6-voices.md | model: T1
+  - Ref: C:/Projects/.dev-shared/behavioral-audit.md
+  - Ref: .dev/planning/multi-voice-architecture.md @ §5
+  - Verify the active-voice routing end to end (select → edit → schedule via transport reapply/setVoiceTrim), the cap formula, the responsive layout, that single-voice authoring is byte-identical when no extra voices exist, and that voice add/remove is a STRUCTURAL `transport.load` rebuild (dirty set, selectedId preserved) — NOT a live reapply
+  - DONE: PARTIAL. Part-A ZERO-change claim VERIFIED (canvas-renderer.ts/interactions.ts read only `preset.nodes`/`durationSec` + delegate to automation funcs that do the same; voiceView supplies exactly that field set; neither file is in the v6 diff). Data spine, selector, monitor, badge, headphone predicate, cap formula all PASS. Cleanup tasks created (FIX-1/2/3) for: EditorScreen not threading activeVoiceId into TimelineCanvas/NodeInspector (extra-voice canvas+inspector editing broken), and the red `npm run check` gate (§0 guardrail).
+
+## Cleanup (Multi-Voice v6 behavioral audit — 2026-06-21)
+
+- [x] [cleanup] Fix: EditorScreen does not thread `activeVoiceId` into TimelineCanvas / NodeInspector — extra-voice canvas + inspector editing is non-functional | file: src/ui/screens/EditorScreen.svelte | model: T2
+  - Ref: behavioral audit 2026-06-21 (.dev/.task-state/ui/behavioral-audit-v6-voices.md) FIX-1
+  - EditorScreen.svelte:316 `<TimelineCanvas …/>` lacks `activeVoiceId={activeVoiceId}` ⇒ canvas always draws/hit-tests/edits voice 0; EditorScreen.svelte:323 `<NodeInspector node={resolved} />` lacks `voiceId={activeVoiceId}` ⇒ for an extra voice `indexOf(node)===-1` so the inspector renders nothing
+  - Pass `activeVoiceId={activeVoiceId}` to `<TimelineCanvas>` and `voiceId={activeVoiceId}` to `<NodeInspector>`; add a regression test that edits an extra voice through the canvas (drag/tap) and the Node Inspector (param + mod), asserting edits land on `preset.voices[k].nodes` and NOT `preset.nodes`
+
+- [x] [cleanup] Fix: HeadphoneNotice.svelte is scriptless → `npm run check` cannot resolve the module (implicit any) | file: src/ui/components/HeadphoneNotice.svelte | model: T3
+  - Ref: behavioral audit 2026-06-21 FIX-2
+  - PlayerScreen.svelte:16 import errors "Could not find a declaration file for module '../components/HeadphoneNotice.svelte'"; add an empty `<script lang="ts"></script>` block (no behavior change), confirm `npm run check` clears the error
+
+- [x] [cleanup] Fix: three library UI test fixtures omit the now-required `PresetSummary.voiceCount` | file: src/ui/components/library-components.test.ts | model: T3
+  - Ref: behavioral audit 2026-06-21 FIX-3
+  - `voiceCount` is required (persistence.ts:77); add `voiceCount: 1` to the PresetSummary fixtures at library-components.test.ts:12, src/ui/screens/library-screen.test.ts:45, and src/ui/stores/library.svelte.test.ts:84 (do not type it optional); re-run `npm run check` green
+
+- [x] [cleanup] MAX_VOICES is unused and the spec-mandated drift tripwire is missing | file: src/ui/lib/constants.ts | model: T3
+  - Ref: behavioral audit 2026-06-21 NOTE-1; tasks #321/#323
+  - Removed unused MAX_VOICES constant (lines 64-66); cap is already enforced via LIMITS.maxVoices in session-model
+
+> NOTE-2 (cross-module, NOT ui-owned): 4 of the 8 `npm run check` errors are engine-file
+> unused-symbol errors from the v6 landing (`mixer.ts:27` ScheduleLaneOpts, `renderer.ts:34`
+> Waveform, `mixer.test.ts:673,684` mod). They keep the shared check gate red (§0 guardrail);
+> route their fixes to the mixer/renderer module task lists.
+
 ## Completion Criteria
 - [ ] All tasks above marked [x] — none left [ ] (Pending) or [!] (Needs-Attention)
 - [ ] Zero active stubs for `ui` (the SessionScheduler adapter stub is resolved by the scheduler-adapter task)

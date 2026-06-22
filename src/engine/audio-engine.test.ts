@@ -412,6 +412,52 @@ describe('master flag — bus mode (D-036)', () => {
 });
 
 // =====================================================================================
+// N-way bus-mode reuse (D-040 §2) — 4 independent voices on one shared ctx
+// =====================================================================================
+
+describe('N-way bus-mode reuse (D-040 §2)', () => {
+  it('should build 4 fully independent bus-mode voices: distinct graphs, unity masterGain, guarded setMasterGain, rewirable output', () => {
+    const ctx = new MockAudioContext();
+    const ctxBase = asCtx(ctx);
+    const voices = [0, 1, 2, 3].map(() => createVoice(ctxBase, { master: 'bus' }));
+
+    // Distinct node graphs: output, masterGainParam, and carrierParam are all unique objects
+    expect(new Set(voices.map(v => v.output)).size).toBe(4);
+    expect(new Set(voices.map(v => v.masterGainParam)).size).toBe(4);
+    expect(new Set(voices.map(v => v.carrierParam)).size).toBe(4);
+
+    // Each masterGainParam is at unity (bus-mode construction — not the silent-start 0)
+    for (const v of voices) {
+      expect(mp(v.masterGainParam).value).toBe(1);
+    }
+
+    // setMasterGain is a guarded no-op in bus mode: no ramp recorded, value unchanged at 1
+    for (const v of voices) {
+      const before = mp(v.masterGainParam).events.length;
+      v.setMasterGain(0.5);
+      expect(mp(v.masterGainParam).events.length).toBe(before);
+      expect(mp(v.masterGainParam).value).toBe(1);
+    }
+
+    // Each voice.output starts wired to ctx.destination (unconditional connect in createVoice)
+    for (const v of voices) {
+      expect(mn(v.output).isConnectedTo(ctx.destination)).toBe(true);
+    }
+
+    // voice.output can be disconnected from destination and reconnected to a shared external GainNode
+    const sharedBus = new MockAudioNode(ctx);
+    for (const v of voices) {
+      mn(v.output).disconnect(ctx.destination);
+      mn(v.output).connect(sharedBus);
+    }
+    for (const v of voices) {
+      expect(mn(v.output).isConnectedTo(ctx.destination)).toBe(false);
+      expect(mn(v.output).isConnectedTo(sharedBus)).toBe(true);
+    }
+  });
+});
+
+// =====================================================================================
 // Task 3 — lifecycle state machine
 // =====================================================================================
 

@@ -109,7 +109,10 @@ interface DuckRegion {
 
 /** Build the arch §1 topology and the single bed-duck writer. Total over any real
  *  `BaseAudioContext` (online or offline); originates no error type (interfaces.md §3). */
-export function createMixer(ctx: BaseAudioContext, opts?: { masterStart?: number }): Mixer {
+export function createMixer(
+  ctx: BaseAudioContext,
+  opts?: { bedHeadroom?: number; masterStart?: number },
+): Mixer {
   // --- the fixed node graph (design §2) ---
   // bedInput(1.0) → duckGain(1.0) ┐
   //                                ├→ busSum(1.0) → master(0.0) → (target via connect())
@@ -123,7 +126,11 @@ export function createMixer(ctx: BaseAudioContext, opts?: { masterStart?: number
   const master = ctx.createGain();
 
   // Initial gains: everything unity except master (silent start, D-008).
-  bedInput.gain.value = UNITY;
+  // bedInput carries the equal-power bed HEADROOM (multi-voice §2 / D-041): written EXACTLY
+  // ONCE here to opts.bedHeadroom (default 1 ⇒ single-voice byte-identical). Transport passes
+  // 1/√N for N voices so summing up to 4 near-full-scale voices never overdrives busSum→master.
+  // bedInput still SUMS its fan-in — there is no auto-normalisation; this is the only writer.
+  bedInput.gain.value = opts?.bedHeadroom ?? 1;
   duckGain.gain.value = UNITY; // = "no duck"
   cueInput.gain.value = UNITY;
   liftInput.gain.value = UNITY;
@@ -266,14 +273,18 @@ export function createMixer(ctx: BaseAudioContext, opts?: { masterStart?: number
     // t0 maps span-time origin to the ctx clock; startOffsetSec is the seek point. The
     // region point t's are already ctx-times, so startTime = t0 and we forward
     // startOffsetSec/floorTime exactly as the binaural/layer callers do.
-    scheduleLane(duckParam, points, {
+    // The duck reuses automation's shared lane contract verbatim (interfaces.md §2): the opts
+    // are the same ScheduleLaneOpts the binaural/layer callers pass, typed here so the reuse is
+    // explicit and a contract drift is a compile error.
+    const duckOpts: ScheduleLaneOpts = {
       startTime: t0,
       startOffsetSec,
       floorTime: t0, // no event before the live now/anchor (the mapped t0).
       anchorValue: trackedDuck, // JS-tracked seek anchor; NEVER duckParam.value (D-019).
       valueAt, // mid-segment start values for later segments after the seek.
       policy: { stepRampSec: 0, expFallback: true }, // bare linear edges, not the volume fork.
-    });
+    };
+    scheduleLane(duckParam, points, duckOpts);
 
     // Settle trackedDuck to the value the emitted envelope reaches once it is past every
     // region (unity), so a subsequent schedule/cancel anchors correctly.

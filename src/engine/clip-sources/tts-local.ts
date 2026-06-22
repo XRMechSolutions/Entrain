@@ -249,8 +249,6 @@ function writeAscii(view: DataView, offset: number, text: string): void {
 const RATE_MIN = 0.5;
 const RATE_MAX = 2.0;
 const DEFAULT_RATE = 1.0;
-/** Field delimiter that cannot occur in a value, so distinct tuples never collide. */
-const HASH_SEP = ' ';
 
 /**
  * Clamp `rateScale` into [0.5, 2.0]. Non-finite (NaN / ±Infinity) and undefined collapse
@@ -270,7 +268,7 @@ function formatRate(rate: number): string {
 
 /**
  * hash = hex(SHA-256(utf-8(join(modelId, voice, lang, text, rate)))) over NORMALIZED
- * inputs (resolved voice, clamped+canonical rate, trimmed text), NUL-separated (design §4).
+ * inputs (resolved voice, clamped+canonical rate, trimmed text), JSON-array-encoded (design §4).
  * Encoding and device are deliberately excluded from the basis. `crypto.subtle` via the
  * shared `sha256Hex` (no hashing lib) — a missing subtle surfaces as a wrapped reject.
  */
@@ -281,7 +279,7 @@ async function computeHash(
   text: string,
   rate: number,
 ): Promise<string> {
-  const basis = [modelId, voice, language, text, formatRate(rate)].join(HASH_SEP);
+  const basis = JSON.stringify([modelId, voice, language, text, formatRate(rate)]);
   const bytes = new TextEncoder().encode(basis);
   // Hand a freshly-sliced ArrayBuffer (not the possibly-shared view buffer) to digest.
   return sha256Hex(bytes.buffer.slice(0));
@@ -533,6 +531,17 @@ export function createTtsAdapter(opts?: TtsAdapterOptions): ClipSourceAdapter<Tt
 
   return {
     source,
+    /**
+     * Content hash for `input` WITHOUT loading the model or synthesizing — the same basis
+     * produce() stamps (normalized text/voice/language/rate + modelId). Lets clip-library's
+     * importVia skip a cache hit before the expensive synth (incremental re-synth). Validation
+     * (EMPTY_TEXT / UNSUPPORTED_LANGUAGE / UNKNOWN_VOICE) runs here too, so an invalid input
+     * rejects cheaply, exactly as produce() would.
+     */
+    async hashFor(input: TtsInput): Promise<string> {
+      const norm = normalize(input);
+      return computeHash(config.modelId, norm.voice, norm.language, norm.text, norm.rate);
+    },
     async produce(input: TtsInput): Promise<ClipDraft> {
       // 1. Validate & normalize FIRST — these reject before ANY model work (edge-cases §4,§5).
       const norm = normalize(input);

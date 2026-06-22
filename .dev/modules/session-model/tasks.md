@@ -187,10 +187,86 @@ runtime npm dependencies (dependencies.md) and uses only platform APIs (`JSON`,
 - [x] [cleanup] Sync ModShape `box` into the session-model planning docs | file: .dev/planning/modules/session-model/interfaces.md, .dev/planning/modules/session-model/edge-cases.md | model: T2
   - Ref: behavioral audit 2026-06-15 (.dev/.task-state/audit-session-model.md, NOTE) — code's `ModShape` includes the additive `box` shape (audited PASS in audit-box-shape.md), but interfaces.md §2 and the `MOD_SHAPE_INVALID` template in edge-cases.md §1/§5 still list only sine/triangle/square/pulse. Add `box` to interfaces.md §2, update the `MOD_SHAPE_INVALID` verbatim template (".. must be one of sine, triangle, square, pulse, box"), and add box's per-shape behavior (pulseWidth = hold ratio; edgeMs/steps IGNORED_FIELD_FOR_SHAPE) to edge-cases.md §5. Docs-only; no code change.
 
+## Feature: Multi-Voice (v6)
+
+> **GATING PREREQUISITE (multi-voice-architecture.md §0 — land FIRST, as ONE ATOMIC bundle).**
+> This section ships schema **v6**: the `Voice` type + `Preset.voices?`, `validateVoices`
+> (phase 13), `normalizeVoice`, `MIGRATIONS[5]` (v5→v6), the merged `VOICE_*`/`VOICES_*` codes,
+> `LIMITS.maxVoices`/`maxPulseWorklets`, and the shared `voiceView` helper. Every downstream
+> multi-voice module (mixer, transport, renderer, ui) depends on these contracts — **no
+> multi-voice module may begin until this section is [x] and the Layer-A checkpoint PASSes.**
+>
+> **Atomic-bundle guardrail (acceptance criteria for the whole section).** `CURRENT_SCHEMA_VERSION`
+> 5→6 ripples to EVERY hardcoded `schemaVersion: 5` literal (16 `presets/*.json`, 4 inline
+> built-ins in `persistence.ts`, and test literals in `session-model.test.ts`,
+> `persistence.test.ts`, `renderer.test.ts`, and the un-owned **`automation.test.ts:44`**). The
+> bundle lands together and the gate is **`npm test` AND `npm run check` (svelte-check) green
+> before AND after** — the literal-type breakage is invisible to vitest (esbuild strips types).
+> The cross-tree literal sweep is the dedicated `[data]` task below; the persistence data half +
+> round-trip tests live in `modules/persistence/tasks.md` under the same Layer-A checkpoint.
+>
+> **The linchpin.** `normalizePreset` is an allowlist clone — miss the `voices` copy or the
+> `PRESET_KEYS` append and `voices` is SILENTLY stripped on every validate/parse/round-trip
+> while tests stay green. The round-trip `presetsEqual` test (task 4) is the executable proof.
+
+- [x] [data] Declare the `Voice` interface + `Preset.voices?`, bump `CURRENT_SCHEMA_VERSION` 5→6 (Preset literal at :63 + both `as 5` casts at normalizePreset:997 and createDefaultPreset:1272 → `as 6`; LEAVE the third in-file `schemaVersion: 5` at :1129 — `migrateV4ToV5`'s v4→v5 output stamp — UNCHANGED; it is permanently 5, not a bundle target), append `'voices'` to `PRESET_KEYS`, add `LIMITS.maxVoices=4`/`maxPulseWorklets=8` + `RANGES.voiceGain {0,1}` + `DEFAULTS.voiceGain=1`, and the merged `VOICE_*`/`VOICES_*` ValidationCode members | file: src/engine/session-model.ts | model: T1
+  - Ref: .dev/planning/multi-voice-architecture.md @ §1.1 Types; §1.2 codes; §1.3 limits/ranges/defaults; §0 atomic bundle
+  - Ref: .dev/planning/data-models.md @ Entity Voice; Preset.voices row
+  - Ref: .dev/planning/decisions-log.md @ D-040
+  - Creates: `export interface Voice { id: string; name?: string; gain?: number; nodes: TimeNode[] }`; `Preset.schemaVersion` literal `6` + `Preset.voices?: Voice[]`; `CURRENT_SCHEMA_VERSION=6` (MIN stays 2); `PRESET_KEYS` append `'voices'`; `LIMITS.maxVoices=4`, `LIMITS.maxPulseWorklets=8`; `RANGES.voiceGain {min:0,max:1}`; `DEFAULTS.voiceGain=1`; the NEW codes `VOICES_NOT_ARRAY`, `VOICES_TOO_MANY`, `VOICES_TOO_MANY_PULSES`, `VOICE_NOT_OBJECT`, `VOICE_ID_NOT_STRING`/`_EMPTY`/`_DUPLICATE`, `VOICE_GAIN_NOT_FINITE`/`_OUT_OF_RANGE`, `VOICE_NODES_NOT_ARRAY`/`_EMPTY`, and warning `VOICES_CARRIER_TOO_CLOSE`
+  - Behavior: additive only — every v5 type/const stays byte-identical except the two version literals and `Preset` gaining `voices?`. Per-voice node-field errors REUSE the existing `NODE_*`/`PARAM_*`/`MOD_*`/`NODES_*`/`CARRIER_NOT_AT_START`/`EXP_RAMP_THROUGH_ZERO` codes at `voices[k].nodes[…]` paths (do NOT mint duplicates)
+  - Tests: `CURRENT_SCHEMA_VERSION===6`/`MIN===2`; `LIMITS.maxVoices===4`; `RANGES.voiceGain`==`{0,1}`; type-level — `Preset.schemaVersion` literal `6`, `Preset.voices` is `Voice[]|undefined`, `Voice` shape; the new codes assignable
+  - Ripple: every `Preset`/`schemaVersion` consumer (audio-engine, automation, transport, persistence, ui, renderer, mixer) now sees `schemaVersion:6` + optional `voices` — additive, so single-voice presets still type-check
+
+- [x] [impl] Thread a `pathPrefix` (default `'nodes'`) through `validateNodes`/`validateNode`/`validateOrdering`/`validateExpThroughZero` so top-level paths stay byte-identical, then add `validateVoices` (phase 13, wired after `validateLayers`) reusing them per voice plus container/id-uniqueness/name-length/gain-range/cap/pulse-cap checks and the `VOICES_CARRIER_TOO_CLOSE` advisory warning | file: src/engine/session-model.ts | model: T1
+  - Ref: .dev/planning/multi-voice-architecture.md @ §1.1 Types (Voice.name "≤ 80 chars, reuse the name rule"); §1.2 codes (reuse-with-prefix strategy); §1.3 cap formula `1 + voices.length`; §6 carrier separation + pulse-worklet cap
+  - Ref: .dev/planning/modules/perf-safety-binaural-integrity/design.md @ §1 (pulse-worklet count SCOPE — counts voice 0; the 4-voice × 4-lane = 16 worst case); §2 (carrier-too-close predicate — ratio < 1.1 OR |Δ| < 30 Hz, uses the t=0 carrier base)
+  - Ref: .dev/planning/modules/session-model/edge-cases.md @ §1 (emit the VOICE_*/VOICES_* message templates VERBATIM — author them consistent with the §11/edge-cases docs task)
+  - Ref: src/engine/session-model.ts @ validateNodes/validateNode/validateOrdering/validateExpThroughZero (423-724) — the validators being prefixed; validateLayers (731) — the phase-12 placement precedent; validateName (378-391) — the NAME_NOT_STRING/NAME_TOO_LONG rule to reuse
+  - Accepts: a value whose top-level nodes + layers are already validated (extends `validate`)
+  - Creates: phase-13 `validateVoices` — `VOICES_NOT_ARRAY`; `VOICES_TOO_MANY` when `1 + voices.length > LIMITS.maxVoices`; per voice `VOICE_NOT_OBJECT`, `VOICE_ID_*` (unique within `voices[]`), `VOICE_GAIN_*` (finite, [0,1]); when `name` is PRESENT, REUSE `NAME_NOT_STRING`/`NAME_TOO_LONG` (≤80) at path `voices[k].name` (spec §1.1 "reuse the name rule"); `VOICE_NODES_NOT_ARRAY`/`_EMPTY`, then the full per-node validation at `voices[k].nodes[…]` paths (carrier@t=0, sorted/unique t≤durationSec, ParamPoint/ModPoint/spatial/exp); `VOICES_TOO_MANY_PULSES` when the total worklet-spawning lane count exceeds `LIMITS.maxPulseWorklets` — COUNTING: across the PRIMARY voice's top-level `preset.nodes` AND every `voices[k].nodes` (counts voice 0, matching the `1 + voices.length` cap), counting ONE per `(voice, param-lane)` whose mod shape spawns an AudioWorklet — `pulse` OR `square` (NOT `box`/`steps`/`sine`/`triangle`, which use ConstantSource/native osc — cf. automation.ts `schedulePulseSpan` vs `scheduleBoxSpan`/`scheduleStepSpan`), since a continuous-phase lane is one persistent worklet regardless of keyframe count; the `VOICES_CARRIER_TOO_CLOSE` warning when any two voices' t=0 carrier base values (the PRIMARY `preset.nodes[0].carrier` participates in the pairwise scan) are within ratio < 1.1 OR |Δ| < 30 Hz
+  - Handles: `voices` absent → no checks (valid, single-voice); the prefix default keeps top-level node paths byte-identical (existing tests unchanged); carrier-too-close is a WARNING (ok stays true)
+  - Tests: a valid 3-extra-voice preset → ok:true; each new code triggered by one bad field at the documented path; `1 + voices.length > 4` → `VOICES_TOO_MANY`; per-voice missing carrier@t=0 → `CARRIER_NOT_AT_START` at `voices[k].nodes[0]`; duplicate voice id → `VOICE_ID_DUPLICATE`; a `voices[k].name` of 81 chars → `NAME_TOO_LONG` at `voices[k].name`; the primary's t=0 carrier participates (primary 200 + extra 210 → `VOICES_CARRIER_TOO_CLOSE`), and two carriers 200 & 205 Hz → `VOICES_CARRIER_TOO_CLOSE` (warning, ok:true); >8 worklet-spawning (pulse/square) lanes across primary+extras → `VOICES_TOO_MANY_PULSES` (8 accepted), while a `box`/`steps`-only preset does NOT trigger it; top-level node-error paths still read `nodes[i]…` (no regression)
+
+- [x] [impl] [data] Add `normalizeVoice` (canonical order id,name,gain,nodes; per-voice nodes via the existing `normalizeNode`) wired into `normalizePreset` AFTER layers; register `MIGRATIONS[5]` as the pure v5→v6 version-bump; add the `voiceView(preset, nodes)` shared helper; update the stub-registry MIGRATIONS marker AND the stale in-code migration comments | file: src/engine/session-model.ts, .dev/.task-state/stub-registry.md | model: T1
+  - Ref: .dev/planning/multi-voice-architecture.md @ §1.4 normalization/migration/linchpin; §1.5 voiceView helper
+  - Ref: src/engine/session-model.ts @ normalizePreset (995-1008, the allowlist clone — add the `voices` copy block mirroring `'layers' in root`); MIGRATIONS (1118-1122); the migration narrative comment + `TODO(stub)` marker (1113-1117 — update "output is always v5" → "always v6" and ">v5 schema" → ">v6 schema"; these are prose, NOT caught by the literal sweep)
+  - Ref: .dev/.task-state/stub-registry.md — advance the `MIGRATIONS[from]` forward-extension marker to MIGRATIONS[5] (v5→v6); ALSO reconcile the stale baseline — add a Resolved row for the already-shipped `MIGRATIONS[4]` (v4→v5, a STRUCTURAL migration, not a pure bump) and correct the Active row text from ">v4" to ">v6"; the extension point stays for any future >v6 bump
+  - Creates: `normalizeVoice` wired into `normalizePreset` after the layers copy (absent `voices` stays absent — sparse); `MIGRATIONS[5] = (obj) => ({ ...obj, schemaVersion: 6 })`; `export function voiceView(preset: Preset, nodes: TimeNode[]): Preset` returning the non-recursive `{schemaVersion,name,durationSec,masterGain,nodes}` (no voices/layers); `createDefaultPreset` stays single-voice (no `voices` key)
+  - Tests: a v5 preset parses → migrates to v6 (`migratedFrom:5`, no `voices`); v6 passthrough (`migratedFrom:null`); `schemaVersion 7` → `SCHEMA_TOO_NEW`; **round-trip `presetsEqual` true** for a multi-voice preset (the linchpin proof — canonical voice key order, per-voice nodes preserved); absent `voices` stays absent through round-trip; `voiceView(preset, voices[0].nodes)` yields a valid single-voice Preset whose nodes === that voice's nodes
+  - Ripple: `persistence` re-saves migrated v5 presets at v6 (reads `migratedFrom`); transport + renderer consume `voiceView`
+
+- [x] [data] Cross-tree atomic literal sweep — bump every remaining `schemaVersion: 5` literal to `6` (EXCEPT the permanent must-stay-5 sites: `session-model.ts:1129` (`migrateV4ToV5`'s v4→v5 output stamp) and any test fixture that intentionally feeds v5 INPUT to a migration) so the schema bundle lands green on `npm run check` | file: (multiple — atomic schema bundle) | model: T1
+  - Ref: .dev/planning/multi-voice-architecture.md @ §0 (the atomic bundle file list); §8 (the `automation.test.ts:44` un-owned literal)
+  - Accepts: nothing (mechanical version-literal sweep)
+  - Creates: `"schemaVersion": 5 → 6` in all 16 `presets/*.json`; the 4 inline built-ins in `src/engine/persistence.ts` → 6; the `default-sessions.ts:27` comment (`5`→`6`, per spec §0 bundle list); the `Preset`-typed `schemaVersion: 5` literals in `src/engine/automation.test.ts:44`, `src/engine/renderer.test.ts` (basePreset), `src/engine/persistence.test.ts`, and any remaining test fixtures (`grep -rn 'schemaVersion.*5'`). SEPARATELY move the `SCHEMA_TOO_NEW` "future" sentinels from `6`→`7` (NOT 5→6): the `session-model.test.ts` gate tests and `persistence.test.ts` C4 (`:385`) — after the bump v6 is current, so a v6 body is VALID and a too-new gate must use v7
+  - Behavior: lands in the SAME commit/landing as the three session-model tasks above and the persistence data tasks — partial landing crashes `seedDefaultPresets` (WRONG_SCHEMA_VERSION) or fails `npm run check`
+  - Tests: `npm test` AND `npm run check` both green; `grep -rn 'schemaVersion.*5'` returns NO hits except the ALLOWLIST — `session-model.ts:1129` (the `migrateV4ToV5` output, permanently 5) and migration-fixture tests that intentionally feed v5 INPUT; and no `schemaVersion: 6` `SCHEMA_TOO_NEW` sentinel remains (they moved to 7)
+  - Ripple: every seed + import path now emits/accepts v6; the default-presets glob test still passes (files validate as v6)
+
+- [x] [test] Extend session-model.test.ts: version-literal sweep to 6 (mkPreset + inline literals; gate tests 6→7; rewrite the v5-identity migrate test to v5→v6 + add a v6 passthrough; retarget v2/v3/v4 migrate-target + canonical-order assertions to v6) and append the multi-voice describe blocks | file: src/engine/session-model.test.ts | model: T1/T1/T2/T3
+  - Ref: .dev/testing-standards.md
+  - Ref: .dev/planning/multi-voice-architecture.md @ §1 (every voice boundary is a test row); §8 (round-trip linchpin proof)
+  - Ref: .dev/planning/modules/session-model/edge-cases.md @ §1 (assert the verbatim VOICE_*/VOICES_* message templates)
+  - Creates: appended v6 voice describe-blocks — valid multi-voice preset; one case per new code at the exact path + verbatim message; cap `VOICES_TOO_MANY`; `VOICES_CARRIER_TOO_CLOSE` warning (ok:true); per-voice reuse of node codes at `voices[k].nodes[…]`; v5→v6 migration (`migratedFrom:5`); round-trip `presetsEqual`; `{voices:[]}` vs absent; canonical key order stable
+  - Handles: the existing v5 guardrail — every pre-existing assertion stays passing EXCEPT the version-const/gate/migrate-target updates (mirror the v4→v5 bump pattern)
+  - Tests (this task IS the tests): `npx vitest run src/engine/session-model.test.ts` green, then full `npm test` + `npm run check` green (zero cross-module regression)
+
+- [x] [data] Add the Voice contract to interfaces.md §11 (Voice + Preset.voices + the merged VOICE_*/VOICES_* union + LIMITS.maxVoices/maxPulseWorklets + voiceView), the VOICE_* verbatim message templates + voice-cap/round-trip rows to edge-cases.md, and correct the STALE `CURRENT_SCHEMA_VERSION` (interfaces.md:16 says 4) to 6 | file: .dev/planning/modules/session-model/interfaces.md, .dev/planning/modules/session-model/edge-cases.md | model: T2
+  - Ref: .dev/planning/multi-voice-architecture.md @ §1; §8
+  - Behavior: the published union in §11 is the contract UI error-display and persistence assertions code against — publish it BEFORE those modules build
+  - Tests: docs-only; no code change
+
+- [x] [audit] Behavioral audit: session-model v6 multi-voice | file: .dev/.task-state/session-model/behavioral-audit-v6-voices.md | model: T1
+  - Ref: C:/Projects/.dev-shared/behavioral-audit.md
+  - Ref: .dev/planning/multi-voice-architecture.md @ §0/§1/§8
+  - Verify every new export is reachable; trace `validate`→issues for voices; `MIGRATIONS[5]` two-/one-/zero-step walk to v6; normalization canonical order + absent-voices sparseness; the round-trip linchpin holds; the atomic bundle is complete (`npm test` AND `npm run check` green before AND after; zero `schemaVersion: 5` literals remain outside intentional v5-input fixtures)
+  - Write findings; PASS required before any multi-voice module begins (Layer-A checkpoint)
+
 ## Completion Criteria
-- [ ] All tasks above marked [x] — none left [ ] (Pending) or [!] (Needs-Attention)
-- [ ] Zero active stubs for this module in .dev/.task-state/stub-registry.md (the Schema v3 task populates `MIGRATIONS[2]` (v2→v3); the extension point remains documented for any future >v3 bump)
-- [ ] All session-model module tests passing
-- [ ] Per-task audit PASS for every task
-- [ ] last-step-summary.md written for every task with a concrete Observable Verification entry
-- [ ] Behavioral audit PASS (see audit task above)
+- [x] All tasks above marked [x] — none left [ ] (Pending) or [!] (Needs-Attention)
+- [x] Zero active stubs for this module in .dev/.task-state/stub-registry.md (the multi-voice task registers `MIGRATIONS[5]` (v5→v6); the `MIGRATIONS[from]` forward-extension point remains documented for any future >v6 bump)
+- [x] All session-model module tests passing
+- [x] Per-task audit PASS for every task
+- [x] last-step-summary.md written for every task with a concrete Observable Verification entry
+- [x] Behavioral audit PASS (see audit task above)

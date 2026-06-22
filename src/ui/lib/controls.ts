@@ -14,11 +14,13 @@ export interface ControlSpec {
 
 /** The Phase-1 controls, keyed by the field each edits. Carrier/beat/volume/spatial edit
  *  nodes[0]; masterGain is preset.masterGain + the transport live trim. Spatial is the
- *  stereo pan position −1 (left) .. +1 (right) (D-021). */
-export const CONTROL: Readonly<Record<'carrier' | 'beat' | 'volume' | 'spatial' | 'masterGain', ControlSpec>> = {
+ *  stereo pan position −1 (left) .. +1 (right) (D-021). voiceGain is the per-voice mix
+ *  trim for extra voices (v6). */
+export const CONTROL: Readonly<Record<'carrier' | 'beat' | 'volume' | 'spatial' | 'masterGain' | 'voiceGain', ControlSpec>> = {
   carrier: { min: RANGES.carrier.min, max: RANGES.carrier.max, step: 1, unit: 'Hz' },
   beat: { min: RANGES.beat.min, max: RANGES.beat.max, step: 0.1, unit: 'Hz' },
   volume: { min: RANGES.volume.min, max: RANGES.volume.max, step: 0.01, unit: '%' },
   spatial: { min: RANGES.spatial.min, max: RANGES.spatial.max, step: 0.01, unit: 'pan' },
   masterGain: { min: RANGES.masterGain.min, max: RANGES.masterGain.max, step: 0.01, unit: '%' },
+  voiceGain: { min: RANGES.voiceGain.min, max: RANGES.voiceGain.max, step: 0.01, unit: '%' },
 };

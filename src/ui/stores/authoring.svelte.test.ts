@@ -7,9 +7,16 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { RenderProgress, RenderedFile } from '../../engine/renderer';
 import type { CompileResult } from '../../engine/voice-script';
 import type { Transport } from '../../engine/transport';
+import type { ClipSourceAdapter } from '../../engine/clip-library';
+import type { TtsInput } from '../../engine/clip-sources/tts-local';
+import { createDefaultPreset } from '../../engine/session-model';
 import { createNoticeStore } from './notices.svelte';
 import { createPlaybackStore, createSessionStore } from './session.svelte';
 import { createRenderStore, createVoiceScriptStore } from './authoring.svelte';
+
+const fakeTts = { source: 'tts', produce: vi.fn() } as unknown as ClipSourceAdapter<TtsInput>;
+const okCompile = (layers: unknown[]) =>
+  vi.fn(async () => ({ ok: true, compiled: { layers, clips: [], totalSec: 1 }, issues: [] }) as unknown as CompileResult);
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
 
@@ -18,6 +25,7 @@ function fakeTransport() {
     state: 'idle',
     load: vi.fn(),
     reapply: vi.fn(),
+    refreshLayers: vi.fn(async () => {}),
     duration: vi.fn(() => 300),
     on: vi.fn(),
     setMasterTrim: vi.fn(),
@@ -279,5 +287,74 @@ describe('VoiceScriptStore (§15/§20)', () => {
     store.importAndCompile({ version: 1 });
     await flush();
     expect(compileVoiceScript.mock.calls[0][1]).toMatchObject({ durationSec: 123 });
+  });
+});
+
+describe('VoiceScriptStore — ensureNarrationForPlayback (auto-synth-on-play, D-043)', () => {
+  const SCRIPT = { version: 1, purpose: 'meditation', blocks: [{ lines: [{ say: 'hi' }] }] };
+  const CUE = { id: 'vs_0_0_0', kind: 'voice', source: { clipId: 'clip_abc' }, t: 5 };
+
+  it('compiles the embedded script, injects fresh cues, and refreshes the live layers', async () => {
+    const { session, notices, transport } = makeSession();
+    session.reset({ ...createDefaultPreset(), voiceScript: SCRIPT });
+    const compileVoiceScript = okCompile([CUE]);
+    const store = createVoiceScriptStore({
+      session,
+      notices,
+      tts: fakeTts,
+      clipLib: { importVia: vi.fn() as never },
+      compileVoiceScript: compileVoiceScript as never,
+    });
+
+    await store.ensureNarrationForPlayback();
+
+    expect(compileVoiceScript).toHaveBeenCalledTimes(1);
+    expect(session.preset.layers).toEqual([CUE]); // timed cue injected into the preset
+    expect(transport.refreshLayers).toHaveBeenCalledTimes(1); // streamed into the running session
+  });
+
+  it('no-ops without studio TTS (mobile): beats only, never compiles', async () => {
+    const { session, notices } = makeSession();
+    session.reset({ ...createDefaultPreset(), voiceScript: SCRIPT });
+    const compileVoiceScript = vi.fn();
+    const store = createVoiceScriptStore({
+      session,
+      notices,
+      tts: null,
+      clipLib: { importVia: vi.fn() as never },
+      compileVoiceScript: compileVoiceScript as never,
+    });
+    await store.ensureNarrationForPlayback();
+    expect(compileVoiceScript).not.toHaveBeenCalled();
+  });
+
+  it('no-ops when the preset carries no voiceScript', async () => {
+    const { session, notices } = makeSession(); // default preset = no embedded script
+    const compileVoiceScript = vi.fn();
+    const store = createVoiceScriptStore({
+      session,
+      notices,
+      tts: fakeTts,
+      clipLib: { importVia: vi.fn() as never },
+      compileVoiceScript: compileVoiceScript as never,
+    });
+    await store.ensureNarrationForPlayback();
+    expect(compileVoiceScript).not.toHaveBeenCalled();
+  });
+
+  it('is idempotent for the same preset (a second play does not recompile)', async () => {
+    const { session, notices } = makeSession();
+    session.reset({ ...createDefaultPreset(), voiceScript: SCRIPT });
+    const compileVoiceScript = okCompile([CUE]);
+    const store = createVoiceScriptStore({
+      session,
+      notices,
+      tts: fakeTts,
+      clipLib: { importVia: vi.fn() as never },
+      compileVoiceScript: compileVoiceScript as never,
+    });
+    await store.ensureNarrationForPlayback();
+    await store.ensureNarrationForPlayback();
+    expect(compileVoiceScript).toHaveBeenCalledTimes(1); // guarded by preset identity
   });
 });

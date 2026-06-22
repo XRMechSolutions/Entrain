@@ -9,7 +9,7 @@ import UpdateToast from './UpdateToast.svelte';
 afterEach(cleanup);
 
 function summary(over: Partial<PresetSummary> = {}): PresetSummary {
-  return { id: 'p1', name: 'Evening Calm', durationSec: 754, nodeCount: 3, createdAt: 0, updatedAt: Date.now(), ...over };
+  return { id: 'p1', name: 'Evening Calm', durationSec: 754, nodeCount: 3, voiceCount: 1, createdAt: 0, updatedAt: Date.now(), ...over };
 }
 
 describe('PresetListItem (design §7, interfaces §9)', () => {

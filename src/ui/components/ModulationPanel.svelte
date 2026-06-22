@@ -19,8 +19,10 @@
     /** Which node's modulator this panel edits. The console uses 0; the inspector passes
      *  the selected node's (reorder-resolved) index. */
     index?: number;
+    /** Which voice's nodes to read/mutate. Omit for the primary voice (voice 0). */
+    voiceId?: string;
   }
-  let { param, index = 0 }: Props = $props();
+  let { param, index = 0, voiceId }: Props = $props();
 
   const { session } = getAppContext();
 
@@ -89,18 +91,22 @@
     return edgeMs > (periodSec * 1000) / 2;
   }
 
+  // Derive the active voice's preset view — a NEW object on every revision, so all downstream
+  // deriveds re-run even when the underlying nodes array reference hasn't changed.
+  const vView = $derived(read(() => session.voiceView(voiceId)));
+
   // --- one-way derived display state ---
   const isOn = $derived(
-    read(() => {
-      const m = session.preset.nodes[index]?.[param]?.mod;
+    (() => {
+      const m = vView.nodes[index]?.[param]?.mod;
       return m !== undefined && m !== null;
-    }),
+    })(),
   );
   const mod = $derived<ModPoint>(
-    read(() => {
-      const m = session.preset.nodes[index]?.[param]?.mod;
+    (() => {
+      const m = vView.nodes[index]?.[param]?.mod;
       return m && typeof m === 'object' ? m : {};
-    }),
+    })(),
   );
   const shape = $derived<ModShape>(mod.shape ?? (param === 'volume' ? 'pulse' : 'sine'));
   const transition = $derived<ModTransition>(mod.transition ?? 'glide');
@@ -113,15 +119,15 @@
   const pulseWidth = $derived(mod.pulseWidth ?? 0.5);
   const edgeMs = $derived(mod.edgeMs ?? 0);
   const steps = $derived<number[]>(mod.steps ?? []);
-  const baseValue = $derived(read(() => session.preset.nodes[index]?.[param]?.value ?? range.min));
+  const baseValue = $derived(vView.nodes[index]?.[param]?.value ?? range.min);
 
   // --- commits (all flow through the session store's three-state setNodeMod) ---
   function toggle(on: boolean): void {
-    session.setNodeMod(index, param, on ? defaultMod() : null);
+    session.setNodeMod(index, param, on ? defaultMod() : null, voiceId);
   }
   /** Merge a partial change onto the current ModPoint and re-commit. */
   function patch(p: Partial<ModPatch>): void {
-    session.setNodeMod(index, param, { ...mod, ...p });
+    session.setNodeMod(index, param, { ...mod, ...p }, voiceId);
   }
   function commitRate(hz: number): void {
     patch({ periodSec: 1 / clampRate(hz) });
@@ -130,7 +136,7 @@
     const merged: ModPatch = { ...mod };
     if (next.length === 0) delete merged.steps; // never author an empty steps[] (would be invalid)
     else merged.steps = next;
-    session.setNodeMod(index, param, merged);
+    session.setNodeMod(index, param, merged, voiceId);
   }
   function addStep(): void {
     setSteps([...steps, clampStep(baseValue)]);

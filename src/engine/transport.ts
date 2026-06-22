@@ -11,7 +11,7 @@
 //
 // See .dev/planning/modules/transport/{design,interfaces,edge-cases}.md.
 
-import type { Layer, Preset } from './session-model';
+import { voiceView, type Layer, type Preset, type Voice as PresetVoice } from './session-model';
 import { createVoice as defaultCreateVoice, registerPulseWorklet, type Voice } from './audio-engine';
 import { createMixer as defaultCreateMixer, type Mixer } from './mixer';
 import { createLayerNode, type LayerNode } from './layer-engine';
@@ -140,6 +140,11 @@ export function createTransport(options: TransportOptions): Transport {
   let ctx: AudioContext | undefined;
   let voice: Voice | undefined;
   let mixer: Mixer | undefined; // the per-session summation bus (D-036); nulled on teardown
+  // MULTI-VOICE (v6, D-040/D-041): one record per preset.voices[] entry, keyed by source.id.
+  // Each extra voice is a full createVoice graph in 'bus' mode → its own single-writer trim
+  // GainNode → the SAME mixer.bedInput. Built in startFresh; the single bus master fade covers
+  // every voice via bedInput. Empty when voices is absent (single-voice byte-identical).
+  let extraVoices: { voice: Voice; trimGain: GainNode; source: PresetVoice }[] = [];
   let masterCtrl: MasterGainController | undefined;
   let pulseReady = false;
 
@@ -830,6 +835,7 @@ export function createTransport(options: TransportOptions): Transport {
     const mc = masterCtrl;
     const ls = layerSchedule;
     const nodes = layerNodes;
+    const evs = extraVoices; // capture the per-session voice set (a new startFresh must not retarget this deferred finish)
     const fadeSec = fade ? fadeOutSec : 0;
     // The bus master fade-out now fades the whole SUM (voice + every layer + the
     // post-duck lift) to silence in ONE ramp before disposal — one master, one fade
@@ -845,11 +851,35 @@ export function createTransport(options: TransportOptions): Transport {
         /* already stopped */
       }
     }
+    // Phase-2 multi-voice: each extra voice fades to silence through the SAME bus master
+    // ramp (trimGain → bedInput), so no per-voice fade is needed — cancel queued base ramps
+    // and schedule the source stop at the fade end, once per voice (arch §3 teardown row).
+    for (const rec of evs) {
+      scheduler.cancel(rec.voice);
+      try {
+        rec.voice.stop(now + fadeSec);
+      } catch {
+        /* already stopped */
+      }
+    }
     // Defer node disposal until after the fade so the tail is not cut early.
     const finish = (): void => {
       if (v) {
         try {
           v.dispose();
+        } catch {
+          /* idempotent */
+        }
+      }
+      // Dispose every extra voice + drop its trim edge into the bus, post-fade (at silence).
+      for (const rec of evs) {
+        try {
+          rec.voice.dispose();
+        } catch {
+          /* idempotent */
+        }
+        try {
+          rec.trimGain.disconnect();
         } catch {
           /* idempotent */
         }
@@ -892,6 +922,7 @@ export function createTransport(options: TransportOptions): Transport {
     masterCtrl = undefined;
     layerSchedule = null;
     layerNodes = [];
+    extraVoices = []; // drop the per-session voice set (a second teardown finds it empty)
     transitionTo('stopped');
   }
   function endSession(): void {
@@ -966,8 +997,13 @@ export function createTransport(options: TransportOptions): Transport {
     // mixer.masterParam (starts at 0, click-free 0→trim fade) → (6) routeOutput(mixer).
     const v = createVoiceFn(c, { master: 'bus' });
     voice = v;
-    const m = createMixerFn(c);
+    // MULTI-VOICE (v6): equal-power headroom on bedInput for N = primary + extra voices, so
+    // summing N near-full-scale voices does not overdrive busSum → master (§2/D-041). N=1
+    // ⇒ bedHeadroom 1 ⇒ single-voice byte-identical.
+    const N = 1 + (p.voices?.length ?? 0);
+    const m = createMixerFn(c, { bedHeadroom: 1 / Math.sqrt(N) });
     mixer = m;
+    extraVoices = []; // fresh per-session set (teardown disposal lands in a later task)
     try {
       v.output.disconnect(c.destination); // drop the voice's default destination edge
     } catch {
@@ -983,8 +1019,43 @@ export function createTransport(options: TransportOptions): Transport {
 
     try {
       scheduler.apply(v, p, startOffset, t0, { pulseAvailable: pulseReady });
+      // MULTI-VOICE (v6, §3): each extra voice is an independent createVoice graph in 'bus'
+      // mode → single-writer trim GainNode → the SAME mixer.bedInput, scheduled by its OWN
+      // scheduler.apply over a shared voiceView. ALL-OR-NOTHING: nested in this same try so a
+      // per-voice apply throw runs the EXISTING SCHEDULE_FAILED path below (I1 — no
+      // half-started session); the catch disposes every extra voice created so far.
+      for (const source of p.voices ?? []) {
+        const ev = createVoiceFn(c, { master: 'bus' });
+        try {
+          ev.output.disconnect(c.destination); // drop the default destination edge
+        } catch {
+          /* the edge may already be absent (mirrors the primary/mediastream rewire) */
+        }
+        const trimGain = c.createGain(); // single-writer (transport): the per-voice mix trim
+        trimGain.gain.value = clamp01(source.gain ?? 1);
+        ev.output.connect(trimGain);
+        trimGain.connect(m.bedInput);
+        extraVoices.push({ voice: ev, trimGain, source });
+        scheduler.apply(ev, voiceView(p, source.nodes), startOffset, t0, { pulseAvailable: pulseReady });
+        ev.start(t0); // the source start, IN the gesture (autoplay requirement, B5)
+      }
     } catch {
-      // I1: a scheduler failure aborts the start — no half-played session.
+      // I1: a scheduler failure aborts the start — no half-played session. All-or-nothing:
+      // dispose every extra voice built so far (teardown(false) covers only the primary until
+      // the teardown multi-voice task lands), then route through the primary SCHEDULE_FAILED path.
+      for (const rec of extraVoices) {
+        try {
+          rec.voice.dispose();
+        } catch {
+          /* best-effort */
+        }
+        try {
+          rec.trimGain.disconnect();
+        } catch {
+          /* best-effort */
+        }
+      }
+      extraVoices = [];
       teardown(false);
       emitNotice('error', 'SCHEDULE_FAILED', 'the session scheduler failed; playback aborted');
       return;
@@ -1029,6 +1100,14 @@ export function createTransport(options: TransportOptions): Transport {
       anchorSessionPos = startOffset;
       anchorCtxTime = c.currentTime + startLeadSec;
       scheduler.apply(v, p, startOffset, anchorCtxTime, { pulseAvailable: pulseReady });
+      // MULTI-VOICE (v6, §3): reschedule each extra voice from the same new offset against
+      // the same anchor (oscillators keep running). Mirrors the seekWhilePlaying batch.
+      for (const rec of extraVoices) {
+        scheduler.cancel(rec.voice);
+        scheduler.apply(rec.voice, voiceView(p, rec.source.nodes), startOffset, anchorCtxTime, {
+          pulseAvailable: pulseReady,
+        });
+      }
       needsReschedule = false;
     }
     mc.rampMaster(trim, pauseFadeSec); // fade back up
@@ -1112,6 +1191,16 @@ export function createTransport(options: TransportOptions): Transport {
     anchorCtxTime = c.currentTime + startLeadSec;
     startOffset = t;
     scheduler.apply(v, p, t, anchorCtxTime, { pulseAvailable: pulseReady }); // fresh schedule from t
+    // MULTI-VOICE (v6, §3): reschedule each extra voice from the same offset against the
+    // same anchor. The oscillators keep running (scheduler.cancel only drops base events +
+    // disposes modulators); the A10 seekToken guard above gates the whole batch — a stale
+    // seek returns before any cancel, so no voice is half-rescheduled.
+    for (const rec of extraVoices) {
+      scheduler.cancel(rec.voice);
+      scheduler.apply(rec.voice, voiceView(p, rec.source.nodes), t, anchorCtxTime, {
+        pulseAvailable: pulseReady,
+      });
+    }
     // Phase-2: layer one-shot sources cannot restart (audio-engine B1 analogue), so a
     // seek DISPOSES + REBUILDS the layer nodes from the new offset (K6 / §19.5). The
     // mixer stays (only master moved by the fade), and the rebuild rides the same
@@ -1134,6 +1223,16 @@ export function createTransport(options: TransportOptions): Transport {
     if (state === 'playing' && masterCtrl) {
       masterCtrl.rampMaster(trim, trimRampSec);
     }
+  }
+  // MULTI-VOICE (v6, §3, D-042): live per-voice mix trim — the UI gain-slider path. A cheap
+  // single-writer (transport) ramp on the keyed extra-voice trimGain, analogous to
+  // setMasterTrim (no whole-session reapply). Unknown voiceId / non-finite value is a no-op.
+  function setVoiceTrim(voiceId: string, value: number): void {
+    assertNotDisposed();
+    if (typeof value !== 'number' || !Number.isFinite(value)) return; // A9: ignore non-finite
+    const rec = extraVoices.find((r) => r.source.id === voiceId);
+    if (!rec) return; // unknown / not-playing → safe no-op (no pending store; source.gain owns it next startFresh)
+    rampLiftParam(rec.trimGain.gain, rec.trimGain.gain.value, clamp01(value), trimRampSec);
   }
   function setLift(opts: LiftOptions | null): void {
     assertNotDisposed();
@@ -1159,6 +1258,14 @@ export function createTransport(options: TransportOptions): Transport {
     // Live edit at the SAME position: re-ramp base lanes + keep modulator phase (I3b).
     const atCtx = c.currentTime + startLeadSec;
     scheduler.retarget(v, preset, atCtx);
+    // MULTI-VOICE (v6, §3): retarget each extra voice at the SAME position (phase kept —
+    // retarget, not apply) over its own voiceView, and re-ramp its single-writer trim to the
+    // edited Voice.gain. The voice set is the one captured at startFresh (count changes are a
+    // STRUCTURAL load(), not a reapply — §3).
+    for (const rec of extraVoices) {
+      scheduler.retarget(rec.voice, voiceView(preset, rec.source.nodes), atCtx);
+      rampLiftParam(rec.trimGain.gain, rec.trimGain.gain.value, clamp01(rec.source.gain ?? 1), trimRampSec);
+    }
     // Phase-2: a same-position live edit RETARGETS the layer schedule (keeps the running
     // layer nodes — the layer analogue of §10's modulator-phase rule; NOT a rebuild,
     // which is seek-only — K6/§19.5). No-op when no layers/scheduler are active.
@@ -1215,6 +1322,29 @@ export function createTransport(options: TransportOptions): Transport {
     disposed = true;
   }
 
+  /**
+   * Rebuild + reschedule the layer subsystem at the CURRENT playback position without touching
+   * the binaural voices (auto-synth-on-play, D-043). After background TTS synthesis populates the
+   * clip library, this is how a freshly-synthesized voice clip becomes audible: a missing-clip
+   * LayerNode is silent for its whole life (one-shot sources can't gain a buffer later), so the
+   * only way to "stream it in" is to dispose the old silent nodes and rebuild from the live
+   * `preset.layers` (decoding the now-present buffers), scheduled from here forward. Cues whose
+   * time already passed are not restarted (scheduleLayers gates each one-shot by inRange). Reads
+   * `preset.layers` by reference, so cues injected since play() are picked up. No-op unless
+   * actively playing with a mixer + layer scheduler; safe to call repeatedly as clips arrive.
+   */
+  async function refreshLayers(): Promise<void> {
+    if (disposed || state !== 'playing' || !ctx || !mixer || !preset || !layerScheduler) return;
+    const c = ctx;
+    const m = mixer;
+    const p = preset;
+    const pos = computePosition();
+    disposeLayers();
+    // t0 = now maps to session position `pos` under the running anchor, so the rebuilt cues line
+    // up with the ongoing binaural timeline; scheduleLayers starts only the in-range/future ones.
+    await scheduleLayersFor(c, m, p, c.currentTime, pos);
+  }
+
   function position(): number {
     assertNotDisposed();
     return computePosition();
@@ -1251,10 +1381,12 @@ export function createTransport(options: TransportOptions): Transport {
     pause,
     seek,
     reapply,
+    refreshLayers,
     stop,
     position,
     duration,
     setMasterTrim,
+    setVoiceTrim,
     setLift,
     setKeepScreenOn,
     isKeepScreenOn,

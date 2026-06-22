@@ -29,10 +29,30 @@
   interface Props {
     selected: NodeHit | null;
     onselect: (hit: NodeHit | null) => void;
+    activeVoiceId?: string;
   }
-  let { selected, onselect }: Props = $props();
+  let { selected, onselect, activeVoiceId }: Props = $props();
 
-  const { transport, session, playback } = getAppContext();
+  const { transport, session, playback, clips } = getAppContext();
+
+  /** Build the narration cue markers (D-043): one per voice-kind layer, at its scheduled `t`,
+   *  labelled with the spoken text from the clip library (falling back to a musical ordinal
+   *  before the clip is synthesized). Session-global — drawn regardless of the active voice. */
+  function buildCues(): Array<{ t: number; label: string }> {
+    const layers = session.preset.layers ?? [];
+    const out: Array<{ t: number; label: string }> = [];
+    let n = 0;
+    for (const l of layers) {
+      if (l.kind !== 'voice') continue;
+      n++;
+      const clipId = (l.source as { clipId?: string }).clipId;
+      const clip = clipId ? clips.clips.find((c) => c.id === clipId) : undefined;
+      const text = clip?.meta.text ?? clip?.meta.name;
+      const label = text ? (text.length > 28 ? `${text.slice(0, 27)}…` : text) : `♪ ${n}`;
+      out.push({ t: l.t, label });
+    }
+    return out;
+  }
 
   let canvasEl: HTMLCanvasElement;
   let ctx2d: CanvasRenderingContext2D | null = null;
@@ -47,24 +67,27 @@
     draw: (positionSec) => {
       if (!ctx2d) return;
       renderTimeline(ctx2d, {
-        preset: session.preset,
+        preset: session.voiceView(activeVoiceId),
         view,
         layout,
         positionSec,
         playing: playback.state === 'playing',
         selected,
+        cues: buildCues(),
       });
     },
     isPlaying: () => playback.state === 'playing',
     position: () => transport.position(),
   });
 
-  // Mark the loop dirty on any edit, view change, or selection change — flips a flag, never
-  // re-renders the <canvas> element (purity).
+  // Mark the loop dirty on any edit, view change, selection change, or voice switch — flips a
+  // flag, never re-renders the <canvas> element (purity).
   $effect(() => {
     void session.revision;
     void view;
     void selected;
+    void activeVoiceId;
+    void clips.clips; // redraw when narration clips load so cue labels fill in (D-043)
     loop.markDirty();
   });
 
@@ -91,7 +114,7 @@
     const p = localPoint(e);
     downAt = p;
     moved = false;
-    dragging = hitTestNode(session.preset, layout, view, p.x, p.y);
+    dragging = hitTestNode(session.voiceView(activeVoiceId), layout, view, p.x, p.y);
     canvasEl.setPointerCapture?.(e.pointerId);
   }
 
@@ -103,9 +126,9 @@
     if (dragging) {
       const lane = layout.lanes.find((l) => l.param === dragging!.param)!;
       const newV = clampParamValue(dragging.param, vOf(lane, dragging.param, p.y));
-      session.setNodeValue(dragging.index, dragging.param, newV);
-      const newT = clampMoveTime(session.preset, dragging.index, tOf(layout, view, p.x));
-      session.moveNode(dragging.index, newT);
+      session.setNodeValue(dragging.index, dragging.param, newV, activeVoiceId);
+      const newT = clampMoveTime(session.voiceView(activeVoiceId), dragging.index, tOf(layout, view, p.x));
+      session.moveNode(dragging.index, newT, activeVoiceId);
     } else {
       // empty-area horizontal drag → pan the time axis
       const dxSec = ((downAt.x - p.x) / layout.laneWidth) * (view.endSec - view.startSec);
@@ -118,14 +141,14 @@
     const p = localPoint(e);
     if (!moved) {
       // a tap: select a node, or add a carry-forward node on an empty lane
-      const hit = hitTestNode(session.preset, layout, view, p.x, p.y);
+      const hit = hitTestNode(session.voiceView(activeVoiceId), layout, view, p.x, p.y);
       if (hit) {
         onselect(hit);
       } else {
         const param = laneParamAt(layout, p.y);
         if (param) {
           const t = tOf(layout, view, p.x);
-          session.addNode(t, param);
+          session.addNode(t, param, activeVoiceId);
         }
       }
     }

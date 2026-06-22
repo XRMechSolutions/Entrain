@@ -10,6 +10,9 @@
   import { EDITOR_MIN_VIEW_SEC } from '../lib/constants';
   import { computeLayout, createRenderLoop, renderTimeline, type CanvasLayout, type View } from '../editor/canvas-renderer';
 
+  interface Props { voiceId?: string | undefined }
+  const { voiceId = undefined }: Props = $props();
+
   const { transport, session, playback } = getAppContext();
 
   let canvasEl: HTMLCanvasElement;
@@ -22,7 +25,7 @@
     draw: (positionSec) => {
       if (!ctx2d) return;
       renderTimeline(ctx2d, {
-        preset: session.preset,
+        preset: session.voiceView(voiceId),
         view,
         layout,
         positionSec,

@@ -24,8 +24,10 @@
   interface Props {
     /** The selected node, tracked by identity by the parent (reorder-safe). */
     node: TimeNode;
+    /** Which voice's nodes to read/mutate. Omit for the primary voice (voice 0). */
+    voiceId?: string;
   }
-  let { node }: Props = $props();
+  let { node, voiceId }: Props = $props();
 
   const { session } = getAppContext();
 
@@ -34,15 +36,19 @@
     return get();
   }
 
+  // Derive the active voice's preset view — a NEW object on every revision, so all downstream
+  // deriveds re-run even when the underlying nodes array reference hasn't changed.
+  const vView = $derived(read(() => session.voiceView(voiceId)));
+
   // Re-resolve the live index from identity on every revision — the array re-sorts on a time
   // change, so a cached index would point at a DIFFERENT node afterwards.
-  const index = $derived(read(() => session.preset.nodes.indexOf(node)));
+  const index = $derived(vView.nodes.indexOf(node));
   const isStart = $derived(index === 0);
-  const tSec = $derived(read(() => session.preset.nodes[index]?.t ?? 0));
+  const tSec = $derived(vView.nodes[index]?.t ?? 0);
 
   // Params this node already sets, and the ones it could still add (add-param affordance).
-  const present = $derived(read(() => PARAM_ORDER.filter((p) => session.preset.nodes[index]?.[p])));
-  const addable = $derived(read(() => PARAM_ORDER.filter((p) => !session.preset.nodes[index]?.[p])));
+  const present = $derived(PARAM_ORDER.filter((p) => vView.nodes[index]?.[p]));
+  const addable = $derived(PARAM_ORDER.filter((p) => !vView.nodes[index]?.[p]));
 
   // --- editable node time (non-start nodes → moveNode; start node pinned at 0:00) ---
   let timeText = $state(untrack(() => formatClock(tSec)));
@@ -64,18 +70,18 @@
       el.value = timeText;
       return;
     }
-    session.moveNode(index, sec); // clamps to [0, durationSec]; revision resyncs the field
+    session.moveNode(index, sec, voiceId); // clamps to [0, durationSec]; revision resyncs the field
   }
 
   /** Add a param keyframe the node lacks, carrying the param's current value at this time so
    *  the sound does not change until it is edited (mirrors addNode's carry-forward). */
   function addParam(param: AutomatableParam): void {
-    const carry = baseValueAt(session.preset, param, tSec);
-    session.setNodeValue(index, param, carry);
+    const carry = baseValueAt(vView, param, tSec);
+    session.setNodeValue(index, param, carry, voiceId);
   }
 
   function remove(): void {
-    session.removeNode(index);
+    session.removeNode(index, voiceId);
   }
 </script>
 
@@ -109,7 +115,7 @@
     {#each present as param (param)}
       <fieldset class="param">
         <legend>{param}</legend>
-        <ParamSection {index} {param} showInterpolation={true} />
+        <ParamSection {index} {param} {voiceId} showInterpolation={true} />
       </fieldset>
     {/each}
 

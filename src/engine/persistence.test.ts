@@ -28,7 +28,7 @@ import type { Preset, ValidationIssue } from './session-model';
 
 function mkPreset(over: Partial<Preset> = {}): Preset {
   return {
-    schemaVersion: 5,
+    schemaVersion: 6,
     name: 'My Session',
     durationSec: 300,
     masterGain: 0.8,
@@ -46,7 +46,7 @@ function mkPreset(over: Partial<Preset> = {}): Preset {
  */
 function layeredFixture(over: Partial<Preset> = {}): Preset {
   return {
-    schemaVersion: 5,
+    schemaVersion: 6,
     name: 'Guided Drift',
     durationSec: 1800,
     masterGain: 0.8,
@@ -363,7 +363,7 @@ describe('loadPreset / deletePreset', () => {
           id: 'x',
           createdAt: 1,
           updatedAt: 1,
-          preset: { schemaVersion: 5, name: '', durationSec: 300, masterGain: 0.8, nodes: [{ t: 0, carrier: { value: 200 } }] },
+          preset: { schemaVersion: 6, name: '', durationSec: 300, masterGain: 0.8, nodes: [{ t: 0, carrier: { value: 200 } }] },
         },
       ],
     });
@@ -382,7 +382,7 @@ describe('loadPreset / deletePreset', () => {
           id: 'f',
           createdAt: 1,
           updatedAt: 1,
-          preset: { schemaVersion: 6, name: 'Future', durationSec: 300, masterGain: 0.8, nodes: [{ t: 0, carrier: { value: 200 } }] },
+          preset: { schemaVersion: 7, name: 'Future', durationSec: 300, masterGain: 0.8, nodes: [{ t: 0, carrier: { value: 200 } }] },
         },
       ],
     });
@@ -490,12 +490,12 @@ describe('savePreset', () => {
 describe('default presets', () => {
   it('every built-in passes session-model.validate with the documented invariants', () => {
     const defs = buildDefaultLibraryPresets();
-    expect(defs).toHaveLength(15);
+    expect(defs).toHaveLength(16);
 
     for (const p of defs) {
       const res = sessionModel.validate(p);
       expect(res.ok).toBe(true);
-      expect(p.schemaVersion).toBe(5);
+      expect(p.schemaVersion).toBe(6);
       expect(p.masterGain).toBeGreaterThan(0);
       expect(p.masterGain).toBeLessThanOrEqual(1);
       expect(p.nodes[0].t).toBe(0); // carrier at the start node, t === 0
@@ -521,7 +521,7 @@ describe('default presets', () => {
 
   it('I3: seed on a fresh library adds the built-ins and returns their summaries; second call is []', () => {
     const added = seedDefaultPresets();
-    expect(added).toHaveLength(15);
+    expect(added).toHaveLength(16);
     // The original four band/use starters seed first, in order.
     expect(added.slice(0, 4).map((s) => s.name)).toEqual([
       'Relax — Alpha 10 Hz',
@@ -534,10 +534,10 @@ describe('default presets', () => {
     expect(names.some((n) => n.startsWith('Power Nap — 20'))).toBe(true);
     expect(names.some((n) => n.startsWith('Power Nap — 60'))).toBe(true);
     for (const s of added) expect(s.id).toMatch(UUID_RE);
-    expect(listPresets()).toHaveLength(15);
+    expect(listPresets()).toHaveLength(16);
 
     expect(seedDefaultPresets()).toEqual([]);
-    expect(listPresets()).toHaveLength(15);
+    expect(listPresets()).toHaveLength(16);
   });
 
   it('I4: deleting all defaults then re-seeding stays empty (seeded gate)', () => {
@@ -551,8 +551,8 @@ describe('default presets', () => {
   it('clearLibrary then seedDefaultPresets re-seeds (factory reset)', () => {
     seedDefaultPresets();
     clearLibrary();
-    expect(seedDefaultPresets()).toHaveLength(15);
-    expect(listPresets()).toHaveLength(15);
+    expect(seedDefaultPresets()).toHaveLength(16);
+    expect(listPresets()).toHaveLength(16);
   });
 });
 
@@ -563,14 +563,14 @@ describe('default presets', () => {
 describe('restoreDefaultPresets (non-destructive top-up)', () => {
   const DEFAULT_NAMES = buildDefaultLibraryPresets().map((p) => p.name);
 
-  it('R1: a FRESH library gains all 15 built-ins and they are returned, in order', () => {
+  it('R1: a FRESH library gains all 16 built-ins and they are returned, in order', () => {
     const added = restoreDefaultPresets();
-    expect(added).toHaveLength(15);
+    expect(added).toHaveLength(16);
     expect(added.map((s) => s.name)).toEqual(DEFAULT_NAMES); // same order as buildDefaultLibraryPresets
     for (const s of added) expect(s.id).toMatch(UUID_RE);
 
     const list = listPresets();
-    expect(list).toHaveLength(15);
+    expect(list).toHaveLength(16);
     // Every returned id is actually present in the library.
     const presentIds = new Set(list.map((s) => s.id));
     for (const s of added) expect(presentIds.has(s.id)).toBe(true);
@@ -595,8 +595,8 @@ describe('restoreDefaultPresets (non-destructive top-up)', () => {
 
     const added = restoreDefaultPresets();
 
-    // Only the defaults NOT already present were added (15 total - 3 pre-seeded).
-    expect(added).toHaveLength(12);
+    // Only the defaults NOT already present were added (16 total - 3 pre-seeded).
+    expect(added).toHaveLength(13);
     const addedNames = added.map((s) => s.name);
     expect(addedNames).not.toContain(defs[0].name);
     expect(addedNames).not.toContain(defs[1].name);
@@ -611,8 +611,8 @@ describe('restoreDefaultPresets (non-destructive top-up)', () => {
       expect(JSON.stringify(stillThere)).toBe(json); // byte-identical
     }
 
-    // Total = 4 pre-existing + 12 appended = 16, with the user preset still present once.
-    expect(after.records).toHaveLength(16);
+    // Total = 4 pre-existing + 13 appended = 17, with the user preset still present once.
+    expect(after.records).toHaveLength(17);
     expect(after.records.filter((r) => r.id === 'user-1')).toHaveLength(1);
     // No default name appears twice (no duplicates created).
     const allNames = listPresets().map((s) => s.name);
@@ -630,7 +630,7 @@ describe('restoreDefaultPresets (non-destructive top-up)', () => {
     expect(restoreDefaultPresets()).toEqual([]);
     expect(setSpy).not.toHaveBeenCalled();
     expect(localStorage.getItem(STORAGE_KEY)).toBe(snapshot); // unchanged bytes
-    expect(listPresets()).toHaveLength(15);
+    expect(listPresets()).toHaveLength(16);
   });
 
   it('R4: after deleting two defaults, restore re-adds EXACTLY those two', () => {
@@ -639,12 +639,12 @@ describe('restoreDefaultPresets (non-destructive top-up)', () => {
     // Delete two specific defaults by id.
     const victims = [list[0], list[1]];
     for (const v of victims) deletePreset(v.id);
-    expect(listPresets()).toHaveLength(13);
+    expect(listPresets()).toHaveLength(14);
 
     const added = restoreDefaultPresets();
     expect(added).toHaveLength(2);
     expect(new Set(added.map((s) => s.name))).toEqual(new Set(victims.map((v) => v.name)));
-    expect(listPresets()).toHaveLength(15);
+    expect(listPresets()).toHaveLength(16);
 
     // And it's idempotent again.
     expect(restoreDefaultPresets()).toEqual([]);
@@ -1014,8 +1014,8 @@ describe('v4 clip-bearing presets — reference-only round-trip', () => {
     expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
   });
 
-  it('edge (D12, §C3): a v3 (pre-layers) preset JSON migrates to v5 through the delegated path; loadPreset self-heals', () => {
-    // A v3 body has no `layers`; session-model.parse up-migrates it to v5 and reports
+  it('edge (D12, §C3): a v3 (pre-layers) preset JSON migrates to v6 through the delegated path; loadPreset self-heals', () => {
+    // A v3 body has no `layers`; session-model.parse up-migrates it to v6 and reports
     // migratedFrom. This is the SAME delegated migrate path layered presets use — no new branch.
     const v3 = {
       schemaVersion: 3,
@@ -1029,23 +1029,23 @@ describe('v4 clip-bearing presets — reference-only round-trip', () => {
     expect(res.ok).toBe(true);
     if (res.ok) {
       expect(res.migratedFrom).toBe(3);
-      expect(res.preset.schemaVersion).toBe(5);
+      expect(res.preset.schemaVersion).toBe(6);
     }
 
-    // Store the v3 body raw, then loadPreset self-heals it: migrates to v5 AND writes back.
+    // Store the v3 body raw, then loadPreset self-heals it: migrates to v6 AND writes back.
     setEnvelope({
       storeVersion: 1,
       seeded: true,
       records: [{ id: 'legacy', createdAt: 11, updatedAt: 22, preset: v3 }],
     });
     const loaded = loadPreset('legacy');
-    expect(loaded?.preset.schemaVersion).toBe(5);
+    expect(loaded?.preset.schemaVersion).toBe(6);
     expect(loaded?.createdAt).toBe(11); // migration preserves timestamps (system action)
     expect(loaded?.updatedAt).toBe(22);
 
-    // The upgraded v5 body was written back in place (read again — now no migration needed).
+    // The upgraded v6 body was written back in place (read again — now no migration needed).
     const after = rawEnvelope() as { records: Array<{ preset: { schemaVersion: number } }> };
-    expect(after.records[0].preset.schemaVersion).toBe(5);
+    expect(after.records[0].preset.schemaVersion).toBe(6);
   });
 
   it('edge: MAX_IMPORT_BYTES still guards the v4 JSON (a layered preset is a few KB)', async () => {
@@ -1075,5 +1075,161 @@ describe('v4 clip-bearing presets — reference-only round-trip', () => {
     expect(loadPreset(saved.id)?.preset).toEqual(normalizedLayeredPreset());
     const reparsed = parsePresetJson(presetToJson(layeredFixture()));
     expect(reparsed.ok && reparsed.preset).toEqual(normalizedLayeredPreset());
+  });
+});
+
+// ===========================================================================
+// Phase-2 multi-voice (v6 `voices[]`) — round-trip + self-heal
+//
+// A v6 Preset may carry `voices: Voice[]` — additional INDEPENDENT generators
+// (each its own carrier/beat `nodes`) summed at the master bus; absent = single
+// voice (D-040). persistence ships NO serializer change: the round-trip is
+// delivered by the UNCHANGED `normalizePreset`/`parse` path the moment
+// session-model copies `voices` in `normalizeVoice`/`PRESET_KEYS`
+// (multi-voice-architecture §1.4 — the make-or-break channel). These tests are
+// that executable proof: if the `voices` copy were missed the feature would go
+// inert with every OTHER test still green, and ONLY the round-trip/self-heal
+// assertions below would fail.
+// ===========================================================================
+
+/**
+ * A fully-valid v6 multi-voice preset: the primary binaural voice (top-level
+ * `nodes`) plus two extra voices — an isochronic voice carrying a per-voice
+ * `name`/`gain`, and a binaural voice with a second automation node. Carriers
+ * (200 / 320 / 480 Hz) are ≥ ratio 1.25 apart, so no `VOICES_CARRIER_TOO_CLOSE`
+ * advisory fires and the bundle stays a clean 3-of-4 voices.
+ */
+function multiVoiceFixture(over: Partial<Preset> = {}): Preset {
+  return {
+    schemaVersion: 6,
+    name: 'Dual Carrier',
+    durationSec: 300,
+    masterGain: 0.8,
+    nodes: [{ t: 0, carrier: { value: 200 }, beat: { value: 8 }, volume: { value: 1 } }],
+    voices: [
+      {
+        id: 'iso',
+        name: 'Iso Pulse',
+        gain: 0.7,
+        nodes: [{ t: 0, carrier: { value: 320 }, beat: { value: 0 }, volume: { value: 1 } }],
+      },
+      {
+        id: 'beta',
+        gain: 0.5,
+        nodes: [
+          { t: 0, carrier: { value: 480 }, beat: { value: 6 }, volume: { value: 1 } },
+          { t: 120, beat: { value: 4 } },
+        ],
+      },
+    ],
+    ...over,
+  };
+}
+
+/** The canonical normalized form of `multiVoiceFixture()` (session-model key order). */
+function normalizedMultiVoice(): Preset {
+  const res = sessionModel.validate(multiVoiceFixture());
+  if (!res.ok) throw new Error('multiVoiceFixture must be valid');
+  return res.preset;
+}
+
+describe('v6 multi-voice — round-trip + self-heal', () => {
+  it('savePreset → loadPreset preserves voices verbatim (deep-equal normalized body)', () => {
+    const expected = normalizedMultiVoice();
+
+    const saved = savePreset(multiVoiceFixture());
+    const loaded = loadPreset(saved.id);
+
+    // The whole normalized v6 body survives localStorage — voices array and all.
+    expect(loaded?.preset).toEqual(expected);
+
+    // Both extra voices carry their full identity/gain/nodes through the round-trip.
+    expect(loaded?.preset.voices).toHaveLength(2);
+    expect(loaded?.preset.voices?.[0]).toMatchObject({ id: 'iso', name: 'Iso Pulse', gain: 0.7 });
+    expect(loaded?.preset.voices?.[1]).toMatchObject({ id: 'beta', gain: 0.5 });
+    expect(loaded?.preset.voices?.[1].nodes).toHaveLength(2);
+    // The primary "voice 0" (top-level nodes) is unchanged alongside the extras.
+    expect(loaded?.preset.nodes[0].carrier).toEqual({ value: 200 });
+  });
+
+  it('presetToJson → parsePresetJson yields ok:true with identical voices', () => {
+    const json = presetToJson(multiVoiceFixture());
+    const res = parsePresetJson(json);
+
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.preset).toEqual(normalizedMultiVoice());
+      expect(res.migratedFrom).toBeNull();
+      // The per-voice carrier bases survive serialization unchanged.
+      expect(res.preset.voices?.map((v) => v.nodes[0].carrier)).toEqual([
+        { value: 320 },
+        { value: 480 },
+      ]);
+    }
+  });
+
+  it('the stored envelope JSON is byte-stable across a save → load → save cycle', () => {
+    // Freeze the clock so an overwrite re-save keeps the same updatedAt — this isolates the
+    // PRESET BODY's byte-stability (the only thing the voices can affect) from the timestamp.
+    vi.spyOn(Date, 'now').mockReturnValue(1000);
+
+    const saved = savePreset(multiVoiceFixture());
+    const afterFirstSave = localStorage.getItem(STORAGE_KEY);
+
+    const loaded = loadPreset(saved.id);
+    expect(loaded).not.toBeNull();
+    savePreset(loaded!.preset, saved.id);
+    const afterReSave = localStorage.getItem(STORAGE_KEY);
+
+    // No key-order drift, no field churn from the voices subtree.
+    expect(afterReSave).toBe(afterFirstSave);
+  });
+
+  it('a stored v5 preset self-heals to v6 on load (migratedFrom:5 write-back)', () => {
+    // A v5 body (CURRENT_SCHEMA_VERSION before the multi-voice bump) carrying voices: parse
+    // walks MIGRATIONS[5] (pure version-bump) up to v6 and reports migratedFrom=5.
+    const v5 = { ...multiVoiceFixture(), schemaVersion: 5 };
+
+    const res = parsePresetJson(JSON.stringify(v5));
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.migratedFrom).toBe(5);
+      expect(res.preset.schemaVersion).toBe(6);
+      expect(res.preset.voices).toHaveLength(2);
+    }
+
+    // Store the v5 body raw, then loadPreset self-heals it: migrates to v6 AND writes back.
+    setEnvelope({
+      storeVersion: 1,
+      seeded: true,
+      records: [{ id: 'legacy5', createdAt: 11, updatedAt: 22, preset: v5 }],
+    });
+    const loaded = loadPreset('legacy5');
+    expect(loaded?.preset.schemaVersion).toBe(6);
+    expect(loaded?.preset.voices).toHaveLength(2);
+    expect(loaded?.createdAt).toBe(11); // migration preserves timestamps (system action)
+    expect(loaded?.updatedAt).toBe(22);
+
+    // The upgraded v6 body was written back in place (read again — now no migration needed).
+    const after = rawEnvelope() as { records: Array<{ preset: { schemaVersion: number } }> };
+    expect(after.records[0].preset.schemaVersion).toBe(6);
+  });
+
+  it('an invalid voice → INVALID_PRESET, writes no record', () => {
+    // A voice-subtree issue from the delegate (empty voice id). persistence adds no rules of
+    // its own; assert generically on the code, not the exact VOICE_* name.
+    const bad = multiVoiceFixture({
+      voices: [{ id: '   ', nodes: [{ t: 0, carrier: { value: 320 } }] }],
+    } as Partial<Preset>);
+
+    const e = caught(() => savePreset(bad));
+    expect(e.code).toBe('INVALID_PRESET');
+    expect(e.issues && e.issues.length).toBeGreaterThan(0);
+    expect(localStorage.getItem(STORAGE_KEY)).toBeNull(); // never wrote a record
+
+    // The pure import core surfaces the SAME upstream failure as { ok:false, issues }.
+    const res = parsePresetJson(JSON.stringify(bad));
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.issues.length).toBeGreaterThan(0);
   });
 });

@@ -74,6 +74,7 @@ export interface PresetSummary {
   name: string;
   durationSec: number;
   nodeCount: number;
+  voiceCount: number;
   createdAt: number;
   updatedAt: number;
 }
@@ -284,11 +285,12 @@ function summaryOf(record: unknown): PresetSummary | null {
   if (typeof id !== 'string') return null;
   if (typeof createdAt !== 'number' || typeof updatedAt !== 'number') return null;
   if (!isPlainObject(preset)) return null;
-  const { name, durationSec, nodes } = preset;
+  const { name, durationSec, nodes, voices } = preset;
   if (typeof name !== 'string') return null;
   if (typeof durationSec !== 'number') return null;
   if (!Array.isArray(nodes)) return null;
-  return { id, name, durationSec, nodeCount: nodes.length, createdAt, updatedAt };
+  const voiceCount = 1 + (Array.isArray(voices) ? voices.length : 0);
+  return { id, name, durationSec, nodeCount: nodes.length, voiceCount, createdAt, updatedAt };
 }
 
 // Total order: most-recently-edited first, then most-recently-created, then by unique
@@ -420,7 +422,7 @@ export function clearLibrary(): void {
 export function buildDefaultLibraryPresets(): Preset[] {
   return [
     {
-      schemaVersion: 5,
+      schemaVersion: 6,
       name: 'Relax — Alpha 10 Hz',
       durationSec: 600,
       masterGain: 0.8,
@@ -432,7 +434,7 @@ export function buildDefaultLibraryPresets(): Preset[] {
       ],
     },
     {
-      schemaVersion: 5,
+      schemaVersion: 6,
       name: 'Meditate — Theta 6 Hz',
       durationSec: 1200,
       masterGain: 0.8,
@@ -450,7 +452,7 @@ export function buildDefaultLibraryPresets(): Preset[] {
       ],
     },
     {
-      schemaVersion: 5,
+      schemaVersion: 6,
       name: 'Sleep Descent — Delta',
       durationSec: 1800,
       masterGain: 0.8,
@@ -468,7 +470,7 @@ export function buildDefaultLibraryPresets(): Preset[] {
       ],
     },
     {
-      schemaVersion: 5,
+      schemaVersion: 6,
       name: 'Isochronic Focus — 10 Hz pulse',
       durationSec: 600,
       masterGain: 0.8,
@@ -519,6 +521,7 @@ export function seedDefaultPresets(): PresetSummary[] {
       name: res.preset.name,
       durationSec: res.preset.durationSec,
       nodeCount: res.preset.nodes.length,
+      voiceCount: 1 + (Array.isArray(res.preset.voices) ? res.preset.voices.length : 0),
       createdAt: now,
       updatedAt: now,
     });
@@ -563,6 +566,7 @@ export function restoreDefaultPresets(): PresetSummary[] {
       name: res.preset.name,
       durationSec: res.preset.durationSec,
       nodeCount: res.preset.nodes.length,
+      voiceCount: 1 + (Array.isArray(res.preset.voices) ? res.preset.voices.length : 0),
       createdAt: now,
       updatedAt: now,
     });

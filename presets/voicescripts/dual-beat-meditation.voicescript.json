@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "purpose": "meditation",
+  "startAtSec": 20,
+  "rateScale": 0.92,
+  "duck": { "toGain": 0.4, "attackSec": 0.8, "releaseSec": 2.0 },
+  "blocks": [
+    {
+      "label": "settle",
+      "pacing": { "gapSec": 8 },
+      "lines": [
+        { "say": "Welcome. Allow yourself to settle into a comfortable, upright position, and gently close your eyes." },
+        { "pauseSec": 6 },
+        { "say": "Take a slow, deep breath in, all the way down, and let it go completely." },
+        { "pauseSec": 10 },
+        { "say": "With each breath out, let your body grow heavier, softer, and more at ease." }
+      ]
+    },
+    {
+      "label": "descent",
+      "lines": [
+        { "at": 120, "say": "There is nowhere to go, and nothing to do. Simply allow this moment to be exactly as it is." },
+        { "at": 240, "say": "Let your attention rest on the gentle pulse of sound, quietly drawing you inward." },
+        { "at": 420, "say": "If a thought arises, notice it kindly, and let it drift away like a passing cloud." },
+        { "at": 600, "say": "Sinking deeper now, with every breath. Calm, and still." }
+      ]
+    },
+    {
+      "label": "deep",
+      "lines": [
+        { "at": 900, "say": "Rest here, in this quiet, open space. There is nothing you need to hold on to." },
+        { "at": 1200, "say": "Simply being. Aware, and at peace." },
+        { "at": 1500, "say": "Whenever you are ready, allow yourself to settle even deeper into the stillness." }
+      ]
+    },
+    {
+      "label": "return",
+      "pacing": { "gapSec": 12 },
+      "lines": [
+        { "at": 1620, "say": "In a few moments, we will gently begin to return." },
+        { "say": "Slowly allow your awareness to expand outward, back to the space around you." },
+        { "say": "Begin to feel your body, your hands, and the rhythm of your breath." },
+        { "say": "Take a deeper breath, and when you are ready, softly open your eyes, carrying this calm with you." }
+      ]
+    }
+  ]
+}
