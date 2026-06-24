@@ -66,7 +66,7 @@ interface WakeLockSentinelLike {
 interface WakeLockLike {
   request(type: 'screen'): Promise<WakeLockSentinelLike>;
 }
-type MediaSessionActionLike = 'play' | 'pause' | 'stop' | 'seekto';
+type MediaSessionActionLike = 'play' | 'pause' | 'stop' | 'seekto' | 'nexttrack' | 'previoustrack';
 interface MediaSessionLike {
   metadata: unknown;
   playbackState: 'none' | 'paused' | 'playing';
@@ -202,6 +202,7 @@ export function createTransport(options: TransportOptions): Transport {
     ended: new Set(),
     error: new Set(),
     warning: new Set(),
+    mediaskip: new Set(),
   };
   function emit<K extends keyof TransportEventMap>(event: K, payload: TransportEventMap[K]): void {
     for (const h of [...listeners[event]]) (h as (p: TransportEventMap[K]) => void)(payload);
@@ -454,6 +455,21 @@ export function createTransport(options: TransportOptions): Transport {
       );
     }
   }
+  /** Pause the background-audio element in lockstep with a transport pause. Without this the
+   *  silent-file loop (or the mediastream <audio>) keeps playing while the context is suspended,
+   *  so the browser's EFFECTIVE media-session state stays 'playing' — it overrides
+   *  setMediaPlaybackState('paused'), and the next hardware/Bluetooth key press toggles to
+   *  'pause' again (a no-op) instead of 'play'. That is exactly what makes resume-by-headset
+   *  impossible, so pause + resume must move the element too. */
+  function pauseBridgeElement(): void {
+    const el = audioEl;
+    if (!el || typeof el.pause !== 'function') return;
+    try {
+      el.pause();
+    } catch {
+      /* best-effort */
+    }
+  }
 
   // --- Shepard "lift" overlay — a PARALLEL aux path (independent live layer) ---
   // The lift never touches the voice/bridge wiring: a dedicated aux GainNode (the
@@ -694,6 +710,10 @@ export function createTransport(options: TransportOptions): Transport {
     setActionHandlerSafe(ms, 'seekto', (details) => {
       if (details && typeof details.seekTime === 'number') void seek(details.seekTime);
     });
+    // No track list to skip through — repurpose the next/previous-track keys as a neutral
+    // event the app maps to its own action (sleep UI: next → drift deeper, previous → resurface).
+    setActionHandlerSafe(ms, 'nexttrack', () => emit('mediaskip', { direction: 'next' }));
+    setActionHandlerSafe(ms, 'previoustrack', () => emit('mediaskip', { direction: 'previous' }));
   }
   function setActionHandlerSafe(
     ms: MediaSessionLike,
@@ -718,7 +738,7 @@ export function createTransport(options: TransportOptions): Transport {
   function clearMediaSession(): void {
     const ms = getMediaSession();
     if (!ms) return;
-    for (const a of ['play', 'pause', 'stop', 'seekto'] as const) {
+    for (const a of ['play', 'pause', 'stop', 'seekto', 'nexttrack', 'previoustrack'] as const) {
       try {
         ms.setActionHandler(a, null);
       } catch {
@@ -1111,6 +1131,7 @@ export function createTransport(options: TransportOptions): Transport {
       needsReschedule = false;
     }
     mc.rampMaster(trim, pauseFadeSec); // fade back up
+    void playBridgeElement(); // re-arm the OS media session element (paused on pause())
     setMediaPlaybackState('playing');
     armEndTimer();
     transitionTo('playing');
@@ -1147,6 +1168,7 @@ export function createTransport(options: TransportOptions): Transport {
       controlledSuspend = false;
     }
     if (state !== 'playing') return;
+    pauseBridgeElement(); // keep the OS media session 'paused' (so the next key press → 'play')
     setMediaPlaybackState('paused');
     transitionTo('paused');
   }
@@ -1248,30 +1270,44 @@ export function createTransport(options: TransportOptions): Transport {
       void applyLift();
     }
   }
+  // Live-retarget every running voice (+ layers) to `p` at the current position, KEEPING
+  // modulator phase (retarget, not apply). Shared by reapply() (loaded preset, the live-edit
+  // path) and retargetTo() (a supplied, externally-derived preset — the drift overlay). Caller
+  // guards state/disposed; this only needs ctx + voice.
+  function liveRetarget(p: Preset): void {
+    const c = ctx;
+    const v = voice;
+    if (!c || !v) return;
+    const atCtx = c.currentTime + startLeadSec;
+    scheduler.retarget(v, p, atCtx);
+    // MULTI-VOICE (v6, §3): retarget each extra voice at the SAME position over its own
+    // voiceView, and re-ramp its single-writer trim to the edited Voice.gain. The voice set is
+    // the one captured at startFresh (count changes are a STRUCTURAL load(), not a reapply — §3).
+    for (const rec of extraVoices) {
+      scheduler.retarget(rec.voice, voiceView(p, rec.source.nodes), atCtx);
+      rampLiftParam(rec.trimGain.gain, rec.trimGain.gain.value, clamp01(rec.source.gain ?? 1), trimRampSec);
+    }
+    // Phase-2: a same-position live retarget RETARGETS the layer schedule (keeps the running
+    // layer nodes — the layer analogue of §10's modulator-phase rule; NOT a rebuild, which is
+    // seek-only — K6/§19.5). No-op when no layers/scheduler are active.
+    if (layerSchedule && p.layers) {
+      layerSchedule.retarget(p.layers, atCtx);
+    }
+  }
   function reapply(): void {
     assertNotDisposed();
     if (!preset) throw new TransportError('NO_PRESET', 'reapply() called before load(preset)');
     if (state !== 'playing' && state !== 'paused' && state !== 'interrupted') return; // no-op idle/stopped
-    const c = ctx;
-    const v = voice;
-    if (!c || !v) return;
     // Live edit at the SAME position: re-ramp base lanes + keep modulator phase (I3b).
-    const atCtx = c.currentTime + startLeadSec;
-    scheduler.retarget(v, preset, atCtx);
-    // MULTI-VOICE (v6, §3): retarget each extra voice at the SAME position (phase kept —
-    // retarget, not apply) over its own voiceView, and re-ramp its single-writer trim to the
-    // edited Voice.gain. The voice set is the one captured at startFresh (count changes are a
-    // STRUCTURAL load(), not a reapply — §3).
-    for (const rec of extraVoices) {
-      scheduler.retarget(rec.voice, voiceView(preset, rec.source.nodes), atCtx);
-      rampLiftParam(rec.trimGain.gain, rec.trimGain.gain.value, clamp01(rec.source.gain ?? 1), trimRampSec);
-    }
-    // Phase-2: a same-position live edit RETARGETS the layer schedule (keeps the running
-    // layer nodes — the layer analogue of §10's modulator-phase rule; NOT a rebuild,
-    // which is seek-only — K6/§19.5). No-op when no layers/scheduler are active.
-    if (layerSchedule && preset.layers) {
-      layerSchedule.retarget(preset.layers, atCtx);
-    }
+    liveRetarget(preset);
+  }
+  function retargetTo(p: Preset): void {
+    assertNotDisposed();
+    if (state !== 'playing' && state !== 'paused' && state !== 'interrupted') return; // no-op idle/stopped
+    // Transient overlay (e.g. the sleep "drift deeper" nudge): retarget the running voices to a
+    // SUPPLIED preset without touching the loaded preset, duration, or playhead. The next
+    // reapply()/seek() schedules from the loaded preset again, so the overlay naturally ends.
+    liveRetarget(p);
   }
 
   // --- Lifecycle ---
@@ -1381,6 +1417,7 @@ export function createTransport(options: TransportOptions): Transport {
     pause,
     seek,
     reapply,
+    retargetTo,
     refreshLayers,
     stop,
     position,

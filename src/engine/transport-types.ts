@@ -78,6 +78,10 @@ export interface TransportEventMap {
   ended: void; // session reached durationSec and stopped naturally
   error: TransportNotice; // fatal — playback cannot proceed
   warning: TransportNotice; // degraded — playback continues
+  // The OS/Bluetooth next/previous-track media keys. This app has no track list, so transport
+  // does NOT act on them — it surfaces them as a neutral event and the app decides what they
+  // mean (the sleep UI maps next → "drift deeper", previous → "resurface").
+  mediaskip: { readonly direction: 'next' | 'previous' };
 }
 
 // --- The SessionScheduler contract (implemented by `automation`) -----------
@@ -261,6 +265,15 @@ export interface Transport {
    *  through `scheduler.retarget`. No-op unless playing/paused/interrupted.
    *  Synchronous. Throws NO_PRESET if nothing is loaded. See design §10. */
   reapply(): void;
+
+  /** TRANSIENT OVERLAY. Live-retarget the running voice(s) to a SUPPLIED preset at the
+   *  current position, preserving modulator phase — the same continuity-keeping path as
+   *  reapply(), but to an externally-derived preset instead of the loaded one. Does NOT
+   *  change the loaded preset, the duration, or the playhead; a later reapply()/seek()
+   *  schedules from the loaded preset again, so the overlay naturally ends. Intended for
+   *  non-persisted nudges such as the sleep "drift deeper" control. Synchronous; no-op
+   *  unless playing/paused/interrupted. */
+  retargetTo(preset: Preset): void;
 
   /** Rebuild + reschedule the LAYER subsystem at the current position WITHOUT touching the
    *  binaural voices (auto-synth-on-play, D-043). Disposes the current layer nodes and rebuilds

@@ -1012,6 +1012,26 @@ describe('background-audio bridge — D-018 (Task 5 — D1/D2/D3/D5/D6)', () => 
     expect(fakeAudio.play).toHaveBeenCalled();
   });
 
+  it('D5b: pause pauses the bridge element and resume re-plays it (so a headset toggle resumes)', async () => {
+    const ms = installMediaSession();
+    const { transport } = setup({ backgroundAudioMode: 'silent-file', silentFileUrl: '/silent-5s.mp3' });
+    await transport.play();
+    await microflush();
+    fakeAudio.play.mockClear();
+
+    const pausePromise = transport.pause();
+    await vi.advanceTimersByTimeAsync(20); // pauseFadeSec → suspend completes
+    await pausePromise;
+    expect(fakeAudio.pause).toHaveBeenCalled(); // element paused → OS state reflects 'paused'
+    expect(ms.playbackState).toBe('paused');
+
+    await transport.play(); // the second hardware-key press routes to 'play'
+    await microflush();
+    expect(transport.state).toBe('playing'); // actually resumed (not a no-op)
+    expect(fakeAudio.play).toHaveBeenCalled(); // element re-armed
+    expect(ms.playbackState).toBe('playing');
+  });
+
   it('D6: none mode connects directly and attaches no MediaSession', async () => {
     const ms = installMediaSession();
     const { transport, fakeCtx } = setup({ backgroundAudioMode: 'none' });
@@ -1058,6 +1078,28 @@ describe('MediaSession — D-018 (Task 5 — E1/E2/E3/E4/E5)', () => {
     expect(ms.playbackState).toBe('none');
   });
 
+  it('repurposes next/previous-track keys into neutral mediaskip events (no track list)', async () => {
+    const ms = installMediaSession();
+    const { transport } = setup({ backgroundAudioMode: 'mediastream' });
+    const skips: Array<{ direction: 'next' | 'previous' }> = [];
+    transport.on('mediaskip', (e) => skips.push(e));
+    await transport.play();
+    await microflush();
+
+    expect(ms.handlers.nexttrack).toBeTypeOf('function');
+    expect(ms.handlers.previoustrack).toBeTypeOf('function');
+
+    ms.handlers.nexttrack?.({});
+    ms.handlers.previoustrack?.({});
+    expect(skips).toEqual([{ direction: 'next' }, { direction: 'previous' }]);
+
+    // Cleared on teardown like the other action handlers.
+    await transport.stop();
+    await vi.advanceTimersByTimeAsync(600);
+    expect(ms.handlers.nexttrack).toBeNull();
+    expect(ms.handlers.previoustrack).toBeNull();
+  });
+
   it('E4: setPositionState is throttled to mediaSessionPositionThrottleMs', async () => {
     const ms = installMediaSession();
     const { transport } = setup({ backgroundAudioMode: 'mediastream', duration: 100 });
@@ -1095,6 +1137,27 @@ describe('reapply() — live edit (Task 6 — I3b / §10)', () => {
 
     const empty = setup({ autoload: false });
     expect(() => empty.transport.reapply()).toThrow(TransportError);
+  });
+});
+
+describe('retargetTo() — transient overlay to a supplied preset (drift nudge)', () => {
+  it('retargets the running voice to the SUPPLIED preset without moving the playhead', async () => {
+    const { transport, scheduler } = setup();
+    await transport.play();
+    const overlay = makePreset({ durationSec: 100, name: 'Deeper' });
+    const pos = transport.position();
+
+    transport.retargetTo(overlay);
+
+    expect(scheduler.retarget).toHaveBeenCalledTimes(1);
+    expect(scheduler.retarget.mock.calls[0][1]).toBe(overlay); // the SUPPLIED preset, not the loaded one
+    expect(transport.position()).toBeCloseTo(pos); // playhead unchanged
+  });
+
+  it('is a no-op while idle (never throws — the caller supplies the preset)', () => {
+    const idle = setup();
+    expect(() => idle.transport.retargetTo(makePreset())).not.toThrow();
+    expect(idle.scheduler.retarget).not.toHaveBeenCalled();
   });
 });
 
