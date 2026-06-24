@@ -10,6 +10,7 @@
   import SignalMonitor from '../components/SignalMonitor.svelte';
   import SignalGauges from '../components/SignalGauges.svelte';
   import MasterVolume from '../components/MasterVolume.svelte';
+  import DriftButton from '../components/DriftButton.svelte';
   import LiftControl from '../components/LiftControl.svelte';
   import KeepScreenOnToggle from '../components/KeepScreenOnToggle.svelte';
   import HeadphoneReminder from '../components/HeadphoneReminder.svelte';
@@ -104,6 +105,11 @@
        wake. Shaping moved to the Advanced editor. -->
   <div class="playback">
     <h2 class="section-title">Playback</h2>
+    <DriftButton
+      active={session.driftActive}
+      disabled={playback.state !== 'playing'}
+      onpress={() => session.toggleDrift()}
+    />
     <MasterVolume value={masterGain} oninput={(v) => session.setMasterGain(v)} />
     <LiftControl oncommit={(lift) => playback.setLift(lift)} />
     <KeepScreenOnToggle on={playback.isKeepScreenOn()} onchange={(on) => playback.setKeepScreenOn(on)} />

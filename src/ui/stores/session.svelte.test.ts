@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createDefaultPreset, type Preset } from '../../engine/session-model';
+import { valueAt } from '../../engine/automation';
 import type { Transport, TransportNotice, TransportState } from '../../engine/transport';
 import { createNoticeStore } from './notices.svelte';
 import { createPlaybackStore, createSessionStore } from './session.svelte';
@@ -17,6 +18,7 @@ function makeFakeTransport() {
     pause: vi.fn().mockResolvedValue(undefined),
     seek: vi.fn().mockResolvedValue(undefined),
     reapply: vi.fn(),
+    retargetTo: vi.fn(),
     stop: vi.fn().mockResolvedValue(undefined),
     position: vi.fn().mockReturnValue(0),
     duration: vi.fn(function (this: { durationSec: number }) {
@@ -193,6 +195,89 @@ describe('SessionStore — Phase-1 edits', () => {
       session.setNodeParam('beat', 6);
       expect(reapplyCount(transport)).toBe(0); // no-op when not active
     }
+  });
+
+  it('driftDeeper retargets to a derived overlay, marks it active, refreshes (bump) but never dirties', () => {
+    const { transport, session } = setup({ state: 'playing' });
+    const rev0 = session.revision;
+    const savedPreset = session.preset;
+
+    session.driftDeeper();
+
+    expect(transport.retargetTo).toHaveBeenCalledTimes(1);
+    const overlay = (transport.retargetTo as ReturnType<typeof vi.fn>).mock.calls[0][0] as Preset;
+    expect(overlay).not.toBe(savedPreset); // a transient DERIVED preset, not the working one
+    expect(session.preset).toBe(savedPreset); // working preset untouched
+    expect(session.dirty).toBe(false); // not a persisted edit
+    expect(session.revision).toBe(rev0 + 1); // bumps so the read-only monitor refreshes
+    expect(session.driftActive).toBe(true);
+    expect(reapplyCount(transport)).toBe(0); // overlay path, not the live-edit path
+  });
+
+  it('driftDeeper is a no-op (no retarget) when not active', () => {
+    for (const state of ['idle', 'stopped'] as const) {
+      const { transport, session } = setup({ state });
+      session.driftDeeper();
+      expect(transport.retargetTo).not.toHaveBeenCalled();
+      expect(session.driftActive).toBe(false);
+    }
+  });
+
+  it('monitorVoiceView reflects the overlay while active (lower beat), voiceView keeps the saved track', () => {
+    const { session } = setup({ state: 'playing' });
+    const beatBefore = valueAt(session.monitorVoiceView(), 'beat', 45);
+    session.driftDeeper();
+    // The saved-track view is unchanged; the monitor view shows the dipped beat at the deep point.
+    expect(valueAt(session.voiceView(), 'beat', 45)).toBeCloseTo(beatBefore, 5);
+    expect(valueAt(session.monitorVoiceView(), 'beat', 45)).toBeLessThan(beatBefore);
+  });
+
+  it('toggleDrift engages then resurfaces (no jump-back-and-re-deepen)', () => {
+    const { transport, session } = setup({ state: 'playing' });
+
+    session.toggleDrift();
+    expect(transport.retargetTo).toHaveBeenCalledTimes(1); // engage
+    expect(session.driftActive).toBe(true);
+
+    session.toggleDrift();
+    expect(reapplyCount(transport)).toBe(1); // resurface — NOT a second retargetTo/deepen
+    expect(transport.retargetTo).toHaveBeenCalledTimes(1);
+    expect(session.driftActive).toBe(false);
+  });
+
+  it('resurface retargets back to the loaded track via reapply (no dirty) and clears active', () => {
+    const { transport, session } = setup({ state: 'playing' });
+    session.driftDeeper();
+    session.resurface();
+    expect(reapplyCount(transport)).toBe(1);
+    expect(session.dirty).toBe(false);
+    expect(session.driftActive).toBe(false);
+  });
+
+  it('a committed edit clears an active drift overlay', () => {
+    const { session } = setup({ state: 'playing' });
+    session.driftDeeper();
+    expect(session.driftActive).toBe(true);
+    session.setNodeParam('carrier', 222);
+    expect(session.driftActive).toBe(false); // the edit superseded the overlay
+  });
+
+  it('the next-track media key toggles drift; previous-track always resurfaces', () => {
+    const { transport, session } = setup({ state: 'playing' });
+
+    transport.emit('mediaskip', { direction: 'next' }); // → drift deeper
+    expect(transport.retargetTo).toHaveBeenCalledTimes(1);
+    expect(session.driftActive).toBe(true);
+
+    transport.emit('mediaskip', { direction: 'next' }); // again → toggle off
+    expect(reapplyCount(transport)).toBe(1);
+    expect(session.driftActive).toBe(false);
+
+    transport.emit('mediaskip', { direction: 'next' }); // → drift deeper again
+    expect(transport.retargetTo).toHaveBeenCalledTimes(2);
+    transport.emit('mediaskip', { direction: 'previous' }); // → resurface
+    expect(reapplyCount(transport)).toBe(2);
+    expect(session.driftActive).toBe(false);
   });
 
   it('an edit committed while paused still re-derives (takes effect on resume)', () => {

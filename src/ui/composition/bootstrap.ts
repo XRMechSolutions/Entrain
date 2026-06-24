@@ -72,10 +72,15 @@ export function bootstrap(target?: HTMLElement, overrides: BootstrapOverrides = 
   //    preset with no layers stays byte-identical to Phase-1 (the injection is additive).
   const scheduler = createSchedulerAdapter();
   const layerScheduler = createLayerScheduler();
-  // The MediaStream→<audio> bridge (D-018) exists only to hold Android background/locked-
-  // screen audio focus. On desktop it adds a glitchy media hop (startup stutter/dropouts)
-  // with no benefit, so use direct Web Audio output there. Engage the bridge only on
-  // touch / coarse-pointer devices (phones/tablets), where background audio matters.
+  // Background-audio routing (D-018) chosen by device class — but NEITHER choice is 'none',
+  // because 'none' also skips MediaSession (transport gates attachMediaSession on it), which
+  // would leave hardware / Bluetooth media buttons (headset play/pause) and the OS media hub
+  // with no handler to call.
+  //  - coarse pointer (phone/tablet): 'mediastream' — the MediaStream→<audio> bridge holds
+  //    background/locked-screen audio focus, which matters there.
+  //  - fine pointer (desktop): 'silent-file' — direct Web Audio output (no glitchy media hop,
+  //    so no startup stutter/dropouts) PLUS a near-silent looping <audio> that anchors an OS
+  //    media session, so the headset pause/play button and lock-screen controls reach the app.
   const wantsBackgroundBridge =
     typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
   const transport = createTransport({
@@ -83,7 +88,7 @@ export function bootstrap(target?: HTMLElement, overrides: BootstrapOverrides = 
     layerScheduler,
     artwork: APP_ICONS,
     silentFileUrl: SILENT_LOOP_URL,
-    backgroundAudioMode: wantsBackgroundBridge ? 'mediastream' : 'none',
+    backgroundAudioMode: wantsBackgroundBridge ? 'mediastream' : 'silent-file',
   });
 
   // 3. + 4. the stores, wired to transport (playback/notices subscribe in their ctors).

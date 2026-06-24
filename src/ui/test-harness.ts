@@ -32,6 +32,7 @@ export function makeFakeTransport(durationSec = 300): FakeTransport {
     pause: vi.fn().mockResolvedValue(undefined),
     seek: vi.fn().mockResolvedValue(undefined),
     reapply: vi.fn(),
+    retargetTo: vi.fn(),
     stop: vi.fn().mockResolvedValue(undefined),
     position: vi.fn(() => 0),
     duration: vi.fn(() => durationSec),

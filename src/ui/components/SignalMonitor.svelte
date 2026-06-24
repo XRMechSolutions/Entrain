@@ -25,7 +25,9 @@
     draw: (positionSec) => {
       if (!ctx2d) return;
       renderTimeline(ctx2d, {
-        preset: session.voiceView(voiceId),
+        // monitorVoiceView reflects the live "drift deeper" overlay while it runs, so the plotted
+        // curves + dots follow what's actually playing (not just the saved track).
+        preset: session.monitorVoiceView(voiceId),
         view,
         layout,
         positionSec,

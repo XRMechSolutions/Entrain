@@ -16,6 +16,7 @@
 import {
   baseValueAt,
 } from '../../engine/automation';
+import { deriveDriftPreset, driftWindow, type DriftOptions } from '../../engine/drift';
 import {
   createDefaultPreset,
   DEFAULTS,
@@ -233,6 +234,32 @@ export interface SessionStore {
 
   applyLiveEdit(): void;
 
+  /** Sleep "drift deeper" nudge (the "drop me back to sleep mid-track" control). Derives a
+   *  transient preset that eases the PRIMARY voice's beat + carrier down toward a deeper target
+   *  for a few minutes, then rejoins the original curve, and retargets the running session to it
+   *  (transport.retargetTo) — continuity-preserving, like the lift overlay. Deliberately NOT a
+   *  preset edit: it does not dirty, bump revision, or touch the saved preset; a later seek/edit
+   *  ends the nudge. No-op unless a session is live (playing/paused/interrupted). */
+  driftDeeper(opts?: DriftOptions): void;
+
+  /** The complement of driftDeeper: cancel any active drift overlay and return to the scheduled
+   *  track at the current position (continuity-preserving, via transport.reapply — which
+   *  retargets to the LOADED preset). Harmless when no drift is active. No-op unless live. */
+  resurface(): void;
+
+  /** Toggle the drift overlay: engage it when off, or resurface (back to the programmed track)
+   *  when a dip is currently active. The one-tap control the Drift button + next-track key use. */
+  toggleDrift(opts?: DriftOptions): void;
+
+  /** True while a drift dip is engaged AND the playhead is still inside its window — drives the
+   *  Drift button's engaged state and auto-clears once the track rejoins. */
+  readonly driftActive: boolean;
+
+  /** Preset-shaped projection of a voice's nodes for the READ-ONLY monitor: the drift overlay
+   *  while it is active, otherwise the saved track (so gauges/timeline show what's PLAYING).
+   *  `undefined`/unknown id ⇒ the primary voice 0. */
+  monitorVoiceView(voiceId?: string): Preset;
+
   // ----- Phase-2 layer authoring (design §17; interfaces §14). Each clamps to v4 RANGES,
   //       bumps revision, sets dirty, and calls applyLiveEdit() — so a live layer edit
   //       reschedules at the unchanged position via transport.reapply(). They never author
@@ -294,8 +321,53 @@ export function createSessionStore(deps: { transport: Transport; playback: Playb
   let dirty = $state(false);
   let selectedId = $state<string | null>(null);
 
+  // Transient "drift deeper" overlay (NOT persisted): a derived preset whose primary voice dips
+  // deeper for one window, retargeted onto the running voices. `driftPreset === null` = off. The
+  // [start,end) window bounds when it is "active" so the read-only monitor reflects the dip while
+  // it runs and reverts once the track rejoins. Reactivity rides `revision` (bumped on
+  // engage/disengage) + the playback position mirror — both read by the monitor accessors below.
+  let driftPreset: Preset | null = null;
+  let driftStartSec = 0;
+  let driftEndSec = 0;
+
   function bump(): void {
     revision++;
+  }
+
+  /** Whether the drift overlay is engaged AND the playhead is still inside its dip window. */
+  function driftEngagedAt(pos: number): boolean {
+    return driftPreset !== null && pos >= driftStartSec && pos < driftEndSec;
+  }
+
+  /** Engage the drift overlay: derive a deeper preset at the live position and retarget the
+   *  running voices onto it. Transient — refreshes the monitor (bump) but never dirties/saves. */
+  function engageDrift(opts?: DriftOptions): void {
+    const s = playback.state;
+    if (s !== 'playing' && s !== 'paused' && s !== 'interrupted') return; // only meaningful mid-session
+    const pos = transport.position();
+    const win = driftWindow(preset, pos, opts);
+    if (win.endSec <= win.startSec + 1) return; // no room to dip + rejoin → nothing to do
+    driftPreset = deriveDriftPreset(preset, pos, opts);
+    driftStartSec = win.startSec;
+    driftEndSec = win.endSec;
+    try {
+      transport.retargetTo(driftPreset);
+    } catch {
+      /* preset always loaded; nothing to surface from this store boundary */
+    }
+    bump();
+  }
+
+  /** Disengage: drop the overlay and retarget back to the LOADED track at the current position
+   *  (transport.reapply is continuity-preserving). Harmless when nothing is engaged. */
+  function disengageDrift(): void {
+    driftPreset = null;
+    try {
+      transport.reapply();
+    } catch {
+      /* preset always loaded; nothing to surface from this store boundary */
+    }
+    bump();
   }
 
   function clampParam(param: AutomatableParam, value: number): number | null {
@@ -329,6 +401,9 @@ export function createSessionStore(deps: { transport: Transport; playback: Playb
   }
 
   function commit(): void {
+    // An edit supersedes any drift overlay — applyLiveEdit's reapply() retargets the running
+    // voices to the (now edited) loaded preset, so just drop the overlay flag here.
+    driftPreset = null;
     dirty = true;
     bump();
     applyLiveEdit();
@@ -456,6 +531,7 @@ export function createSessionStore(deps: { transport: Transport; playback: Playb
       preset = next; // adopt BY REFERENCE as the new source of truth
       selectedId = id;
       dirty = false;
+      driftPreset = null; // a fresh load clears any drift overlay
       transport.load(preset);
       bump();
     },
@@ -567,6 +643,36 @@ export function createSessionStore(deps: { transport: Transport; playback: Playb
     },
 
     applyLiveEdit,
+
+    get driftActive() {
+      void revision; // re-read when an engage/disengage bumps
+      return driftEngagedAt(playback.positionSec); // and when the playhead crosses the window
+    },
+
+    monitorVoiceView(voiceId?: string): Preset {
+      // The READ-ONLY monitor (gauges + timeline) shows what's PLAYING: the drift overlay while
+      // its window is active, otherwise the saved track. (Editing still goes through voiceView.)
+      void revision;
+      const src = driftEngagedAt(playback.positionSec) ? (driftPreset as Preset) : preset;
+      const nodes =
+        voiceId === undefined ? src.nodes : src.voices?.find((v) => v.id === voiceId)?.nodes ?? src.nodes;
+      return voiceViewModel(src, nodes);
+    },
+
+    driftDeeper(opts?: DriftOptions) {
+      engageDrift(opts);
+    },
+
+    resurface() {
+      disengageDrift();
+    },
+
+    toggleDrift(opts?: DriftOptions) {
+      // A second press returns to the programmed track (toggle off) rather than re-deepening
+      // from it — uses the live position so it matches what the user hears right now.
+      if (driftEngagedAt(transport.position())) disengageDrift();
+      else engageDrift(opts);
+    },
 
     // ----- Multi-voice authoring (v6) -----
 
@@ -809,6 +915,20 @@ export function createSessionStore(deps: { transport: Transport; playback: Playb
       bump();
     },
   };
+
+  // The OS/Bluetooth next/previous-track keys are repurposed as the eyes-closed sleep controls:
+  // next → drift deeper, previous → resurface (this app has no track list to skip). transport
+  // surfaces them as a neutral 'mediaskip' event; the mapping to drift lives here, where drift
+  // does. Each method already guards on playback state, so an out-of-session press is a no-op.
+  transport.on('mediaskip', (e) => {
+    if (e.direction === 'previous') {
+      disengageDrift();
+    } else if (driftEngagedAt(transport.position())) {
+      disengageDrift(); // next again → toggle off (return to the programmed track)
+    } else {
+      engageDrift();
+    }
+  });
 
   return store;
 }

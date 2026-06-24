@@ -26,7 +26,9 @@
 
   function live(param: AutomatableParam): number {
     void session.revision; // recompute if the preset changes (load); tNow covers the playhead
-    return valueAt(session.voiceView(voiceId), param, tNow);
+    // monitorVoiceView reflects the live "drift deeper" overlay while it runs, so the readouts
+    // follow what's actually playing (not just the saved track).
+    return valueAt(session.monitorVoiceView(voiceId), param, tNow);
   }
   const carrier = $derived(live('carrier'));
   const beat = $derived(live('beat'));

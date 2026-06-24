@@ -128,13 +128,15 @@ describe('bootstrap — composition root', () => {
     }
   });
 
-  it('uses direct output (no bridge) on fine-pointer / desktop', () => {
+  it('uses the silent-file anchor on fine-pointer / desktop (direct output + MediaSession for hardware keys)', () => {
     const restore = stubMatchMedia(false);
     try {
       const { createTransport, overrides } = makeOverrides();
       bootstrap(document.createElement('div'), overrides);
       const opts = createTransport.mock.calls[0][0] as TransportOptions;
-      expect(opts.backgroundAudioMode).toBe('none');
+      // NOT 'none' — 'none' would skip MediaSession, so the headset play/pause button would
+      // have no handler. 'silent-file' keeps direct Web Audio output but anchors a media session.
+      expect(opts.backgroundAudioMode).toBe('silent-file');
     } finally {
       restore();
     }
