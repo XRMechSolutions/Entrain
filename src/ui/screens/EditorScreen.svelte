@@ -33,7 +33,7 @@
   import RenderSheet from '../components/RenderSheet.svelte';
   import VoiceScriptImport from '../components/VoiceScriptImport.svelte';
 
-  const { ui, session, transport, clips } = getAppContext();
+  const { ui, session, transport, clips, library } = getAppContext();
 
   function rev<T>(read: () => T): T {
     void session.revision;
@@ -154,20 +154,41 @@
   <div class="main">
     <!-- Phase-2 Editor sub-tabs + header actions (design §16.3). Render/Import are
          capability-gated inside their own components, never width-hidden. -->
-    <nav class="subtabs" aria-label="Editor sections">
-      {#each [['nodes', 'Nodes'], ['layers', 'Layers'], ['clips', 'Clips'], ['narration', 'Narration'], ['export', 'Export']] as const as [id, label] (id)}
+    <div class="editor-header">
+      <nav class="subtabs" aria-label="Editor sections">
+        {#each [['nodes', 'Nodes'], ['layers', 'Layers'], ['clips', 'Clips'], ['narration', 'Narration'], ['export', 'Export']] as const as [id, label] (id)}
+          <button
+            type="button"
+            class="subtab"
+            class:active={subTab === id}
+            aria-pressed={subTab === id}
+            data-testid={`subtab-${id}`}
+            onclick={() => (subTab = id)}
+          >
+            {label}
+          </button>
+        {/each}
+      </nav>
+
+      <!-- Save back to the loaded preset, or save a new/blank session (prompting for a name).
+           Available across every sub-tab. Disabled only when a loaded preset has no unsaved
+           edits; a brand-new session (no selectedId) stays enabled so its first save works. -->
+      <div class="header-actions">
+        {#if session.dirty}
+          <span class="dirty-dot" title="Unsaved changes" aria-label="Unsaved changes">●</span>
+        {/if}
         <button
           type="button"
-          class="subtab"
-          class:active={subTab === id}
-          aria-pressed={subTab === id}
-          data-testid={`subtab-${id}`}
-          onclick={() => (subTab = id)}
+          class="save-btn"
+          data-testid="editor-save"
+          disabled={!session.dirty && session.selectedId !== null}
+          title={session.selectedId === null ? 'Save this session to your library' : 'Save changes to this preset'}
+          onclick={() => library.save()}
         >
-          {label}
+          Save
         </button>
-      {/each}
-    </nav>
+      </div>
+    </div>
 
     {#if subTab === 'layers'}
       <LayerList {layers} selectedId={inspectedLayerId} onadd={addLayer} onedit={editLayer} onremove={removeLayer} />
@@ -349,10 +370,46 @@
     min-width: 0;
     flex: 1;
   }
+  .editor-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--sp-3);
+    flex-wrap: wrap;
+  }
   .subtabs {
     display: flex;
     gap: var(--sp-2);
     flex-wrap: wrap;
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .header-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    flex: none;
+  }
+  .dirty-dot {
+    color: var(--accent);
+    font-size: 0.8em;
+    line-height: 1;
+  }
+  .save-btn {
+    min-height: var(--tap-min);
+    padding: 0 var(--sp-4);
+    background: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: var(--radius);
+    color: var(--accent-contrast);
+    font-weight: 600;
+  }
+  .save-btn:disabled {
+    background: var(--surface);
+    border-color: var(--border);
+    color: var(--text-dim);
+    opacity: 0.7;
+    cursor: not-allowed;
   }
   .subtab {
     min-height: var(--tap-min);

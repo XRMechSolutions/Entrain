@@ -515,6 +515,43 @@ describe('schedule modulator wiring (Task 5)', () => {
       expect(mp(voice.modVolumeParam).inputs.length).toBeGreaterThan(0);
     });
 
+    it('should hold a LATE volume pulse silent (depth 0) until its span starts (regression: a gentle-wake isochronic must not pulse the whole binaural track)', async () => {
+      const p = preset(20, [
+        { t: 0, volume: pp(1, 'linear') },
+        { t: 5, volume: pp(1, 'linear', { shape: 'pulse', periodSec: 0.25, depth: 0.5, pulseWidth: 0.5, edgeMs: 5 }) },
+      ]);
+      const { ctx, voice } = await voiceWithWorklet();
+      schedule(p, 'volume', voice, { startTime: 0 });
+      const depth = (ctx.created.worklets[0] as MockAudioWorkletNode).parameters.get('depth');
+      // depth 0 ⇒ worklet output is a constant 1.0 ⇒ no volume modulation before the span.
+      expect(depth.valueAtTime(0)).toBe(0);
+      expect(depth.valueAtTime(2)).toBe(0);
+      expect(depth.valueAtTime(5)).toBeCloseTo(0.5, 6); // real depth once the span begins
+    });
+
+    it('should hold a LATE carrier pulse gate at 0 until its span starts (regression)', async () => {
+      const p = preset(20, [
+        { t: 0, carrier: pp(200, 'linear') },
+        { t: 5, carrier: pp(200, 'linear', { shape: 'pulse', periodSec: 1, depth: 0.03, pulseWidth: 0.5 }) },
+      ]);
+      const { ctx, voice } = await voiceWithWorklet();
+      schedule(p, 'carrier', voice, { startTime: 0 });
+      const gate = ctx.created.gains[ctx.created.gains.length - 1] as MockGainNode;
+      expect(gate.gain.valueAtTime(0)).toBe(0); // gate gain 0 ⇒ no carrier swing before the span
+      expect(gate.gain.valueAtTime(5)).toBeCloseTo(6, 6); // 0.03 × 200 Hz once the span begins
+      expect(gate.isConnectedTo(mp(voice.carrierParam))).toBe(true);
+    });
+
+    it('should keep a pulse that starts at t=0 active immediately (no pre-gate)', async () => {
+      const p = preset(10, [
+        { t: 0, volume: pp(1, 'linear', { shape: 'pulse', periodSec: 0.25, depth: 0.5, pulseWidth: 0.5, edgeMs: 5 }) },
+      ]);
+      const { ctx, voice } = await voiceWithWorklet();
+      schedule(p, 'volume', voice, { startTime: 0 });
+      const depth = (ctx.created.worklets[0] as MockAudioWorkletNode).parameters.get('depth');
+      expect(depth.valueAtTime(0)).toBeCloseTo(0.5, 6); // active from the first sample
+    });
+
     it('should catch WORKLET_NOT_REGISTERED, keep the base curve, and set pulseUnavailable (F1)', () => {
       const p = preset(10, [
         { t: 0, carrier: pp(200, 'linear', { shape: 'pulse', periodSec: 1, depth: 0.03 }) },

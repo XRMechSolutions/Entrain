@@ -174,4 +174,27 @@ describe('EditorScreen — multi-voice routing (FIX-1 regression)', () => {
     expect(ctx.session.preset.voices![0].nodes[0].carrier?.value).toBe(333);
     expect(ctx.session.preset.nodes[0].carrier?.value).not.toBe(333); // primary untouched
   });
+
+  it('shows a Save button that invokes library.save()', async () => {
+    const { ctx, getByTestId } = renderEditor();
+    const saveSpy = vi.spyOn(ctx.library, 'save').mockImplementation(() => {});
+    await fireEvent.click(getByTestId('editor-save'));
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('Save is disabled for a loaded, unedited preset and enables after an edit', async () => {
+    const { ctx, getByTestId } = renderEditor();
+    ctx.session.reset(ctx.session.preset, 'lib-1'); // loaded record, no unsaved edits
+    await tick();
+    expect((getByTestId('editor-save') as HTMLButtonElement).disabled).toBe(true);
+    ctx.session.setNodeParam('carrier', 250); // an edit dirties the working preset
+    await tick();
+    expect((getByTestId('editor-save') as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('Save stays enabled for a brand-new (unsaved) session even when clean', async () => {
+    const { ctx, getByTestId } = renderEditor();
+    expect(ctx.session.selectedId).toBeNull(); // fresh harness session, never saved
+    expect((getByTestId('editor-save') as HTMLButtonElement).disabled).toBe(false);
+  });
 });

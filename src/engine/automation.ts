@@ -805,7 +805,7 @@ export function schedule(
       scheduleWarbleSpan(p, span, span.shape, ctxTimeOf, floorT, spanStartCtx, spanEndCtx, spanStartPt);
       return;
     }
-    schedulePulseSpan(p, span, ctxTimeOf, floorT, spanStartCtx, spanEndCtx, spanStartPt);
+    schedulePulseSpan(p, span, ctxTimeOf, floorT, spanStartCtx, spanEndCtx, spanStartPt, startOffsetSec, floorTime);
   }
 
   function scheduleWarbleSpan(
@@ -869,6 +869,8 @@ export function schedule(
     spanStartCtx: number,
     spanEndCtx: number,
     spanStartPt: number,
+    startOffsetSec: number,
+    floorTime: number,
   ): void {
     const k0 = span.keys[0];
     const base0 = baseCore(p, param, spanStartPt);
@@ -914,8 +916,21 @@ export function schedule(
     handle.frequencyParam.setValueAtTime(k0.frequency, spanStartCtx);
     handle.dutyCycleParam.setValueAtTime(k0.pulseWidth, spanStartCtx);
     handle.edgeWidthParam.setValueAtTime(edge0, spanStartCtx);
-    if (param === 'volume') handle.depthParam.setValueAtTime(clampRange(k0.depth, 0, 1), spanStartCtx);
-    else gateGain!.gain.setValueAtTime(resolveModDepth(param, k0.depth, base0), spanStartCtx);
+    // Unlike warble/box/step (whose osc/ConstantSource emit nothing before start(spanStartCtx)),
+    // the pulse AudioWorkletNode runs continuously from creation. A span that begins AFTER
+    // playback starts must therefore be held silent until spanStartCtx, or the modulator is
+    // audible from t=0 — e.g. a late gentle-wake isochronic would pulse the WHOLE binaural track
+    // (post-merger envGain modulates both ears). depth 0 ⇒ worklet output is a constant 1.0
+    // (low=high=1) ⇒ no volume modulation; gate gain 0 ⇒ no carrier/beat swing. A seek INTO the
+    // span (startOffsetSec ≥ span.startT) skips the pre-gate so it is active immediately.
+    const startsInFuture = span.startT > startOffsetSec;
+    if (param === 'volume') {
+      if (startsInFuture) handle.depthParam.setValueAtTime(0, floorTime);
+      handle.depthParam.setValueAtTime(clampRange(k0.depth, 0, 1), spanStartCtx);
+    } else {
+      if (startsInFuture) gateGain!.gain.setValueAtTime(0, floorTime);
+      gateGain!.gain.setValueAtTime(resolveModDepth(param, k0.depth, base0), spanStartCtx);
+    }
 
     for (let j = 1; j < span.keys.length; j++) {
       const key = span.keys[j];

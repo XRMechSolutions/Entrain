@@ -29,6 +29,7 @@ import {
   totalBytes as defaultTotalBytes,
   type Clip,
 } from '../../engine/clip-library';
+import { createDefaultPreset } from '../../engine/session-model';
 import type { ValidationIssue } from '../../engine/session-model';
 import type { ClipPanelMode } from '../lib/constants';
 import type { SessionStore } from './session.svelte';
@@ -46,6 +47,10 @@ export interface LibraryStore {
   seed(): void;
   restoreDefaults(): void;
   open(id: string): void;
+  /** Smart save for the editor's single Save button: overwrite the loaded preset when one is
+   *  selected, or save a NEW/blank session — prompting for a name first while it is still
+   *  unnamed (empty or the default). Adopts the saved id, marks clean, and toasts on success. */
+  save(): void;
   saveCurrent(): void;
   saveAsNew(): void;
   remove(id: string): void;
@@ -64,6 +69,22 @@ function confirmDiscard(): boolean {
 function confirmDelete(): boolean {
   if (typeof window === 'undefined' || typeof window.confirm !== 'function') return true;
   return window.confirm('Delete this preset? This cannot be undone.');
+}
+
+/** The name a brand-new session starts with — read once so the "still unnamed" check below
+ *  tracks session-model's default rather than a duplicated string literal. */
+const DEFAULT_SESSION_NAME = createDefaultPreset().name;
+
+/** Prompt for a session name (browser prompt — consistent with confirmDiscard/confirmDelete;
+ *  the app has no modal layer). Returns the trimmed entry, or a non-empty fallback when left
+ *  blank, or `null` when the user cancels (the caller then aborts the save). */
+function promptName(current: string): string | null {
+  const fallback = current.trim() || DEFAULT_SESSION_NAME;
+  if (typeof window === 'undefined' || typeof window.prompt !== 'function') return fallback;
+  const entered = window.prompt('Name this session', current.trim());
+  if (entered === null) return null; // cancelled
+  const trimmed = entered.trim();
+  return trimmed.length > 0 ? trimmed : fallback;
 }
 
 function issuesList(issues: ValidationIssue[] | undefined): string {
@@ -151,6 +172,28 @@ export function createLibraryStore(deps: { session: SessionStore; notices: Notic
     session.reset(saved.preset, saved.id);
     if (saved.warnings.length > 0) {
       notices.push({ severity: 'info', message: `Loaded with notes — ${issuesList(saved.warnings)}` });
+    }
+  }
+
+  function save(): void {
+    try {
+      // New / blank session (no loaded record): make sure it carries a real name before it
+      // lands in the library, so it isn't filed under the default placeholder. A loaded preset
+      // (selectedId set) overwrites silently — its name is edited via the always-visible field.
+      if (session.selectedId === null) {
+        const current = session.preset.name.trim();
+        if (current.length === 0 || current === DEFAULT_SESSION_NAME) {
+          const chosen = promptName(current === DEFAULT_SESSION_NAME ? '' : current);
+          if (chosen === null) return; // user cancelled the prompt → abort the save
+          session.setName(chosen);
+        }
+      }
+      const saved = savePreset(session.preset, session.selectedId ?? undefined);
+      session.markSaved(saved.id);
+      refresh();
+      notices.push({ severity: 'info', message: `Saved "${session.preset.name}".` });
+    } catch (e) {
+      handleError(e);
     }
   }
 
@@ -257,6 +300,7 @@ export function createLibraryStore(deps: { session: SessionStore; notices: Notic
       }
     },
     open,
+    save,
     saveCurrent,
     saveAsNew,
     remove,

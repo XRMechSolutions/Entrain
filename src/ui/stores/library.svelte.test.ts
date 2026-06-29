@@ -137,6 +137,59 @@ describe('LibraryStore — happy paths', () => {
     expect(session.markSaved).toHaveBeenCalledWith('new-1');
   });
 
+  it('save() overwrites the loaded preset (selectedId) without prompting, and toasts', () => {
+    const { library, session, notices } = setup();
+    session.selectedId = 'lib-9';
+    session.preset.name = 'My Session';
+    const promptSpy = vi.fn();
+    vi.stubGlobal('prompt', promptSpy);
+    vi.mocked(savePreset).mockReturnValue(saved('lib-9'));
+    vi.mocked(listPresets).mockReturnValue([summary('lib-9', 5)]);
+    library.save();
+    expect(promptSpy).not.toHaveBeenCalled(); // a loaded preset overwrites silently
+    expect(savePreset).toHaveBeenCalledWith(session.preset, 'lib-9');
+    expect(session.markSaved).toHaveBeenCalledWith('lib-9');
+    expect(notices.items.at(-1)).toMatchObject({ severity: 'info' });
+  });
+
+  it('save() on a new/blank session prompts for a name, applies it, then saves new', () => {
+    const { library, session } = setup();
+    session.selectedId = null; // a blank session — never saved yet
+    // preset.name is the default 'Untitled Session'; setName must update it for the save to use.
+    session.setName = vi.fn((n: string) => {
+      session.preset.name = n;
+    });
+    vi.stubGlobal('prompt', vi.fn().mockReturnValue('Evening Wind-Down'));
+    vi.mocked(savePreset).mockReturnValue(saved('new-1'));
+    vi.mocked(listPresets).mockReturnValue([]);
+    library.save();
+    expect(session.setName).toHaveBeenCalledWith('Evening Wind-Down');
+    expect(savePreset).toHaveBeenCalledWith(session.preset, undefined); // no id ⇒ new record
+    expect(session.markSaved).toHaveBeenCalledWith('new-1');
+  });
+
+  it('save() on a new session that already has a custom name does NOT prompt', () => {
+    const { library, session } = setup();
+    session.selectedId = null;
+    session.preset.name = 'Hand-Named Mix';
+    const promptSpy = vi.fn();
+    vi.stubGlobal('prompt', promptSpy);
+    vi.mocked(savePreset).mockReturnValue(saved('new-2'));
+    vi.mocked(listPresets).mockReturnValue([]);
+    library.save();
+    expect(promptSpy).not.toHaveBeenCalled();
+    expect(savePreset).toHaveBeenCalledWith(session.preset, undefined);
+  });
+
+  it('save() aborts (no write) when the name prompt is cancelled', () => {
+    const { library, session } = setup();
+    session.selectedId = null; // blank session with the default name → prompts
+    vi.stubGlobal('prompt', vi.fn().mockReturnValue(null)); // user cancels
+    library.save();
+    expect(savePreset).not.toHaveBeenCalled();
+    expect(session.markSaved).not.toHaveBeenCalled();
+  });
+
   it('exportCurrent() invokes exportPreset directly and toasts the filename', () => {
     const { library, session, notices } = setup();
     vi.mocked(exportPreset).mockReturnValue('evening.json');
